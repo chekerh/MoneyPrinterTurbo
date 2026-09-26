@@ -13,6 +13,17 @@ listen_port = 8080
 
 [app]
 
+# Absolute path to the outer portfolio root that holds plans/ and outputs/.
+# Only needed by features that read or write the channel portfolio (channel
+# materialisation, thumbnail archiving). Leave empty when unused: the layout
+# resolver fails closed rather than guessing a path.
+# 存放 plans/ 与 outputs/ 的外层作品集根的绝对路径。
+# 仅在需要读写频道作品集的功能（频道落地、缩略图归档）用到；不用时留空即可。
+# 布局解析器在取不到时直接失败，不会去猜路径。
+# The MPT_PORTFOLIO_ROOT environment variable overrides this for a single run.
+# 环境变量 MPT_PORTFOLIO_ROOT 可以在单次运行时覆盖这里的值。
+portfolio_root = ""
+
 # Optional protection for API routes and generated files under /tasks.
 # Leave empty for local backward-compatible access. When configured, clients
 # must send the same value in the x-api-key request header. Keep real keys only
