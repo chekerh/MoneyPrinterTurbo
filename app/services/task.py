@@ -29,6 +29,7 @@ from app.services import (
     voice,
 )
 from app.services import upload_post
+from app.services import youtube_upload
 from app.services import state as sm
 from app.utils import file_security, utils
 
@@ -1449,19 +1450,32 @@ def _run_pipeline(
 
     # 7. 先完成视频生成任务，再按需提交跨平台发布。第三方上传可能耗时
     # 数分钟，不应阻塞视频结果返回，也不能反向影响已经生成的成片。
-    cross_post_enabled = (
+    upload_post_ready = (
         upload_post.upload_post_service.is_configured()
         and upload_post.upload_post_service.auto_upload
     )
+    youtube_native_ready = youtube_upload.is_configured()
+    cross_post_enabled = upload_post_ready or youtube_native_ready
     platforms = (
-        list(upload_post.upload_post_service.platforms) if cross_post_enabled else []
+        list(upload_post.upload_post_service.platforms)
+        if cross_post_enabled
+        else []
     )
+    if upload_post_ready and not youtube_native_ready:
+        platforms = [
+            p
+            for p in upload_post.upload_post_service.platforms
+            if not (isinstance(p, str) and p.startswith("youtube"))
+        ]
     should_cross_post = cross_post_enabled and bool(platforms)
     if cross_post_enabled and not platforms:
         logger.warning(
             f"skip cross-post because no platforms are configured, task_id: {task_id}"
         )
     cross_post_state = const.CROSS_POST_STATE_PENDING if should_cross_post else None
+
+    # 在标记完成之前固定成片身份。失败只影响缩略图，不影响视频任务本身。
+    descriptor_state = _record_result_descriptor(task_id)
 
     kwargs = {
         "videos": final_video_paths,
@@ -1477,6 +1491,11 @@ def _run_pipeline(
         "cross_post_error": None,
         "cross_post_owner": _cross_post_process_owner if should_cross_post else None,
         "warnings": generation_warnings or None,
+        "thumbnail_eligibility": (
+            "supported" if descriptor_state["eligible"] else "unsupported"
+        ),
+        "thumbnail_unsupported_reason": descriptor_state["reason"] or None,
+        "thumbnail_descriptor_id": descriptor_state["descriptor_id"] or None,
     }
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
@@ -1501,6 +1520,78 @@ def _run_pipeline(
             kwargs["cross_post_owner"] = None
 
     return kwargs
+
+
+def _record_result_descriptor(
+    task_id: str,
+    layout=None,
+    tools=None,
+):
+    """
+    在把任务标记为完成之前，写下这个任务的成片身份记录。
+
+    缩略图是附加能力，成片任务的成败不能由它决定。因此本函数**永不抛出**：
+    任何失败都降级成 ``eligible=False`` 加一条可读原因，由调用方写进任务状态。
+    WebUI 读到不可用时只是不渲染缩略图段落，页面其余部分照常。
+
+    记录写在 ``storage/result_descriptors/`` 而不是 ``storage/tasks/``——后者会被
+    静态挂载到 ``/tasks``，任务元数据不该跟着公开暴露。
+    """
+    empty = {
+        "eligible": False,
+        "reason": "",
+        "descriptor_id": "",
+        "descriptor_sha256": "",
+        "video_count": 0,
+    }
+
+    if layout is None:
+        try:
+            from app.services.project_layout import resolve_project_layout
+
+            layout = resolve_project_layout()
+        except Exception as exc:  # noqa: BLE001 - 配置缺失是可预期状态
+            logger.warning(
+                f"result descriptor skipped: task_id={task_id}, reason={exc}"
+            )
+            return {**empty, "reason": str(exc)[:200]}
+
+    if tools is None:
+        try:
+            from app.utils.strict_media_tools import probe_media_tools
+
+            tools = probe_media_tools()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"result descriptor skipped: task_id={task_id}, reason={exc}"
+            )
+            return {**empty, "reason": str(exc)[:200]}
+
+    try:
+        from app.services.result_descriptor import (
+            build_result_descriptor,
+            write_result_descriptor,
+        )
+
+        descriptor = build_result_descriptor(layout, task_id, tools=tools)
+        _, descriptor_id, digest = write_result_descriptor(layout, descriptor)
+    except Exception as exc:  # noqa: BLE001 - 附加能力不允许影响主流程
+        logger.warning(
+            f"failed to record result descriptor: task_id={task_id}, error={exc}"
+        )
+        return {**empty, "reason": str(exc)[:200]}
+
+    logger.debug(
+        f"recorded result descriptor: task_id={task_id}, "
+        f"videos={len(descriptor.videos)}, descriptor_id={descriptor_id}"
+    )
+    return {
+        "eligible": True,
+        "reason": "",
+        "descriptor_id": descriptor_id,
+        "descriptor_sha256": digest,
+        "video_count": len(descriptor.videos),
+    }
 
 
 def start(

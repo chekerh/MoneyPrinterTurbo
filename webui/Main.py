@@ -27,8 +27,25 @@ if root_dir in sys.path:
     sys.path.remove(root_dir)
 sys.path.insert(0, root_dir)
 
+# 内容计划工具位于仓库 tools/ 目录。WebUI 复用同一份计划读取逻辑，保证
+# 页面展示的待生成/已发布状态与 daily_youtube_short.sh 命令行流水线一致。
+tools_dir = os.path.join(os.path.dirname(root_dir), "tools")
+if tools_dir not in sys.path:
+    sys.path.insert(0, tools_dir)
+
+import plans
+import archive_video
+
 from app.config import config
 from app.models import const
+from app.services.project_layout import resolve_project_layout
+from app.services.result_descriptor import (
+    ResultDescriptorError,
+    read_result_descriptor,
+)
+from app.services.thumbnail_files import ThumbnailFilesError
+from app.utils.strict_media_tools import MediaToolsError, probe_media_tools
+from webui.thumbnail_panel import render_thumbnail_panel
 from app.models.llm_provider import (
     DEFAULT_LLM_PROVIDER_ID,
     LLM_PROVIDER_REGISTRY,
@@ -45,6 +62,7 @@ from app.models.schema import (
 from app.services import bgm as bgm_service
 from app.services import (
     cache_manager,
+    campaign as campaign_service,
     llm,
     loomloom,
     video,
@@ -542,6 +560,12 @@ def _initialize_session_state():
             loomloom.MAX_VIDEO_SCENES,
             int,
         ),
+        # 活动内容工作台：保留跨 rerun 的抓取结果、简报与文案包。
+        "campaign_source": None,
+        "campaign_brief": None,
+        "campaign_posts": None,
+        "campaign_link_input": "",
+        "campaign_post_count": 5,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -976,6 +1000,66 @@ def _count_processing_tasks(tasks):
     return len(processing_task_ids)
 
 
+def _get_task_queue_position(task, all_tasks):
+    """获取任务在队列中的位置（仅针对处理中/等待中的任务）。"""
+    if _task_state_filter_key(task) not in ("processing", "pending", "queued"):
+        return 0
+    position = 0
+    for t in all_tasks:
+        if _task_state_filter_key(t) in ("processing", "pending", "queued"):
+            position += 1
+            if t["task_id"] == task["task_id"]:
+                return position
+    return 0
+
+
+def _estimate_task_eta(task):
+    """估算任务剩余时间（基于进度和已耗时）。"""
+    progress = task.get("progress", 0)
+    mtime = task.get("mtime", 0)
+    if progress <= 0 or progress >= 100 or mtime <= 0:
+        return ""
+    elapsed = time.time() - mtime
+    if elapsed < 10:  # 太短不显示
+        return ""
+    estimated_total = elapsed * 100 / progress
+    remaining = max(0, estimated_total - elapsed)
+    if remaining < 60:
+        return f"(~{int(remaining)}s)"
+    elif remaining < 3600:
+        return f"(~{int(remaining/60)}m)"
+    else:
+        return f"(~{int(remaining/3600)}h{int((remaining%3600)/60)}m)"
+
+
+def _get_task_thumbnail(task):
+    """获取任务的缩略图路径（优先使用输出目录中的缩略图，其次任务目录）。"""
+    task_path = task.get("task_path", "")
+    video_file = task.get("video_file", "")
+    
+    # 优先检查输出目录中的缩略图
+    if video_file and os.path.isfile(video_file):
+        video_dir = os.path.dirname(video_file)
+        base_name = os.path.splitext(os.path.basename(video_file))[0]
+        thumb_path = os.path.join(video_dir, f"{base_name}.jpg")
+        if os.path.isfile(thumb_path):
+            return thumb_path
+        # 尝试其他常见缩略图格式
+        for ext in ('.png', '.webp'):
+            alt_path = os.path.join(video_dir, f"{base_name}{ext}")
+            if os.path.isfile(alt_path):
+                return alt_path
+    
+    # 回退到任务目录中的缩略图
+    if task_path and os.path.isdir(task_path):
+        for ext in ('.jpg', '.png', '.webp'):
+            for fname in os.listdir(task_path):
+                if fname.lower().endswith(ext) and 'thumb' in fname.lower():
+                    return os.path.join(task_path, fname)
+    
+    return None
+
+
 def _task_manager_label(processing_count):
     label = tr("Task Manager")
     if processing_count <= 0:
@@ -996,12 +1080,14 @@ def _build_video_download_name(subject, index, total):
 
 def _render_task_table(filtered_tasks, key_prefix):
     with st.container(key=f"task_table_header_{key_prefix}"):
-        header_cols = st.columns([1.1, 1.7, 3.0, 0.8, 1.6], vertical_alignment="center")
-        header_cols[0].caption(tr("Task Status"))
-        header_cols[1].caption(tr("Task Updated At"))
-        header_cols[2].caption(tr("Task Subject"))
-        header_cols[3].caption(tr("Task Progress"))
-        header_cols[4].caption(tr("Task Actions"))
+        header_cols = st.columns([0.6, 0.8, 1.1, 1.7, 3.0, 0.8, 1.6], vertical_alignment="center")
+        header_cols[0].caption(tr("Queue #"))
+        header_cols[1].caption(tr("Thumbnail"))
+        header_cols[2].caption(tr("Task Status"))
+        header_cols[3].caption(tr("Task Updated At"))
+        header_cols[4].caption(tr("Task Subject"))
+        header_cols[5].caption(tr("Task Progress"))
+        header_cols[6].caption(tr("Task Actions"))
 
     if not filtered_tasks:
         st.info(tr("No Tasks Match Filter"))
@@ -1010,7 +1096,7 @@ def _render_task_table(filtered_tasks, key_prefix):
     visible_tasks = filtered_tasks[:12]
     list_height = min(390, max(96, len(visible_tasks) * 58))
     with st.container(height=list_height, border=False):
-        for task in visible_tasks:
+        for idx, task in enumerate(visible_tasks):
             task_id = task["task_id"]
             has_video = bool(task["video_file"] and os.path.isfile(task["video_file"]))
             is_processing = _task_state_filter_key(task) == "processing"
@@ -1027,13 +1113,30 @@ def _render_task_table(filtered_tasks, key_prefix):
                 key=f"task_row_{key_prefix}_{safe_task_key}", border=True
             ):
                 row_cols = st.columns(
-                    [1.1, 1.7, 3.0, 0.8, 1.6],
+                    [0.6, 0.8, 1.1, 1.7, 3.0, 0.8, 1.6],
                     vertical_alignment="center",
                 )
-                row_cols[0].write(_task_state_label(task["state"], has_video))
-                row_cols[1].write(_format_task_time(task["mtime"]))
-                row_cols[2].write(_format_task_subject(task["subject"]))
-                row_cols[3].write(f"{task['progress']}%")
+                # Queue position (only for processing/queued tasks)
+                queue_pos = _get_task_queue_position(task, filtered_tasks)
+                row_cols[0].write(f"#{queue_pos}" if queue_pos else "—")
+                
+                # Thumbnail preview
+                thumbnail_path = _get_task_thumbnail(task)
+                if thumbnail_path and os.path.isfile(thumbnail_path):
+                    row_cols[1].image(thumbnail_path, width=60)
+                else:
+                    row_cols[1].write("—")
+                
+                row_cols[2].write(_task_state_label(task["state"], has_video))
+                row_cols[3].write(_format_task_time(task["mtime"]))
+                row_cols[4].write(_format_task_subject(task["subject"]))
+                
+                # Enhanced progress display with ETA for processing tasks
+                if _task_state_filter_key(task) == "processing":
+                    eta_str = _estimate_task_eta(task)
+                    row_cols[5].write(f"{task['progress']}% {eta_str}")
+                else:
+                    row_cols[5].write(f"{task['progress']}%")
 
                 action_cols = row_cols[4].columns(
                     4,
@@ -1045,7 +1148,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         play_label,
                         key=f"play_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width='stretch',
                         icon=":material/play_arrow:",
                         help=play_label,
                         disabled=not has_video,
@@ -1057,7 +1160,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         open_label,
                         key=f"open_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width='stretch',
                         icon=":material/folder_open:",
                         help=open_label,
                     ):
@@ -1068,7 +1171,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         restore_label,
                         key=f"restore_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width='stretch',
                         icon=":material/replay:",
                         help=restore_label,
                         disabled=is_processing or not has_restore_data,
@@ -1085,7 +1188,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     if st.button(
                         delete_label,
                         key=f"delete_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
+                        width='stretch',
                         icon=":material/delete:",
                         help=delete_help,
                         disabled=is_busy,
@@ -1150,7 +1253,7 @@ def _render_task_video_preview():
     closed = preview_cols[1].button(
         "✕",
         key="close_task_video_preview",
-        use_container_width=True,
+        width='stretch',
         help=tr("Close"),
     )
     if closed:
@@ -1159,10 +1262,88 @@ def _render_task_video_preview():
     st.video(preview_file)
 
 
+def _plan_topic_recorded(channel, topic) -> bool:
+    """任务对应主题是否已在任意月份的月度计划中标记为已录制。"""
+    normalized = str(topic or "").strip().lower()
+    if not normalized:
+        return False
+    for _plan_dir, row in plans.iter_all_plan_rows(channel):
+        if row["recorded"] and str(row["topic"] or "").strip().lower() == normalized:
+            return True
+    return False
+
+
+def _auto_archive_plan_tasks() -> bool:
+    """把已完成、尚未归档的 WebUI 计划任务归档进频道输出目录。
+
+    仅处理写有 ``plan_meta.json`` 且有最终成片的历史任务；主题已经录制过的
+    不再重复归档，保证幂等。返回是否归档了至少一个任务，调用方据此刷新整页。
+    """
+    archived = False
+    for task in _scan_history_tasks(limit=50):
+        if not task["video_file"]:
+            continue
+        task_path = task["task_path"]
+        if os.path.isfile(os.path.join(task_path, ".plan_archived")):
+            continue
+        meta_path = os.path.join(task_path, "plan_meta.json")
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                f"skip plan task with invalid metadata: "
+                f"task_id={task['task_id']}, error={exc}"
+            )
+            continue
+        channel = str((meta or {}).get("channel") or "").strip()
+        topic = str((meta or {}).get("topic") or "").strip()
+        if not channel or not topic:
+            continue
+        if _plan_topic_recorded(channel, topic):
+            continue
+        try:
+            base = archive_video.archive_channel_video(
+                channel=channel,
+                task_dir=task_path,
+                topic=topic,
+                out_dir=plans.current_plan_dir(channel),
+                plans_root=plans.PLANS_DIR,
+                copy_media=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"failed to archive plan video: task_id={task['task_id']}, "
+                f"channel={channel}, topic={topic}, error={exc}"
+            )
+            continue
+        logger.info(
+            f"auto-archived plan video: channel={channel}, topic={topic}, "
+            f"task_id={task['task_id']}, base={base}"
+        )
+        # 主题不在 topics_30day.txt 时归档会落入「未计划录制」，iter_all_plan_rows
+        # 不会把它读成已录制记录；用按任务持久化的标记保证只归档一次，避免反复 rerun。
+        try:
+            with open(os.path.join(task_path, ".plan_archived"), "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"task_id": task["task_id"]}, ensure_ascii=False))
+        except OSError as exc:
+            logger.warning(
+                f"failed to write plan archive marker: task_id={task['task_id']}, error={exc}"
+            )
+        archived = True
+    return archived
+
+
 @st.fragment(run_every="2s")
 def _render_task_manager_entry():
     # 任务可能由当前页面或其它页面触发生成。入口单独用 fragment 定时刷新，
     # 只更新任务数量和 popover 内容，不打断主页面表单输入。
+    if _auto_archive_plan_tasks():
+        # 归档会新增媒体库条目并推进月度计划，触发一次整页刷新让各面板
+        # 立即反映归档结果；未被归档的主题在后续轮询中会跳过，不会反复刷新。
+        st.rerun(scope="app")
     task_summaries = _collect_task_summaries()
     processing_task_count = _count_processing_tasks(task_summaries)
     with st.container(key="task_manager_entry", width="content"):
@@ -1395,7 +1576,7 @@ def _render_task_restore_dialog(task_id):
     if cancel_col.button(
         tr("Cancel"),
         key="cancel_task_restore",
-        use_container_width=True,
+        width='stretch',
     ):
         st.session_state.pop("task_restore_candidate_id", None)
         st.rerun(scope="app")
@@ -1403,7 +1584,7 @@ def _render_task_restore_dialog(task_id):
         tr("Load Task Configuration"),
         key="confirm_task_restore",
         type="primary",
-        use_container_width=True,
+        width='stretch',
     ):
         st.session_state["task_restore_payload"] = payload
         st.session_state.pop("task_restore_candidate_id", None)
@@ -1682,6 +1863,76 @@ def render_onboarding_tour():
         tour.start()
 
 
+@st.cache_resource(show_spinner=False)
+def _cached_media_tools():
+    """
+    解析并固定 ffmpeg/ffprobe 的版本与哈希。
+
+    放在缓存里是因为它要跑两次 `-version` 并给两个二进制做 SHA-256；
+    每次重跑都算一遍会把 Streamlit 的重绘拖慢。该函数自身对失败关闭：
+    解析不出来就抛，由调用方降级成"缩略图不可用"。
+    """
+    return probe_media_tools()
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_project_layout():
+    """解析应用根与作品集根。作品集根缺失时不抛，交给调用方按不可用处理。"""
+    try:
+        return resolve_project_layout()
+    except Exception as exc:  # noqa: BLE001 - 配置缺失是可预期状态
+        logger.warning(f"project layout unavailable, thumbnails disabled: {exc}")
+        return None
+
+
+def _render_thumbnail_section(task_id: str):
+    """
+    在已完成结果下方渲染缩略图面板。
+
+    任何失败都只影响这一段：缩略图是附加能力，不能让它把整个结果页打不开。
+    读不到描述符时说明这个任务还没有成片身份记录，直接安静地不渲染。
+    """
+    try:
+        layout = _cached_project_layout()
+        if layout is None:
+            return
+
+        descriptor_path = (
+            layout.descriptor_root / task_id / "result_descriptor.json"
+        )
+        if not descriptor_path.is_file():
+            return
+
+        descriptor = read_result_descriptor(descriptor_path)
+        tools = _cached_media_tools()
+    except (ResultDescriptorError, ThumbnailFilesError, MediaToolsError) as exc:
+        logger.info(f"thumbnail section skipped: task_id={task_id}, reason={exc}")
+        return
+    except Exception as exc:  # noqa: BLE001 - 附加功能不应影响主流程
+        logger.warning(
+            f"unexpected error preparing thumbnail section: "
+            f"task_id={task_id}, error={exc}"
+        )
+        return
+
+    if not descriptor.videos:
+        return
+
+    try:
+        render_thumbnail_panel(
+            descriptor=descriptor,
+            manifest_path=layout.thumbnail_root / task_id / "manifest.json",
+            thumbnail_root=layout.thumbnail_root / task_id,
+            source_root=layout.storage_root / "tasks" / task_id,
+            tools=tools,
+            tr=tr,
+        )
+    except Exception as exc:  # noqa: BLE001 - 同上，附加功能不应影响主流程
+        logger.warning(
+            f"failed to render thumbnail panel: task_id={task_id}, error={exc}"
+        )
+
+
 def _render_generation_logs(task_id):
     """渲染后台任务日志快照，不从工作线程访问 Streamlit 会话状态。"""
     if config.ui.get("hide_log", False):
@@ -1774,13 +2025,15 @@ def _render_generation_task_snapshot(task_id, task):
                         key=f"download_generated_video_{task_id}_{i}",
                         icon=":material/download:",
                         on_click="ignore",
-                        use_container_width=True,
+                        width='stretch',
                     )
     except Exception as exc:
         logger.exception(
             f"failed to render generated video preview: task_id={task_id}, "
             f"video_files={video_files}, error={exc}"
         )
+
+    _render_thumbnail_section(task_id)
 
     _render_generation_logs(task_id)
     if st.session_state.get("handled_generation_task_id") != task_id:
@@ -2204,7 +2457,7 @@ def _render_cache_management_settings(panel):
         if refresh_col.button(
             tr("Refresh Cache Stats"),
             key="refresh_video_cache_stats",
-            use_container_width=True,
+            width='stretch',
             icon=":material/refresh:",
         ):
             _get_video_cache_stats.clear()
@@ -2213,7 +2466,7 @@ def _render_cache_management_settings(panel):
         if open_col.button(
             tr("Open Cache Directory"),
             key="open_video_cache_directory",
-            use_container_width=True,
+            width='stretch',
             icon=":material/folder_open:",
         ):
             webbrowser.open(Path(cache_manager.video_cache_dir()).as_uri())
@@ -2224,7 +2477,7 @@ def _render_cache_management_settings(panel):
             key="clean_video_cache_now",
             type="primary",
             disabled=cleanup_disabled,
-            use_container_width=True,
+            width='stretch',
             icon=":material/delete_sweep:",
         ):
             result = cache_manager.clean_video_cache(max_age_days=max_age_days)
@@ -2468,7 +2721,7 @@ def _render_settings_transfer(params):
             ),
             file_name=SETTINGS_PRESET_FILE_NAME,
             mime="application/json",
-            use_container_width=True,
+            width='stretch',
             key="export_settings_preset_button",
             icon=":material/download:",
         )
@@ -2523,7 +2776,7 @@ def _render_key_backup_settings(panel):
             file_name=KEY_BACKUP_FILE_NAME,
             mime="application/json",
             disabled=backup_key_count == 0,
-            use_container_width=True,
+            width='stretch',
             key="export_key_backup_button",
             icon=":material/download:",
         )
@@ -2943,7 +3196,7 @@ def _render_settings_dialog():
             if llm_form_panel.button(
                 tr("Test LLM Connection"),
                 key="test_llm_connection_button",
-                use_container_width=True,
+                width='stretch',
                 type="secondary",
                 icon=":material/network_check:",
             ):
@@ -3206,7 +3459,7 @@ def _render_loomloom_video_settings(params):
     if st.button(
         tr("Get LoomLoom Quote"),
         key="loomloom_quote_videos",
-        use_container_width=True,
+        width='stretch',
         type="secondary",
         icon=":material/request_quote:",
         disabled=not token or batch is None,
@@ -3289,7 +3542,7 @@ def _render_local_script_generation(params):
     if not st.button(
         tr("Generate Video Script and Keywords"),
         key="auto_generate_script",
-        use_container_width=True,
+        width='stretch',
         type="secondary",
         icon=":material/auto_awesome:",
     ):
@@ -3363,7 +3616,7 @@ def _render_loomloom_candidates():
         tr("Use Selected Candidate"),
         key="loomloom_apply_candidate",
         type="primary",
-        use_container_width=True,
+        width='stretch',
     ):
         st.session_state["video_script"] = selected.script
         st.session_state["video_terms"] = ", ".join(selected.video_terms)
@@ -3491,7 +3744,7 @@ def _render_loomloom_script_generation(params):
     if st.button(
         tr("Get LoomLoom Quote"),
         key="loomloom_quote_scripts",
-        use_container_width=True,
+        width='stretch',
         type="secondary",
         icon=":material/request_quote:",
         disabled=not effective_token or bool(st.session_state.get("loomloom_run_id")),
@@ -3565,7 +3818,7 @@ def _render_loomloom_script_generation(params):
         if st.button(
             tr("Run LoomLoom Batch"),
             key="loomloom_execute_scripts",
-            use_container_width=True,
+            width='stretch',
             type="primary",
             disabled=(not quote_is_current or not confirm_charge or run_in_progress),
         ):
@@ -3604,7 +3857,7 @@ def _render_loomloom_script_generation(params):
         if retry_col.button(
             tr("Resume LoomLoom Status Check"),
             key="loomloom_resume_status_check",
-            use_container_width=True,
+            width='stretch',
             type="secondary",
         ):
             st.session_state["loomloom_run_error"] = ""
@@ -3615,7 +3868,7 @@ def _render_loomloom_script_generation(params):
         if stop_col.button(
             tr("Stop Tracking LoomLoom Run"),
             key="loomloom_stop_tracking_run",
-            use_container_width=True,
+            width='stretch',
             type="secondary",
             help=tr("Stop Tracking LoomLoom Run Help"),
         ):
@@ -3730,14 +3983,14 @@ def _render_script_settings(panel, params):
                         key="restore_default_system_prompt",
                         icon=":material/restart_alt:",
                         on_click=reset_script_system_prompt,
-                        use_container_width=True,
+                        width='stretch',
                     ):
                         st.toast(tr("Default System Prompt Restored"))
                     if preview_prompt_col.button(
                         tr("Preview Final Prompt"),
                         key="preview_final_script_prompt",
                         icon=":material/preview:",
-                        use_container_width=True,
+                        width='stretch',
                     ):
                         render_script_prompt_preview(
                             llm.build_script_prompt(
@@ -3767,7 +4020,7 @@ def _render_script_settings(panel, params):
             elif st.button(
                 tr("Generate Video Keywords"),
                 key="auto_generate_terms",
-                use_container_width=True,
+                width='stretch',
                 type="secondary",
                 icon=":material/auto_awesome:",
             ):
@@ -4333,14 +4586,14 @@ def _render_voice_preview(params, friendly_names, selected_tts_server, voice_nam
         tr("Play Voice"),
         key="play_voice_button",
         icon=":material/graphic_eq:",
-        use_container_width=True,
+        width='stretch',
     )
     full_preview_requested = preview_columns[1].button(
         tr("Generate Full Voiceover Preview"),
         key="generate_full_voiceover_preview_button",
         icon=":material/article:",
         help=tr("Full Voiceover Preview Cost Hint"),
-        use_container_width=True,
+        width='stretch',
         disabled=not bool(script_content),
     )
 
@@ -4595,7 +4848,7 @@ def _render_minimax_tts_settings() -> tuple[list[str], dict[str, str]]:
         tr("Load MiniMax Voices"),
         key="load_minimax_voices_button",
         icon=":material/refresh:",
-        use_container_width=True,
+        width='stretch',
     ):
         try:
             available_voices = voice.get_minimax_voice_catalog(
@@ -4887,7 +5140,7 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         if st.button(
             tr("Test Sonilo Connection"),
             key="test_sonilo_connection_button",
-            use_container_width=True,
+            width='stretch',
         ):
             try:
                 sonilo_service.test_connection()
@@ -4916,7 +5169,7 @@ def _render_background_music_settings(params, elevenlabs_api_key_rendered=False)
         if st.button(
             tr("Test ElevenLabs Connection"),
             key="test_elevenlabs_music_connection_button",
-            use_container_width=True,
+            width='stretch',
         ):
             try:
                 elevenlabs_music_service.test_connection()
@@ -5701,7 +5954,7 @@ def _render_subtitle_settings(panel, params):
                 key="restore_default_subtitle_settings",
                 icon=":material/restart_alt:",
                 on_click=reset_subtitle_settings,
-                use_container_width=True,
+                width='stretch',
             ):
                 st.toast(tr("Default Subtitle Settings Restored"))
 
@@ -5744,11 +5997,18 @@ def _render_generation_controls(
 
     start_button = st.button(
         tr("Generate Video"),
-        use_container_width=True,
+        width='stretch',
         type="primary",
         key="generate_video_button",
         on_click=_prepare_generation_task,
     )
+    # 活动面板的“用作视频主题”按钮会写入该标志，表示用户希望用刚才载入的
+    # 活动文案直接开始生成。这里把它等价于一次真实的“生成视频”点击：手动
+    # 复用同样的任务准备与校验逻辑，避免出现第二条提交路径无法获得 API 密钥、
+    # 本地素材等校验的状态。
+    if st.session_state.pop("campaign_auto_generate", False):
+        _prepare_generation_task()
+        start_button = True
     render_onboarding_tour()
     if start_button:
         _save_runtime_config()
@@ -6040,6 +6300,657 @@ def _render_generation_controls(
     return start_button
 
 
+# -----------------------------------------------------------------------------
+# 内容计划与发布：读取 plans/<channel>、生成“今日”视频、经 Chrome 发布
+# -----------------------------------------------------------------------------
+
+
+def _plan_python() -> str:
+    return os.path.join(root_dir, ".venv", "bin", "python")
+
+
+def _plan_uploader_tool() -> str:
+    return os.path.join(tools_dir, "youtube_uploader.py")
+
+
+def _run_plan_uploader(args, timeout=900) -> dict:
+    command = [_plan_python(), _plan_uploader_tool()] + args
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "uploader timed out"}
+    output = (proc.stdout or "").strip()
+    if not output:
+        return {
+            "success": False,
+            "error": (proc.stderr or "uploader produced no output").strip(),
+        }
+    last_line = output.splitlines()[-1]
+    try:
+        return json.loads(last_line)
+    except (ValueError, TypeError):
+        return {"success": False, "error": last_line}
+
+
+def _build_plan_params(channel, topic) -> VideoParams:
+    env = plans.read_automation_env(channel)
+    params = VideoParams(video_subject=topic)
+    if env.get("VIDEO_ASPECT"):
+        params.video_aspect = VideoAspect.portrait
+    if env.get("VOICE_NAME"):
+        params.voice_name = env["VOICE_NAME"]
+    else:
+        # Fallback voice for channels without automation.env
+        params.voice_name = "en-US-AvaMultilingualNeural"
+    if env.get("VOICE_RATE"):
+        try:
+            params.voice_rate = float(env["VOICE_RATE"])
+        except ValueError:
+            pass
+    if env.get("VIDEO_LANGUAGE"):
+        params.video_language = env["VIDEO_LANGUAGE"]
+    if env.get("PARAGRAPH_NUMBER"):
+        try:
+            params.paragraph_number = int(env["PARAGRAPH_NUMBER"])
+        except ValueError:
+            pass
+    if env.get("BGM_TYPE"):
+        params.bgm_type = env["BGM_TYPE"]
+    if env.get("BGM_VOLUME"):
+        try:
+            params.bgm_volume = float(env["BGM_VOLUME"])
+        except ValueError:
+            pass
+    system_prompt = plans.read_file_text(channel, "system_prompt.txt")
+    if system_prompt:
+        params.custom_system_prompt = system_prompt
+    return params
+
+
+def _submit_plan_generation(channel, topic) -> None:
+    task_id = str(uuid4())
+    _add_active_generation_task(task_id, subject=topic)
+    # 记录该任务归属于哪个频道/主题。任务完成后，任务管理 fragment 会读取这份
+    # 元数据，把成片归档进 outputs/<channel>/<月份>/videos/ 并推进月度计划。
+    plan_meta = {"channel": channel, "topic": topic}
+    try:
+        task_path = utils.task_dir(task_id)
+        os.makedirs(task_path, exist_ok=True)
+        with open(os.path.join(task_path, "plan_meta.json"), "w", encoding="utf-8") as handle:
+            json.dump(plan_meta, handle, ensure_ascii=False)
+    except OSError as exc:
+        logger.warning(f"failed to write plan task metadata: channel={channel}, error={exc}")
+    params = _build_plan_params(channel, topic)
+    _save_runtime_config()
+    try:
+        st.toast(tr("Generating Video"))
+        logger.info(f"plan generation submitted: channel={channel}, task_id={task_id}")
+        webui_task.submit_generation(
+            task_id=task_id,
+            params=params,
+            capture_logs=not config.ui.get("hide_log", False),
+        )
+    except Exception:
+        _remove_active_generation_task(task_id)
+        st.error(tr("Video Generation Failed"))
+        st.stop()
+    st.session_state["current_generation_task_id"] = task_id
+    st.rerun()
+
+
+def _publish_via_browser(channel, video_path, title, index=None, plan_dir=None) -> dict:
+    description = plans.read_file_text(channel, "channel_description.md")
+    result = _run_plan_uploader(
+        [
+            "--profile",
+            channel,
+            "--publish",
+            video_path,
+            "--title",
+            title,
+            "--description",
+            description,
+        ]
+    )
+    if result.get("success") and index is not None and result.get("video_url"):
+        plans.mark_posted(channel, index, result["video_url"], plan_dir=plan_dir)
+    return result
+
+
+def _latest_generated_video():
+    has_video = ""
+    subject = ""
+    for task in _scan_history_tasks(limit=30):
+        if task["video_file"]:
+            has_video = task["video_file"]
+            subject = task["subject"]
+            break
+    return has_video, subject
+
+
+def _render_plan_panel():
+    channels = [c for c in plans.list_channels() if c]
+    if not channels:
+        return
+    default_channel = (
+        "history-mysteries" if "history-mysteries" in channels else channels[0]
+    )
+    channel = st.selectbox(
+        tr("Plan Channel"),
+        channels,
+        index=channels.index(default_channel),
+        key="plan_channel_select",
+    )
+
+    pending = plans.first_pending_topic(channel)
+    env = plans.read_automation_env(channel)
+
+    if pending:
+        index, topic = pending
+        st.markdown(
+            f"**{tr('Today Topic')}** #{index}: {topic}"
+        )
+        if env:
+            st.caption(" · ".join(f"{k}={v}" for k, v in env.items()))
+    else:
+        st.info(tr("All Topics Recorded"))
+
+    action_cols = st.columns([1, 1, 1], vertical_alignment="center")
+    with action_cols[0]:
+        if st.button(
+            tr("Generate Today Video"),
+            width='stretch',
+            type="primary",
+            disabled=not pending,
+            key="plan_generate_today_button",
+        ):
+            _submit_plan_generation(channel, pending[1])
+
+    latest_video, latest_subject = _latest_generated_video()
+    with action_cols[1]:
+        if st.button(
+            tr("Publish Latest Video"),
+            width='stretch',
+            disabled=not latest_video,
+            key="plan_publish_latest_button",
+        ):
+            with st.spinner(tr("Uploading To YouTube")):
+                result = _publish_via_browser(
+                    channel, latest_video, latest_subject or os.path.basename(latest_video)
+                )
+            if result.get("success"):
+                st.success(tr("Video Published"))
+                if result.get("video_url"):
+                    st.write(result["video_url"])
+            else:
+                st.error(result.get("error", tr("Video Publish Failed")))
+            st.rerun()
+
+    login = st.session_state.get("plan_login_result")
+    with action_cols[2]:
+        if st.button(
+            tr("Channel Sign In"),
+            width='stretch',
+            disabled=bool(login and login.get("logged_in")),
+            key="plan_channel_login_button",
+        ):
+            check = _run_plan_uploader(["--profile", channel, "--check"], timeout=180)
+            if check.get("logged_in"):
+                st.session_state["plan_login_result"] = check
+                st.rerun()
+            elif _run_plan_uploader(
+                ["--profile", channel, "--login"], timeout=240
+            ).get("success"):
+                st.session_state["plan_login_result"] = {
+                    "success": True,
+                    "logged_in": True,
+                }
+                st.rerun()
+            else:
+                st.error(tr("Channel Login Failed"))
+
+    if login:
+        if login.get("logged_in"):
+            st.caption(f"✅ {tr('Channel Logged In')}")
+        else:
+            st.caption(f"⚠️ {tr('Channel Not Logged In')}")
+
+    plan_rows = plans.load_monthly_plan(channel)
+    if not plan_rows:
+        return
+    st.divider()
+    with st.container(border=True, key="plan_rows_container"):
+        for row in plan_rows:
+            if not row["recorded"]:
+                continue
+            video_path = plans.find_video_path(channel, row["index"])
+            post_disabled = bool(row["posted"]) or not video_path
+            cols = st.columns([0.5, 4.0, 0.9, 1.6], vertical_alignment="center")
+            cols[0].write(f"#{row['index']}")
+            cols[1].write(row["topic"])
+            cols[2].write("🔗" if row["posted"] else "—")
+            with cols[3]:
+                if st.button(
+                    tr("Post Video"),
+                    width='stretch',
+                    disabled=post_disabled,
+                    key=f"plan_post_row_{channel}_{row['index']}",
+                ):
+                    with st.spinner(tr("Uploading To YouTube")):
+                        result = _publish_via_browser(
+                            channel, video_path, row["topic"], index=row["index"]
+                        )
+                    if result.get("success"):
+                        st.success(tr("Video Published"))
+                        if result.get("video_url"):
+                            st.write(result["video_url"])
+                    else:
+                        st.error(result.get("error", tr("Video Publish Failed")))
+                    st.rerun()
+
+
+def _open_path_in_folder(path):
+    folder = os.path.dirname(os.path.abspath(path))
+    if sys.platform.startswith("darwin"):
+        return subprocess.Popen(["open", folder], stderr=subprocess.DEVNULL)
+    if os.name == "nt":
+        return subprocess.Popen(["explorer", "/select,", os.path.abspath(path)])
+    return subprocess.Popen(["xdg-open", folder], stderr=subprocess.DEVNULL)
+
+
+def _media_library_entries(channel):
+    entries = plans.list_channel_videos(channel)
+    row_index = plans.build_video_row_index(channel)
+    for entry in entries:
+        match = row_index.get(entry["name"])
+        if match:
+            plan_dir, row = match
+            entry["topic"] = (row["topic"] or entry["topic"]).strip() or entry["name"]
+            entry["plan_index"] = row["index"]
+            entry["plan_dir"] = plan_dir
+            entry["posted"] = bool(row.get("posted"))
+            entry["video_url"] = row.get("posted") or ""
+        else:
+            entry["topic"] = entry["topic"].strip() or entry["name"]
+            entry["plan_index"] = None
+            entry["plan_dir"] = None
+            entry["posted"] = False
+            entry["video_url"] = ""
+    return entries
+
+
+# Cap the per-channel dataframe at the newest N rows so the library stays
+# responsive once a channel has archived thousands of videos.
+_MEDIA_LIBRARY_TABLE_LIMIT = 200
+
+
+def _render_media_library():
+    channels = [c for c in plans.list_channels() if c]
+    if not channels:
+        return
+    tabs = st.tabs([f"{channel}" for channel in channels])
+    for tab, channel in zip(tabs, channels):
+        with tab:
+            entries = _media_library_entries(channel)
+            posted_count = sum(1 for entry in entries if entry["posted"])
+            metric_cols = st.columns(3, gap="small")
+            metric_cols[0].metric(tr("Videos Built"), len(entries))
+            metric_cols[1].metric(tr("Posted To YouTube"), posted_count)
+            metric_cols[2].metric(tr("Not Posted"), len(entries) - posted_count)
+            if not entries:
+                st.markdown(
+                    f"<p class='mpt-empty-state'>{tr('No Generated Videos Yet')}</p>",
+                    unsafe_allow_html=True,
+                )
+                continue
+            preview_names = [
+                f"#{str(entry.get('plan_index') or '—')}  ·  {entry['date']}  ·  {entry['name']}"
+                for entry in entries
+            ]
+            pick_name = st.selectbox(
+                tr("Preview Video"),
+                preview_names,
+                key=f"media_library_preview_{channel}",
+            )
+            pick_index = preview_names.index(pick_name)
+            entry = entries[pick_index]
+            local = entry["path"]
+            if st.checkbox(
+                tr("Show Preview"),
+                value=False,
+                key=f"media_library_show_video_{channel}",
+            ):
+                st.video(local)
+            badge = (
+                "<span class='mpt-badge mpt-badge--posted'>● Posted</span>"
+                if entry["posted"]
+                else "<span class='mpt-badge mpt-badge--draft'>● Draft</span>"
+            )
+            st.markdown(
+                f"<p class='mpt-media-caption'>{badge} "
+                f"{html.escape(entry['topic'])}</p>",
+                unsafe_allow_html=True,
+            )
+            action_cols = st.columns([1, 1, 3], gap="small")
+            with action_cols[0]:
+                if st.button(
+                    tr("Post Video"),
+                    type="primary",
+                    width='stretch',
+                    disabled=entry["posted"],
+                    key=f"media_library_post_{channel}_{pick_index}",
+                ):
+                    with st.spinner(tr("Uploading To YouTube")):
+                        result = _publish_via_browser(
+                            channel,
+                            local,
+                            entry["topic"],
+                            index=entry["plan_index"],
+                            plan_dir=entry["plan_dir"],
+                        )
+                    if result.get("success"):
+                        st.success(tr("Video Published"))
+                        if result.get("video_url"):
+                            st.write(result["video_url"])
+                    else:
+                        st.error(result.get("error", tr("Video Publish Failed")))
+                    st.rerun()
+            with action_cols[1]:
+                if st.button(
+                    tr("Open Folder"),
+                    width='stretch',
+                    key=f"media_library_open_{channel}_{pick_index}",
+                ):
+                    _open_path_in_folder(local)
+            st.divider()
+            library_rows = []
+            shown_entries = entries[:_MEDIA_LIBRARY_TABLE_LIMIT]
+            for entry in shown_entries:
+                library_rows.append(
+                    {
+                        tr("Index"): entry["plan_index"] or "—",
+                        tr("Date"): entry["date"],
+                        tr("Topic"): entry["topic"],
+                        tr("Status"): tr("Posted") if entry["posted"] else tr("Draft"),
+                    }
+                )
+            if len(entries) > len(shown_entries):
+                st.caption(
+                    f"Showing newest {len(shown_entries)} of {len(entries)} videos"
+                )
+            st.dataframe(
+                library_rows,
+                width='stretch',
+                hide_index=True,
+                key=f"media_library_table_{channel}",
+            )
+
+
+def _as_campaign_list(value):
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return []
+
+
+def _render_campaign_panel():
+    """活动内容工作台：从链接/文本理解活动简报，生成可直接发布的文案包。"""
+    with st.container(border=True):
+        st.markdown(
+            f"<p class='mpt-explain'>{html.escape(tr('Campaign Content Help'))}</p>",
+            unsafe_allow_html=True,
+        )
+        saved_campaigns = campaign_service.list_saved_campaigns()
+        if saved_campaigns:
+            saved_options = campaign_service.saved_campaign_options(saved_campaigns)
+            with st.container(key="campaign_saved_loader"):
+                loader_cols = st.columns([3, 1], gap="small", vertical_alignment="center")
+                with loader_cols[0]:
+                    saved_label = st.selectbox(
+                        tr("Saved Campaigns"),
+                        list(saved_options),
+                        key="campaign_saved_select",
+                    )
+                with loader_cols[1]:
+                    if st.button(
+                        tr("Load Saved Campaign"),
+                        width='stretch',
+                        key="campaign_load_saved_button",
+                    ):
+                        try:
+                            loaded = campaign_service.load_saved_campaign(
+                                saved_options[saved_label]
+                            )
+                        except Exception as exc:
+                            st.error(f"{tr('Campaign Load Failed')}: {exc}")
+                        else:
+                            st.session_state["campaign_source"] = loaded["source"].to_dict()
+                            st.session_state["campaign_brief"] = loaded["brief"]
+                            st.session_state["campaign_posts"] = loaded["posts"]
+                            st.toast(tr("Campaign Loaded"))
+                            st.rerun()
+            st.divider()
+        with st.container(key="campaign_input_container"):
+            campaign_link = st.text_input(
+                tr("Campaign Link Or Text"),
+                placeholder=tr("Campaign Link Placeholder"),
+                key="campaign_link_input",
+            )
+
+        fetch_cols = st.columns([1, 1], gap="small", vertical_alignment="center")
+        with fetch_cols[0]:
+            if st.button(
+                tr("Fetch And Understand"),
+                type="primary",
+                width='stretch',
+                disabled=not (campaign_link or "").strip(),
+                key="campaign_fetch_button",
+            ):
+                raw = (campaign_link or "").strip()
+                try:
+                    with st.spinner(tr("Fetching Campaign Source")):
+                        source = campaign_service.fetch_campaign_source(raw)
+                    if not source.text and not source.refs:
+                        st.session_state["campaign_source"] = None
+                        st.session_state["campaign_brief"] = None
+                        st.session_state["campaign_posts"] = None
+                        st.warning(tr("Campaign Source Empty"))
+                    else:
+                        st.session_state["campaign_source"] = source.to_dict()
+                        st.session_state["campaign_brief"] = None
+                        st.session_state["campaign_posts"] = None
+                        st.toast(tr("Campaign Source Fetched"))
+                        st.rerun()
+                except Exception as exc:
+                    st.session_state["campaign_source"] = None
+                    st.session_state["campaign_brief"] = None
+                    st.session_state["campaign_posts"] = None
+                    st.error(f"{tr('Campaign Fetch Failed')}: {exc}")
+
+        source = st.session_state.get("campaign_source")
+        if not source:
+            st.markdown(
+                f"<p class='mpt-empty-state'>{html.escape(tr('No Campaign Source Yet'))}</p>",
+                unsafe_allow_html=True,
+            )
+            return
+
+        st.markdown(f"**{tr('Campaign Source')}**")
+        kind_labels = {
+            "notion": tr("Kind Notion"),
+            "drive_file": tr("Kind Drive File"),
+            "drive_folder": tr("Kind Drive Folder"),
+            "docs": tr("Kind Drive Docs"),
+            "url": tr("Kind Url"),
+            "text": tr("Kind Text"),
+        }
+        kind_label = kind_labels.get(source.get("kind")) or tr("Campaign Source")
+        st.caption(
+            f"{kind_label}  ·  {source.get('title') or source.get('url') or '(pasted text)'}"
+        )
+        with st.expander(tr("Campaign Source Text"), expanded=False):
+            st.code(source.get("text") or tr("Campaign Source Empty"), language=None, height=400)
+        if source.get("refs"):
+            with st.expander(tr("Campaign Media References"), expanded=False):
+                for ref in source.get("refs", []):
+                    st.markdown(f"- {ref.get('title') or ref.get('url')}")
+                    if ref.get("url"):
+                        st.caption(ref["url"])
+
+        with fetch_cols[1]:
+            if st.button(
+                tr("Build Campaign Brief"),
+                width='stretch',
+                key="campaign_brief_button",
+            ):
+                try:
+                    with st.spinner(tr("Building Campaign Brief")):
+                        brief = campaign_service.understand_campaign(
+                            campaign_service.CampaignSource.from_dict(source)
+                        )
+                    st.session_state["campaign_brief"] = brief
+                    st.session_state["campaign_posts"] = None
+                    st.toast(tr("Campaign Brief Built"))
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"{tr('Campaign Brief Failed')}: {exc}")
+
+        brief = st.session_state.get("campaign_brief")
+        if brief:
+            st.divider()
+            st.markdown(f"**{tr('Campaign Brief')}**")
+            st.markdown(f"- **{tr('Campaign Name')}**: {brief.get('campaign_name') or '—'}")
+            st.markdown(f"- **{tr('Brand')}**: {brief.get('brand') or '—'}")
+            st.markdown(f"- **{tr('Goal')}**: {brief.get('goal') or '—'}")
+            st.markdown(f"- **{tr('Audience')}**: {brief.get('audience') or '—'}")
+            st.markdown(f"- **{tr('Tone')}**: {brief.get('tone') or '—'}")
+            platforms = ", ".join(_as_campaign_list(brief.get("platforms")))
+            st.markdown(f"- **{tr('Platforms')}**: {platforms or '—'}")
+            hashtags = ", ".join(_as_campaign_list(brief.get("hashtags")))
+            hashtag_line = f"#{hashtags.replace(', ', ' #')}" if hashtags else "—"
+            st.markdown(f"- **{tr('Hashtags')}**: {hashtag_line}")
+            requirements = _as_campaign_list(brief.get("requirements"))
+            if requirements:
+                st.markdown(f"**{tr('Requirements')}**")
+                for req in requirements:
+                    st.markdown(f"- {req}")
+            source_materials = _as_campaign_list(brief.get("source_materials"))
+            if source_materials:
+                st.markdown(f"**{tr('Source Materials')}**")
+                for url in source_materials:
+                    st.markdown(f"- {url}")
+
+            gen_cols = st.columns([1, 1], gap="small", vertical_alignment="center")
+            with gen_cols[0]:
+                post_count = st.number_input(
+                    tr("Campaign Posts Count"),
+                    min_value=1,
+                    max_value=20,
+                    value=int(st.session_state.get("campaign_post_count", 5)),
+                    key="campaign_post_count_input",
+                )
+                st.session_state["campaign_post_count"] = int(post_count)
+            with gen_cols[1]:
+                if st.button(
+                    tr("Generate Campaign Posts"),
+                    type="primary",
+                    width='stretch',
+                    key="campaign_generate_button",
+                ):
+                    try:
+                        with st.spinner(tr("Generating Campaign Posts")):
+                            posts = campaign_service.generate_campaign_posts(
+                                brief, count=int(post_count)
+                            )
+                        st.session_state["campaign_posts"] = posts
+                        st.toast(tr("Campaign Posts Generated"))
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"{tr('Campaign Generate Failed')}: {exc}")
+
+            posts = st.session_state.get("campaign_posts")
+            if posts:
+                st.divider()
+                st.markdown(f"**{tr('Content Pieces')}**")
+                for index, post in enumerate(posts, start=1):
+                    with st.expander(
+                        f"#{index}  {post.get('title') or tr('Untitled Post')}",
+                        expanded=index == 1,
+                    ):
+                        st.markdown(f"**{tr('Hook')}**: {post.get('hook') or '—'}")
+                        st.markdown(f"**{tr('Script')}**")
+                        st.code(post.get("script") or "", language=None)
+                        on_screen = post.get("on_screen_text") or ""
+                        st.markdown(
+                            f"**{tr('On Screen Text')}**: {on_screen or '—'}"
+                        )
+                        st.markdown(f"**{tr('CTA')}**: {post.get('cta') or '—'}")
+                        st.markdown(f"**{tr('Hashtags')}**: {' '.join('#' + h for h in _as_campaign_list(post.get('hashtags'))) or '—'}")
+                        st.markdown(f"**{tr('Ready To Post')}**")
+                        st.code(post.get("ready_to_post") or "", language="markdown")
+                        if st.button(
+                            tr("Use Title As Video Subject"),
+                            width='stretch',
+                            key=f"campaign_use_subject_{index}",
+                        ):
+                            st.session_state["video_subject"] = post.get("title") or ""
+                            st.session_state["video_script"] = post.get("script") or ""
+                            # 单击语义：把活动标题文案载入生成表单，并立即触发视频生成。
+                            # 生成控制面板在同一次页面执行中会消费该标志，沿用与手动
+                            # 点击“生成视频”完全一致的校验与提交流程。
+                            st.session_state["campaign_auto_generate"] = True
+                            st.toast(tr("Campaign Subject Loaded"))
+                accept_cols = st.columns([1, 1], gap="small", vertical_alignment="center")
+                with accept_cols[0]:
+                    if st.button(
+                        tr("Accept Campaign"),
+                        type="primary",
+                        width='stretch',
+                        key="campaign_accept_button",
+                    ):
+                        try:
+                            saved_meta = campaign_service.save_campaign(
+                                campaign_service.CampaignSource.from_dict(source),
+                                brief,
+                                posts,
+                            )
+                        except Exception as exc:
+                            st.error(f"{tr('Campaign Save Failed')}: {exc}")
+                        else:
+                            st.session_state["campaign_saved_last"] = saved_meta
+                            st.toast(tr("Campaign Accepted"))
+                            st.rerun()
+                with accept_cols[1]:
+                    st.download_button(
+                        tr("Download Campaign Markdown"),
+                        data=campaign_service.build_campaign_markdown(
+                            campaign_service.CampaignSource.from_dict(source),
+                            brief,
+                            posts,
+                        ),
+                        file_name="campaign-content.md",
+                        mime="text/markdown",
+                        width='stretch',
+                        key="campaign_download_markdown",
+                    )
+                saved_last = st.session_state.get("campaign_saved_last")
+                if saved_last:
+                    st.caption(
+                        f"✅ {tr('Campaign Saved As')}: {saved_last.get('campaign_id')}"
+                    )
+            elif posts is not None:
+                st.markdown(
+                    f"<p class='mpt-empty-state'>{html.escape(tr('Campaign Posts Empty'))}</p>",
+                    unsafe_allow_html=True,
+                )
+
+
 def _render_application():
     """按固定顺序渲染顶部栏、弹窗、生成表单和任务结果。"""
     _render_top_bar()
@@ -6057,6 +6968,15 @@ def _render_application():
     restore_succeeded = st.session_state.pop("task_restore_succeeded", False)
     if restore_applied or restore_succeeded:
         st.success(tr("Task Configuration Loaded"))
+
+    with st.expander(tr("Content Plan And Publishing"), expanded=True):
+        _render_plan_panel()
+
+    with st.expander(tr("Generated Videos Library"), expanded=False):
+        _render_media_library()
+
+    with st.expander(tr("Campaign Content Studio"), expanded=False):
+        _render_campaign_panel()
 
     with st.container(key="main_settings_grid"):
         panel = st.columns(4)

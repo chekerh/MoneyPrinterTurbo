@@ -216,6 +216,9 @@ def test_completed_task_renders_subject_named_video_download(
         "st": fake_st,
         "tr": lambda key: key,
         "_render_generation_logs": lambda _task_id: None,
+        # 缩略图面板由 test_webui_thumbnail_integration.py 单独覆盖；
+        # 这里只测下载按钮，因此按同样的约定把协作函数替换成空实现。
+        "_render_thumbnail_section": lambda _task_id: None,
     }
     module = ast.fix_missing_locations(ast.Module(body=selected_nodes, type_ignores=[]))
     exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)
@@ -242,7 +245,7 @@ def test_completed_task_renders_subject_named_video_download(
                 "key": "download_generated_video_download-test_0",
                 "icon": ":material/download:",
                 "on_click": "ignore",
-                "use_container_width": True,
+                "width": "stretch",
             },
         )
     ]
