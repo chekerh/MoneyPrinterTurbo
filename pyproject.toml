@@ -34,6 +34,11 @@ dependencies = [
     "audioop-lts==0.2.2; python_version >= '3.13'",
     "litellm==1.86.2",
     "google-genai==2.11.0",
+    # youtube_upload.py 直接 import 这两个包。之前只有 google-genai 被声明，
+    # 于是本地 venv 里有（装过），但 `uv sync --frozen` 的干净环境里没有：
+    # 一导入就 ModuleNotFoundError，测试在收集阶段就崩。依赖必须写出来。
+    "google-auth-oauthlib==1.4.1",
+    "google-api-python-client==2.200.0",
     # Used directly by app.services.thumbnail for text compositing.
     # Previously only present transitively via moviepy, which is not a
     # guarantee that will survive a dependency change.
