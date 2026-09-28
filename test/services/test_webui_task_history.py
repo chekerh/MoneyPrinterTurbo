@@ -1,6 +1,8 @@
 import ast
 import os
 import re
+import subprocess
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -9,6 +11,8 @@ ROOT_DIR = Path(__file__).parent.parent.parent
 WEBUI_MAIN = ROOT_DIR / "webui" / "Main.py"
 TASK_HISTORY_HELPERS = {
     "_find_final_task_video",
+    "_is_settled_video_file",
+    "_probe_video_dimensions",
     "_build_video_download_name",
     "_build_restore_upload_requirements",
     "_get_unmet_restore_upload_requirements",
@@ -16,10 +20,18 @@ TASK_HISTORY_HELPERS = {
 TASK_HISTORY_CONSTANTS = {
     "_FINAL_VIDEO_PATTERN",
     "_DOWNLOAD_FILENAME_INVALID_PATTERN",
+    "_MEDIA_PROBE_TIMEOUT_SECONDS",
+    "_VIDEO_SETTLE_SECONDS",
+    "_VIDEO_DIMENSIONS_CACHE",
     "VOICE_MODE_TTS",
     "VOICE_MODE_UPLOAD",
     "VOICE_MODE_NONE",
 }
+
+
+class _NullLogger:
+    def debug(self, *args, **kwargs):
+        pass
 
 
 def _load_task_history_helpers():
@@ -37,10 +49,24 @@ def _load_task_history_helpers():
             for target in node.targets
         ):
             selected_nodes.append(node)
+        elif isinstance(node, ast.AnnAssign) and (
+            isinstance(node.target, ast.Name)
+            and node.target.id in TASK_HISTORY_CONSTANTS
+        ):
+            # 带类型注解的常量（例如 ``_VIDEO_DIMENSIONS_CACHE: dict = {}``）
+            # 同样是 Assign 之外的另一种节点形态，漏掉会让引用它的函数 NameError。
+            selected_nodes.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in TASK_HISTORY_HELPERS:
             selected_nodes.append(node)
 
-    namespace = {"os": os, "re": re, "Mapping": Mapping}
+    namespace = {
+        "os": os,
+        "re": re,
+        "time": time,
+        "subprocess": subprocess,
+        "Mapping": Mapping,
+        "logger": _NullLogger(),
+    }
     module = ast.fix_missing_locations(ast.Module(body=selected_nodes, type_ignores=[]))
     exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)
     return namespace
@@ -57,8 +83,40 @@ get_unmet_restore_upload_requirements = TASK_HISTORY_NAMESPACE[
 ]
 
 
-def test_find_final_task_video_ignores_intermediate_files(tmp_path):
+def _write_settled_video(path: Path, payload: bytes = b"video-bytes"):
+    """写出一个「已写完」的成片：内容占位，但 mtime 回退到一小时前。"""
+    path.write_bytes(payload)
+    old = time.time() - 3600
+    os.utime(path, (old, old))
+    return path
+
+
+def _stub_ffprobe(monkeypatch, stdout: str):
+    """让隔离命名空间里的 ``_probe_video_dimensions`` 走固定结果。
+
+    直接替换 ``subprocess.run`` 而不是替换 ``_probe_video_dimensions`` 本身，
+    这样尺寸解析和缓存仍然跑真实实现，只有 ffprobe 这一层外部依赖被打桩。
+    """
+    completed = subprocess.CompletedProcess(
+        args=["ffprobe"], returncode=0, stdout=stdout, stderr=""
+    )
+    monkeypatch.setattr(
+        TASK_HISTORY_NAMESPACE["subprocess"], "run", lambda *a, **k: completed
+    )
+    TASK_HISTORY_NAMESPACE["_VIDEO_DIMENSIONS_CACHE"].clear()
+
+
+def _readable_video(monkeypatch):
+    _stub_ffprobe(monkeypatch, "1080x1920\n")
+
+
+def _unreadable_video(monkeypatch):
+    _stub_ffprobe(monkeypatch, "")
+
+
+def test_find_final_task_video_ignores_intermediate_files(tmp_path, monkeypatch):
     """任务历史只能把 final 成片识别为完成，不能使用合成中间文件。"""
+    _readable_video(monkeypatch)
     for file_name in (
         "combined-1.mp4",
         "temp-clip-1.mp4",
@@ -69,13 +127,38 @@ def test_find_final_task_video_ignores_intermediate_files(tmp_path):
     assert find_final_task_video(str(tmp_path)) == ""
 
 
-def test_find_final_task_video_returns_first_numbered_output(tmp_path):
+def test_find_final_task_video_returns_first_numbered_output(tmp_path, monkeypatch):
     """多成片任务与运行时结果保持一致，默认播放序号最小的最终视频。"""
-    (tmp_path / "final-10.mp4").touch()
-    (tmp_path / "final-2.mp4").touch()
-    (tmp_path / "final-1.mp4").touch()
+    _readable_video(monkeypatch)
+    _write_settled_video(tmp_path / "final-10.mp4")
+    _write_settled_video(tmp_path / "final-2.mp4")
+    _write_settled_video(tmp_path / "final-1.mp4")
 
     assert find_final_task_video(str(tmp_path)) == str(tmp_path / "final-1.mp4")
+
+
+def test_find_final_task_video_ignores_unreadable_final(tmp_path, monkeypatch):
+    """ffprobe 解析不出尺寸的成片不能算完成。
+
+    归档链路过去只看文件名，于是 0 字节或被截断的 final-1.mp4 会被当成成片
+    复制进媒体库；这里锁定「解析不出尺寸就当作还在写」。
+    """
+    _write_settled_video(tmp_path / "final-1.mp4")
+    _unreadable_video(monkeypatch)
+
+    assert find_final_task_video(str(tmp_path)) == ""
+
+
+def test_find_final_task_video_ignores_just_written_final(tmp_path, monkeypatch):
+    """刚落盘的成片要等一个静默窗口之后才算完成。
+
+    任务面板每 2 秒轮询一次；ffmpeg 刚创建目标文件时若立刻被判为完成，归档就会
+    复制到半截文件。mtime 仍是「刚刚」的文件必须继续被视为未完成。
+    """
+    _readable_video(monkeypatch)
+    (tmp_path / "final-1.mp4").write_bytes(b"video-bytes")  # mtime = now
+
+    assert find_final_task_video(str(tmp_path)) == ""
 
 
 def test_build_video_download_name_uses_subject_and_output_index():

@@ -39,10 +39,11 @@ class TestRecordResultDescriptor(unittest.TestCase):
         self.base = Path(self._tmp.name).resolve()
         self.app_root = self.base / "MoneyPrinterTurbo"
         self.storage = self.app_root / "storage"
-        self.task_dir = self.storage / "tasks" / "task-x"
-        self.task_dir.mkdir(parents=True)
         self.portfolio = self.base / "portfolio"
         self.portfolio.mkdir()
+        # 成片落在 outputs_root（唯一长期留存的视频），不再在任务工作目录里。
+        self.task_dir = self.portfolio / "outputs" / "task-x"
+        self.task_dir.mkdir(parents=True)
         self.task_id = "task-x"
         self.tools = probe_media_tools()
         self.layout = ProjectLayout(

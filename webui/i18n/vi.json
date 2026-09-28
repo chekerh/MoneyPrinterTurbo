@@ -67,7 +67,7 @@
     "Delete Task": "Xóa tác vụ",
     "Task Deleted": "Đã xóa tác vụ",
     "Task Delete Failed": "Không thể xóa tác vụ",
-    "Open Task Folder": "Mở thư mục",
+    "Open Task Folder": "Mở tệp tác vụ",
     "Generating Video Script and Keywords": "AI đang tạo kịch bản video và từ khóa...",
     "Generating Video Keywords": "AI đang tạo từ khóa video...",
     "Video Keywords": "Từ Khóa Video (Tiếng Anh, Không Bắt Buộc)",
@@ -390,6 +390,23 @@
     "Thumbnail Overlay Invalid": "Chữ phủ chứa ký tự không được phép.",
     "Thumbnail Generate Failed": "Không thể tạo ảnh thu nhỏ. Ảnh trước được giữ nguyên.",
     "Thumbnail Record Failed": "Không thể cập nhật bản ghi ảnh thu nhỏ. Ảnh trước được giữ nguyên.",
-    "Thumbnail Archive Failed": "Không thể lưu trữ ảnh thu nhỏ đó."
+    "Thumbnail Archive Failed": "Không thể lưu trữ ảnh thu nhỏ đó.",
+    "Thumbnail Queued": "Đang xếp hàng để tạo.",
+    "Thumbnail Generating": "Đang tạo ảnh thu nhỏ…",
+    "Thumbnail Queue Unavailable": "Không thể xếp hàng tạo lúc này. Hãy thử lại.",
+    "Open Archive Folder": "Mở thư mục lưu trữ",
+    "Task Not Archived Yet": "Tác vụ này chưa được lưu trữ",
+    "Video File Missing": "Không tìm thấy tệp video: {name}",
+    "Video File Unreadable": "Tệp video trống hoặc bị hỏng: {name}",
+    "Thumbnail unavailable": "Không có ảnh xem trước",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "Đặt portfolio_root trong mục [app] của config.toml để bật ảnh xem trước và lập kế hoạch danh mục.",
+    "Niche": "Ngách",
+    "No Niche": "Không có ngách",
+    "Niche Preview": "{name}: {line} (khoảng {words} từ)",
+    "Choose Thumbnail": "Chọn ảnh xem trước",
+    "Thumbnail Candidate {index}": "Ứng viên {index}",
+    "Thumbnail Select Failed": "Không thể đổi ảnh xem trước",
+    "Highlight Spoken Words": "Làm nổi bật từ đang đọc",
+    "Highlight Spoken Words Help": "Phụ đề theo từ: từ đang đọc được làm nổi bật. Cần mốc thời gian theo từ từ nhận dạng giọng nói; thiếu thì dùng phụ đề cả dòng."
   }
 }

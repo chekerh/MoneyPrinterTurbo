@@ -252,10 +252,12 @@ div[class*="st-key-advanced_settings_"] div[data-testid="stExpanderDetails"] {
 }
 
 /* 任务管理 popover 需要固定宽度，避免内容从空状态、列表状态切换时
-   反复改变宽度造成页面抖动。宽度仍保留视口约束，兼容窄屏。 */
+   反复改变宽度造成页面抖动。宽度仍保留视口约束，兼容窄屏。
+   1000px 是按操作列 5 个 44px 按钮 + 状态/时间两列不换行反推的下限：
+   再窄就会出现「Complet / ed」这类断词，或者操作列被挤到按钮换行。 */
 div[data-testid="stPopoverBody"] {
-    width: min(860px, calc(100vw - 48px)) !important;
-    max-width: min(860px, calc(100vw - 48px)) !important;
+    width: min(1000px, calc(100vw - 48px)) !important;
+    max-width: min(1000px, calc(100vw - 48px)) !important;
 }
 
 div[data-testid="stPopoverBody"] div[data-testid="stVerticalBlock"] {
@@ -268,8 +270,25 @@ div[class*="st-key-task_row_"] {
     margin-bottom: 0.18rem !important;
 }
 
+/* 任务行是横向 flex 布局，默认 `min-width: auto` 会让每一列 refuse 收缩到
+   内容宽度以下：长主题会把所在列顶宽，文字直接压到相邻的进度和操作列上。
+   归零 min-width 之后各列才会按比例收缩，主题再长也只会在自己格子里省略。 */
+div[class*="st-key-task_row_"]
+    > div[data-testid="stLayoutWrapper"]
+    > div[data-testid="stHorizontalBlock"]
+    > div[data-testid="stColumn"] {
+    min-width: 0 !important;
+}
+
 div[class*="st-key-task_row_"] div[data-testid="stVerticalBlockBorderWrapper"] {
     padding: 0.18rem 0.6rem !important;
+}
+
+/* 表头容器没有边框，因此拿不到上面那层 0.6rem 的水平内边距，结果表头文字
+   会整体比下面的列偏左一小截——正是「表头和内容对不齐」的观感来源。给表头
+   补上同样的水平内边距，两者的列边界才真正重合。 */
+div[class*="st-key-task_table_header_"] {
+    padding: 0 0.6rem !important;
 }
 
 div[class*="st-key-task_row_"] div[data-testid="stElementContainer"],
@@ -301,14 +320,32 @@ div[class*="st-key-task_row_"] button[kind="secondary"] {
     padding: 0.1rem 0.3rem !important;
 }
 
-/* 按钮文字视觉隐藏后，Streamlit 仍会保留图标与文字之间的默认间距，导致
-   单独图标向左偏移。清除该间距并让内容层占满按钮，确保操作图标严格居中。 */
-div[class*="st-key-task_row_"]
-    button[kind="secondary"]
-    span[data-has-shortcut] {
+/* 任务行按钮是纯图标按钮：文字保留给屏幕阅读器，视觉上只留图标。
+   按钮的即时子元素是 Streamlit 的内容包装层，它默认按内容宽度收缩，导致
+   图标相对于按钮出现偏移。这里让它撑满按钮并在内部居中，图标位置就不再
+   依赖 Streamlit 内部的 class 名（那些 hash 每次构建都会变）。 */
+div[class*="st-key-task_row_"] button[kind="secondary"] > div {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
     width: 100% !important;
     gap: 0 !important;
+}
+
+/* 图标与标签之间那条 8px 间距才是「图标偏左」的真凶：标签被视觉隐藏成 0 宽
+   之后，间距仍然保留，16px 的图标被推到 24px 内容盒的左侧，正好偏出 4px。
+   目标层同时含「图标」和「标签」两个 testid，因此选择器精确指向这一层，
+   既不依赖 Streamlit 内部的 emotion class（那些 hash 每次构建都会变），
+   也不会误伤外层包装。 */
+div[class*="st-key-task_row_"]
+    button[kind="secondary"]
+    > div
+    > span:has(span[data-testid="stIconMaterial"]):has(
+        div[data-testid="stMarkdownContainer"]
+    ) {
+    gap: 0 !important;
     justify-content: center !important;
+    align-items: center !important;
 }
 
 /* 行内操作保留可访问的按钮名称，但视觉上只显示图标。使用屏幕阅读器可见的
@@ -323,6 +360,31 @@ div[class*="st-key-task_row_"] button[kind="secondary"] p {
     clip: rect(0, 0, 0, 0) !important;
     clip-path: inset(50%) !important;
     white-space: nowrap !important;
+}
+
+/* 任务主题固定单行 + 省略号。多行主题会让这一行比其它行高，而
+   vertical_alignment="center" 是按各列自身高度居中的，于是同一行里
+   状态、进度和按钮会各自对不同的基线，整行看起来是散的。完整主题由
+   元素上的 title 属性提供。
+
+   Streamlit 的 markdown 容器是 flex，内部的 <p> 作为 flex item 默认
+   `min-width: auto`，遇到没有断行机会的长英文标题就会撑成 max-content 并
+   溢出到相邻列（曾经直接压在「100%」和操作按钮上）。因此省略号必须落在
+   这一层：<p> 允许收缩并裁剪，span 再按 100% 宽绘制省略号。 */
+div[class*="st-key-task_row_"]
+    > div[data-testid="stLayoutWrapper"]
+    > div[data-testid="stHorizontalBlock"]
+    > div[data-testid="stColumn"]:nth-child(5) p {
+    min-width: 0 !important;
+    overflow: hidden !important;
+}
+
+.mpt-task-subject {
+    display: block;
+    width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 
@@ -353,7 +415,19 @@ div[class*="st-key-task_row_"] button[kind="secondary"] p {
     }
 }
 
-/* 移动端隐藏桌面表头，并将任务行重排为“主题 + 元信息 + 操作”紧凑结构。 */
+/* 移动端隐藏桌面表头，并把任务行重排成三行紧凑结构：
+     第 1 行  主题（整行）
+     第 2 行  缩略图 + 状态 + 进度
+     第 3 行  操作按钮（整行铺开）
+   列序号对应 _TASK_TABLE_COLUMNS：
+     1 队列号  2 缩略图  3 状态  4 更新时间  5 主题  6 进度  7 操作
+   队列号和更新时间在窄屏下价值最低，直接隐藏。
+
+   操作独占一行是必须的：5 个 44px 按钮加间距约 244px，而 390px 视口下弹层
+   内容区只剩约 294px。早期版本试图把操作和元信息塞进同一行，结果 1fr 轨道
+   被挤成 0px，「状态」整列不可见。
+   旧版按 5 列写的 nth-child 映射对应的是操作按钮挤在主题列里的结构，
+   操作按钮移到第 7 列后必须同步更新。 */
 @media (max-width: 700px) {
     div[class*="st-key-task_table_header_"] {
         display: none !important;
@@ -363,8 +437,8 @@ div[class*="st-key-task_row_"] button[kind="secondary"] p {
         > div[data-testid="stLayoutWrapper"]
         > div[data-testid="stHorizontalBlock"] {
         display: grid !important;
-        grid-template-columns: auto minmax(0, 1fr) auto auto;
-        gap: 0.2rem 0.5rem !important;
+        grid-template-columns: auto minmax(0, 1fr) auto;
+        gap: 0.3rem 0.5rem !important;
         align-items: center !important;
     }
 
@@ -376,10 +450,23 @@ div[class*="st-key-task_row_"] button[kind="secondary"] p {
         min-width: 0 !important;
     }
 
+    /* 1 队列号 / 4 更新时间：窄屏隐藏 */
     div[class*="st-key-task_row_"]
         > div[data-testid="stLayoutWrapper"]
         > div[data-testid="stHorizontalBlock"]
-        > div[data-testid="stColumn"]:nth-child(1) {
+        > div[data-testid="stColumn"]:nth-child(1),
+    div[class*="st-key-task_row_"]
+        > div[data-testid="stLayoutWrapper"]
+        > div[data-testid="stHorizontalBlock"]
+        > div[data-testid="stColumn"]:nth-child(4) {
+        display: none !important;
+    }
+
+    /* 2 缩略图 / 3 状态 / 6 进度：第二行 */
+    div[class*="st-key-task_row_"]
+        > div[data-testid="stLayoutWrapper"]
+        > div[data-testid="stHorizontalBlock"]
+        > div[data-testid="stColumn"]:nth-child(2) {
         grid-column: 1;
         grid-row: 2;
     }
@@ -387,7 +474,7 @@ div[class*="st-key-task_row_"] button[kind="secondary"] p {
     div[class*="st-key-task_row_"]
         > div[data-testid="stLayoutWrapper"]
         > div[data-testid="stHorizontalBlock"]
-        > div[data-testid="stColumn"]:nth-child(2) {
+        > div[data-testid="stColumn"]:nth-child(3) {
         grid-column: 2;
         grid-row: 2;
     }
@@ -395,45 +482,242 @@ div[class*="st-key-task_row_"] button[kind="secondary"] p {
     div[class*="st-key-task_row_"]
         > div[data-testid="stLayoutWrapper"]
         > div[data-testid="stHorizontalBlock"]
-        > div[data-testid="stColumn"]:nth-child(3) {
-        grid-column: 1 / 4;
-        grid-row: 1;
-        font-weight: 600;
-    }
-
-    div[class*="st-key-task_row_"]
-        > div[data-testid="stLayoutWrapper"]
-        > div[data-testid="stHorizontalBlock"]
-        > div[data-testid="stColumn"]:nth-child(4) {
+        > div[data-testid="stColumn"]:nth-child(6) {
         grid-column: 3;
         grid-row: 2;
     }
 
+    /* 5 主题：整行 */
     div[class*="st-key-task_row_"]
         > div[data-testid="stLayoutWrapper"]
         > div[data-testid="stHorizontalBlock"]
         > div[data-testid="stColumn"]:nth-child(5) {
-        grid-column: 4;
-        grid-row: 1 / 3;
+        grid-column: 1 / -1;
+        grid-row: 1;
+        font-weight: 600;
+    }
+
+    /* 7 操作：整行铺开，按钮等分 */
+    div[class*="st-key-task_row_"]
+        > div[data-testid="stLayoutWrapper"]
+        > div[data-testid="stHorizontalBlock"]
+        > div[data-testid="stColumn"]:nth-child(7) {
+        grid-column: 1 / -1;
+        grid-row: 3;
     }
 
     div[class*="st-key-task_row_"]
         > div[data-testid="stLayoutWrapper"]
         > div[data-testid="stHorizontalBlock"]
-        > div[data-testid="stColumn"]:nth-child(5)
+        > div[data-testid="stColumn"]:nth-child(7)
         div[data-testid="stHorizontalBlock"] {
         display: flex !important;
         flex-direction: row !important;
-        gap: 0.15rem !important;
+        gap: 0.25rem !important;
     }
 
     div[class*="st-key-task_row_"]
         > div[data-testid="stLayoutWrapper"]
         > div[data-testid="stHorizontalBlock"]
-        > div[data-testid="stColumn"]:nth-child(5)
+        > div[data-testid="stColumn"]:nth-child(7)
         div[data-testid="stColumn"] {
         flex: 1 1 0 !important;
         width: auto !important;
-        min-width: 1.75rem !important;
+        min-width: 2.75rem !important;
+    }
+
+    /* 主题在窄屏下同样需要收缩：第 5 列此时横跨整行，长标题不能顶出边界。 */
+    div[class*="st-key-task_row_"]
+        > div[data-testid="stLayoutWrapper"]
+        > div[data-testid="stHorizontalBlock"]
+        > div[data-testid="stColumn"]:nth-child(5) p {
+        min-width: 0 !important;
+        overflow: hidden !important;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+   设计系统：单一强调色 + 状态色 + 数值字体 + 交互反馈
+   原则：一个非紫色强调色（沿用品牌红）、列表/数字用等宽数字字形、
+   每个可点击控件都有 hover / active / focus 状态、空状态与徽章明确。
+   dark mode 通过色值明度切换，背景一律用 color-mix，不引入纯黑。
+   --------------------------------------------------------------------------- */
+
+/* 缓动曲线。CSS 内置的 ease 曲线太弱，按下与状态切换读起来像「卡了一下」。
+   进入/退出一律用强 ease-out（起步快、感觉更跟手），hover 用 ease。 */
+:root {
+    --mpt-ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+    --mpt-ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+    --mpt-ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+    /* 按下反馈 160ms、控件状态切换 120ms。都在 300ms 以内——用户是在
+       完成任务，不是在看动画。 */
+    --mpt-press-duration: 160ms;
+    --mpt-state-duration: 120ms;
+}
+
+div[data-testid="stButton"] > button,
+div[data-testid="stButtonPrimary"] > button,
+div[data-testid="stLinkButton"] > a {
+    transition:
+        background-color var(--mpt-state-duration) var(--mpt-ease),
+        color var(--mpt-state-duration) var(--mpt-ease),
+        border-color var(--mpt-state-duration) var(--mpt-ease),
+        transform var(--mpt-press-duration) var(--mpt-ease-out);
+}
+
+div[data-testid="stButton"] > button:active,
+div[data-testid="stButtonPrimary"] > button:active {
+    transform: scale(0.97);
+}
+
+/* 键盘焦点必须可见。Streamlit 默认样式在自定义 border-radius 的按钮上
+   容易被覆盖，这里显式补上，位置跟随圆角避免贴边。 */
+div[data-testid="stButton"] > button:focus-visible,
+div[data-testid="stButtonPrimary"] > button:focus-visible,
+div[data-testid="stLinkButton"] > a:focus-visible {
+    outline: 2px solid color-mix(in srgb, currentColor 55%, transparent);
+    outline-offset: 2px;
+}
+
+/* 指标与数据表使用 tabular 数字，保证数字纵向对齐、批量变化时列宽稳定。 */
+div[data-testid="stMetricValue"],
+div[data-testid="stMetricLabel"],
+div[data-testid="stDataFrame"],
+div[data-testid="stExpander"] {
+    font-variant-numeric: tabular-nums;
+}
+
+/* 标签页：选中项加重字重并在底部给出与强调色一致的短线，弱化默认下划线。 */
+div[data-testid="stTabs"] > div > button[data-baseweb="tab"] {
+    font-weight: 500;
+}
+
+div[data-testid="stTabs"] > div > button[aria-selected="true"] {
+    font-weight: 650;
+}
+
+/* 视频预览统一圆角与弱边框，与其卡片语义一致。
+   播放器宽度由 Python 侧按视频真实宽高比计算后传给 st.video(width=...)，
+   这里只做兜底：一旦某处又用回 width="stretch"，max-width 仍然阻止它铺满
+   整行变成一个巨大的黑框。 */
+div[data-testid="stVideo"] video {
+    border-radius: 10px;
+    border: 1px solid color-mix(in srgb, currentColor 14%, transparent);
+    box-shadow: 0 1px 2px color-mix(in srgb, currentColor 8%, transparent);
+    max-width: 100%;
+    height: auto;
+}
+
+/* 播放器所在容器左对齐即可：宽度已经按比例算好，居中反而会让它和上方的
+   标题、说明文字左边缘对不齐。 */
+div[data-testid="stVideo"] {
+    display: flex;
+    justify-content: flex-start;
+}
+
+/* 媒体库空状态：醒目但克制，与 Info 弹窗区分。 */
+.mpt-empty-state {
+    margin: 0;
+    padding: 1.4rem 1rem;
+    border: 1px dashed color-mix(in srgb, currentColor 18%, transparent);
+    border-radius: 8px;
+    color: color-mix(in srgb, currentColor 72%, transparent);
+    font-size: 0.95rem;
+    font-weight: 500;
+    text-align: center;
+}
+
+/* 状态徽章：唯一状态绿用于“完成”，中性灰用于“待处理”。 */
+.mpt-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.08rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 650;
+    letter-spacing: 0.02em;
+    line-height: 1.4;
+    white-space: nowrap;
+}
+
+.mpt-badge--posted {
+    color: #2f9e44;
+    background: color-mix(in srgb, #2f9e44 13%, transparent);
+}
+
+.mpt-badge--draft {
+    color: #868e96;
+    background: color-mix(in srgb, currentColor 9%, transparent);
+}
+
+/* 归档目录里存在但无法解析的成片。它和「已发布」不是一回事，必须用状态色
+   明确区分，否则用户只会看到一个点不动的播放器。 */
+.mpt-badge--broken {
+    color: #d94848;
+    background: color-mix(in srgb, #d94848 13%, transparent);
+}
+
+.mpt-badge--posted::before,
+.mpt-badge--draft::before,
+.mpt-badge--broken::before {
+    content: "";
+    width: 0.42rem;
+    height: 0.42rem;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+@media (prefers-color-scheme: dark) {
+    .mpt-badge--posted {
+        color: #51cf66;
+    }
+
+    .mpt-badge--broken {
+        color: #ff6b6b;
+    }
+}
+
+/* 媒体库说明行：徽章与主题文字垂直对齐，避免 <p> 内两个行内元素对不齐。 */
+.mpt-media-caption {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0.5rem 0 0.75rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+}
+
+/* 触达尺寸。行内操作一排五个，宽度必须留够 44px 才不会挤成一团；高度保持
+   32px，让整行仍然维持单行主题下的紧凑密度，同时明显高于 WCAG 2.5.8 要求的
+   24px 最小目标尺寸。 */
+div[class*="st-key-task_row_"] button[kind="secondary"] {
+    min-width: 2.75rem !important;
+    min-height: 2rem !important;
+}
+
+/* 减少动态效果。保留颜色与透明度这类帮助理解状态变化的过渡，去掉位移和
+   缩放这类可能引起不适的运动——不是把动画全部关掉。 */
+@media (prefers-reduced-motion: reduce) {
+    div[data-testid="stButton"] > button,
+    div[data-testid="stButtonPrimary"] > button,
+    div[data-testid="stLinkButton"] > a {
+        transition:
+            background-color var(--mpt-state-duration) var(--mpt-ease),
+            color var(--mpt-state-duration) var(--mpt-ease),
+            border-color var(--mpt-state-duration) var(--mpt-ease);
+    }
+
+    div[data-testid="stButton"] > button:active,
+    div[data-testid="stButtonPrimary"] > button:active {
+        transform: none;
+    }
+}
+
+/* hover 动效只在真正有指针的设备上生效。触屏点击会先派发一次 hover，
+   不加这个限定就会在每次点按时闪过一层假的悬停态。 */
+@media (hover: hover) and (pointer: fine) {
+    div[class*="st-key-task_row_"] button[kind="secondary"]:hover {
+        border-color: color-mix(in srgb, currentColor 35%, transparent);
     }
 }

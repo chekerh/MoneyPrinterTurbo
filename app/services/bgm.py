@@ -271,33 +271,50 @@ def save_bgm_upload(filename: str, source: BinaryIO) -> str:
         _remove_staged_file(temp_path)
 
 
+def _list_bgm_files_in(directory: str) -> list[str]:
+    """列出单个目录下可用的背景音乐文件，并拒绝未校验或越权的路径。"""
+    files: list[str] = []
+    if not os.path.isdir(directory):
+        return files
+    for name in sorted(os.listdir(directory), key=str.lower):
+        # 上传预检和最终保存都会短暂创建同目录文件。临时文件虽然带有合法
+        # 音频扩展名，但尚未完成校验，不能被随机 BGM 列表提前选中。
+        if name.startswith(_INTERNAL_UPLOAD_PREFIX):
+            continue
+        if Path(name).suffix.lower() not in SUPPORTED_BGM_EXTENSIONS:
+            continue
+        file_path = os.path.join(directory, name)
+        try:
+            # 枚举结果同样需要真实路径校验。否则攻击者可在允许目录中放置
+            # 指向外部文件的音频符号链接，再借随机 BGM 路径交给 MoviePy。
+            files.append(
+                file_security.resolve_path_within_directory(directory, file_path)
+            )
+        except ValueError as exc:
+            logger.warning(
+                f"skip unsafe background music file: name={name}, error={str(exc)}"
+            )
+            continue
+    return files
+
+
 def list_bgm_files() -> list[str]:
     """列出用户上传和内置的可用背景音乐。"""
     files_by_name: dict[str, str] = {}
     for directory in (utils.song_dir(), uploaded_bgm_dir(create=True)):
-        if not os.path.isdir(directory):
-            continue
-        for name in sorted(os.listdir(directory), key=str.lower):
-            # 上传预检和最终保存都会短暂创建同目录文件。临时文件虽然带有合法
-            # 音频扩展名，但尚未完成校验，不能被随机 BGM 列表提前选中。
-            if name.startswith(_INTERNAL_UPLOAD_PREFIX):
-                continue
-            if Path(name).suffix.lower() not in SUPPORTED_BGM_EXTENSIONS:
-                continue
-            file_path = os.path.join(directory, name)
-            try:
-                # 枚举结果同样需要真实路径校验。否则攻击者可在允许目录中放置
-                # 指向外部文件的音频符号链接，再借随机 BGM 路径交给 MoviePy。
-                resolved_path = file_security.resolve_path_within_directory(
-                    directory, file_path
-                )
-            except ValueError as exc:
-                logger.warning(
-                    f"skip unsafe background music file: name={name}, error={str(exc)}"
-                )
-                continue
-            files_by_name[name] = resolved_path
+        for resolved_path in _list_bgm_files_in(directory):
+            files_by_name[os.path.basename(resolved_path)] = resolved_path
     return [files_by_name[name] for name in sorted(files_by_name, key=str.lower)]
+
+
+def blastoff_bgm_dir(create: bool = True) -> str:
+    """返回 Blast Off Music 授权曲目池目录。"""
+    return utils.storage_dir("bgm/blastoff", create=create)
+
+
+def list_blastoff_bgm_files() -> list[str]:
+    """列出 Blast Off Music 授权曲目池中可用的背景音乐。"""
+    return _list_bgm_files_in(blastoff_bgm_dir(create=True))
 
 
 def resolve_bgm_file(unsafe_path: str) -> str:

@@ -16,8 +16,9 @@ from app.utils.logging_utils import format_log_record
 # WebUI 的配置保存在进程级全局字典中。原来的同步实现会在完整生成期间持有
 # runtime_config_lock，因此不同浏览器会话实际上也是串行执行。这里把并发数固定
 # 为 1，既延续原有配置一致性，也避免多个线程只是在配置锁外无意义地等待。
+# TODO: 可通过 config.app.max_concurrent_tasks 调整（默认 1，保持向后兼容）。
 _task_manager = InMemoryTaskManager(
-    max_concurrent_tasks=1,
+    max_concurrent_tasks=max(1, int(config.app.get("max_concurrent_tasks", 1))),
     max_queued_tasks=max(1, int(config.app.get("max_queued_tasks", 100))),
 )
 _task_logs: dict[str, deque[str]] = {}

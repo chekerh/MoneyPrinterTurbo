@@ -144,13 +144,16 @@
   - [x] 横屏 16:9，`1920x1080`
 - [x] 支持 **批量视频生成**，可以一次生成多个视频，然后选择一个最满意的
 - [x] 支持 **视频片段时长** 设置，方便调节素材切换频率
+- [x] 支持 **视频片段播放速度**（0.5x–2.0x）和 **镜头过渡效果**（淡入淡出、滑入滑出、推近推远、随机）
 - [x] 支持 **多语言视频脚本** 生成
-- [x] 支持 **Edge TTS**、**Azure Speech**、**SiliconFlow**、**Google Gemini**、**小米 MiMo**、**ElevenLabs**、**Chatterbox** 和 **Fish Audio** 语音合成，可实时试听
+- [x] 支持 **Edge TTS**、**Azure Speech**、**SiliconFlow**、**Google Gemini**、**小米 MiMo**、**MiniMax TTS**、**ElevenLabs**、**Chatterbox** 和 **Fish Audio** 语音合成，可实时试听
 - [x] 支持 **字幕生成**，可调整字体、位置、颜色、大小、描边和背景样式
 - [x] 支持 **背景音乐**，可随机选择或使用指定音乐，并调整音量
+- [x] 支持 **AI 生成背景音乐**：接入 **Sonilo** 和 **ElevenLabs Music**，仅凭文字描述即可为视频生成专属配乐
 - [x] 支持使用自己的 **本地素材**，也可从 **Pexels**、**Pixabay** 和 **Coverr** 获取可免费使用的高清素材
-- [x] 支持 **AI 生成素材**：接入 [WaveSpeed AI](https://wavespeed.ai) 文生视频模型（默认 Seedance），按脚本关键词直接生成全新画面，不再受限于库存素材
+- [x] 支持 **AI 生成素材**：接入 [WaveSpeed AI](https://wavespeed.ai) 文生视频模型（默认 Seedance），按脚本关键词直接生成全新画面，不再受限于库存素材；也支持通过 **LoomLoom** 生成 AI 视频
 - [x] 原生支持 **火山引擎方舟 Seedance** 文生视频，可配置模型或推理接入点 ID，并提供有限轮询与付费任务确认
+- [x] 支持使用 **TwelveLabs** 对视频素材做语义重排，让画面更贴合脚本内容
 - [x] 支持 **Kimi / Moonshot AI**、**OpenAI**、**Anthropic Claude**、**Google Gemini**、**DeepSeek**、**阿里云通义千问**、**Microsoft Azure OpenAI**、**火山引擎方舟**、**xAI Grok**、**MiniMax**、**小米 MiMo** 等主流模型服务，并兼容 **Cloudflare AI Gateway**、**魔搭 ModelScope**、**AIHubMix**、**AIML API**、**EvoLink**、**Ollama**、**OneAPI**、**LiteLLM**、**Groq**、**Pollinations AI** 等统一网关、聚合平台和本地运行环境
 - [x] 支持一键 **跨平台发布**，生成完成后可自动上传至 **TikTok**、**Instagram** 和 **YouTube Shorts**
 - [x] 支持将生成设置**导出和导入**为预设文件，并在设置弹窗中备份和恢复所有 **API Key**
@@ -207,6 +210,29 @@
 
 - 如果你主要依赖云端 LLM、云端 TTS 和在线素材源，CPU 与内存比 GPU 更重要
 - 如果你启用 `faster-whisper`、批量生成或更重的本地处理链路，GPU 会明显提升速度
+
+## 缩略图生成 🖼️
+
+任务完成后可以为每条成片生成 1280×720 的缩略图，并叠加一行自定义文字。
+
+**需要先配置作品集目录**，否则该功能保持关闭（结果页会给出提示）：
+
+```toml
+# config.toml
+[app]
+portfolio_root = "/你的/作品集目录"
+```
+
+也可以用环境变量 `MPT_PORTFOLIO_ROOT` 临时指定，优先级高于配置文件。
+
+几个要点：
+
+- **该目录必须已存在**，且不能与应用目录互相包含（含子目录）。程序不会替你猜目录，
+  静默回退会把产物写到错误的目录树里。
+- 缩略图在**后台线程**渲染，点击后立即返回，界面不会被 FFmpeg 卡住。
+- 文字支持中文、西里尔、韩文、阿拉伯文等各类文字；控制字符、双向覆盖字符和
+  零宽字符会被拒绝，避免显示顺序被伪装。
+- 产物写在 `storage/thumbnails/<task_id>/`，状态与清单为 `manifest.json`。
 
 ## 快速开始 🚀
 

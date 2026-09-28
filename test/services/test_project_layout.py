@@ -12,6 +12,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 from app.services.project_layout import (
+    PORTFOLIO_ROOT_ENV_VAR,
     ProjectLayout,
     ProjectLayoutError,
     resolve_project_layout,
@@ -93,10 +94,15 @@ class TestResolveProjectLayout(unittest.TestCase):
     def test_missing_portfolio_root_fails_closed(self):
         """
         缺少作品集根时必须报错。静默回退到应用根会让产物写进错误的树。
+
+        必须把配置来源也一并清掉：只清环境变量不够，未设置的场景会读到开发者
+        真实的 config.toml，于是"配置了 portfolio_root 的机器"上这个用例
+        反而不再报错——测试要的其实是"未配置"，那就得自己制造未配置。
         """
         with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(ProjectLayoutError):
-                resolve_project_layout(application_root=self.app_root)
+            with patch("app.config.config.app", {"portfolio_root": ""}):
+                with self.assertRaises(ProjectLayoutError):
+                    resolve_project_layout(application_root=self.app_root)
 
     def test_reads_portfolio_root_from_the_app_config_file(self):
         """
@@ -154,6 +160,19 @@ class TestResolveProjectLayout(unittest.TestCase):
                 application_root=self.app_root,
                 portfolio_root="   ",
             )
+
+    def test_configuration_is_not_read_from_the_real_config_file(self):
+        """
+        解析布局不得受开发者本机 config.toml 影响。
+
+        这不是洁癖：portfolio_root 是操作者真实会配的字段，一旦本机配上，
+        那些断言"未配置时失败关闭"的用例就会静默失效——功能回归不会被任何人
+        看到。测试必须自己提供配置。
+        """
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("app.config.config.app", {"portfolio_root": ""}):
+                with self.assertRaises(ProjectLayoutError):
+                    resolve_project_layout(application_root=self.app_root)
 
     def test_existing_application_root_is_required(self):
         """
@@ -527,3 +546,38 @@ class TestSameFilesystem(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMissingPortfolioRootIsActionable(unittest.TestCase):
+    """
+    作品集根没配时必须失败关闭——不能让产物静默落进错误的目录树。
+    但"失败"不等于"沉默"：报错本身要能让人立刻知道该改哪里，
+    否则用户只会看到缩略图功能凭空消失，以为是坏了。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name).resolve()
+        self.app_root = self.base / "app"
+        self.app_root.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _resolve_with_nothing_configured(self) -> str:
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("app.config.config.app", {"portfolio_root": ""}):
+                with self.assertRaises(ProjectLayoutError) as ctx:
+                    resolve_project_layout(application_root=self.app_root)
+        return str(ctx.exception)
+
+    def test_error_names_both_ways_to_configure_it(self):
+        """两种配置方式都要写出来：环境变量适合临时覆盖，配置文件适合长期使用。"""
+        message = self._resolve_with_nothing_configured()
+        self.assertIn(PORTFOLIO_ROOT_ENV_VAR, message)
+        self.assertIn("portfolio_root", message)
+
+    def test_error_does_not_leak_a_filesystem_path(self):
+        """报错是给用户看的，不该把服务端路径抖出来。"""
+        message = self._resolve_with_nothing_configured()
+        self.assertNotIn(str(self.base), message)

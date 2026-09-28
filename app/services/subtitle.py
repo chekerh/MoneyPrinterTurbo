@@ -10,6 +10,11 @@ except ImportError:
 from loguru import logger
 
 from app.config import config
+from app.services.caption_highlight import (
+    WordTiming,
+    word_timing_path,
+    write_word_timings,
+)
 from app.utils import utils
 
 model_size = config.whisper.get("model_size", "large-v3")
@@ -67,6 +72,9 @@ def create(audio_file, subtitle_file: str = ""):
 
     start = timer()
     subtitles = []
+    # 词级时间：逐词高亮字幕要靠它。SRT 只有整句时间，按字数均分会让
+    # 高亮和语音明显错位，所以这里把 whisper 的真实词级时间落到 sidecar。
+    word_timings = []
 
     def recognized(seg_text, seg_start, seg_end):
         seg_text = seg_text.strip()
@@ -91,6 +99,15 @@ def create(audio_file, subtitle_file: str = ""):
         if segment.words:
             is_segmented = False
             for word in segment.words:
+                text = str(getattr(word, "word", "") or "").strip()
+                if text:
+                    word_timings.append(
+                        WordTiming(
+                            start=float(word.start),
+                            end=float(word.end),
+                            text=text,
+                        )
+                    )
                 if not is_segmented:
                     seg_start = word.start
                     is_segmented = True
@@ -142,6 +159,13 @@ def create(audio_file, subtitle_file: str = ""):
     with open(subtitle_file, "w", encoding="utf-8") as f:
         f.write(sub)
     logger.info(f"subtitle file created: {subtitle_file}")
+
+    if word_timings:
+        sidecar = write_word_timings(subtitle_file, word_timings)
+        logger.info(f"word timings written: {sidecar} ({len(word_timings)} words)")
+    else:
+        # 没有词级时间就不写 sidecar：渲染时会整句退回原样，而不是猜。
+        word_timing_path(subtitle_file).unlink(missing_ok=True)
 
 
 def file_to_subtitles(filename):

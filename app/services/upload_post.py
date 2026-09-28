@@ -149,4 +149,50 @@ def cross_post_video(
     platforms: Optional[list] = None,
     youtube_extra: Optional[dict] = None,
 ) -> dict:
-    return upload_post_service.upload_video(video_path, title, platforms, youtube_extra=youtube_extra)
+    # YouTube Shorts go through the free native YouTube Data API when configured;
+    # all other platforms require the (paid) upload-post.com bridge.
+    from app.services import youtube_upload
+
+    if platforms is None:
+        platforms = upload_post_service.platforms
+
+    youtube_platforms = [p for p in (platforms or []) if isinstance(p, str) and p.startswith("youtube")]
+    other_platforms = [
+        p for p in (platforms or []) if not (isinstance(p, str) and p.startswith("youtube"))
+    ]
+
+    results = {}
+    if youtube_platforms and youtube_upload.is_configured():
+        results["youtube"] = youtube_upload.publish_video(
+            video_path,
+            title=(youtube_extra or {}).get("youtube_title") or title,
+            description=(youtube_extra or {}).get("youtube_description") or "",
+            tags=(youtube_extra or {}).get("tags") or None,
+            privacy_status=(youtube_extra or {}).get("privacyStatus", "public"),
+            category_id=str(config.app.get("youtube_upload_category_id", "27") or "27"),
+        )
+
+    if other_platforms and upload_post_service.is_configured():
+        results["upload_post"] = upload_post_service.upload_video(
+            video_path,
+            title,
+            platforms=other_platforms,
+            privacy_level="PUBLIC_TO_EVERYONE",
+            youtube_extra=None,
+        )
+    elif other_platforms:
+        results["upload_post"] = {
+            "success": False,
+            "error": "Upload-Post not configured (only YouTube native publishing is active)",
+        }
+
+    if not results:
+        return {
+            "success": False,
+            "error": "No publishing channel configured (run ./setup_youtube.sh)",
+        }
+
+    return {
+        "success": any(r.get("success") for r in results.values()),
+        "result": results,
+    }

@@ -198,10 +198,21 @@ def resolve_project_layout(
     """
     if application_root is None:
         application_root = _default_application_root()
+    # 只有"完全没传"才继续往下找。显式传了空白串是调用方的错误，必须直接报错：
+    # 悄悄换成另一个来源的值，会让调用方以为自己配的目录生效了。
     if portfolio_root is None:
         portfolio_root = os.environ.get(PORTFOLIO_ROOT_ENV_VAR)
-    if portfolio_root is None or not str(portfolio_root).strip():
-        portfolio_root = _portfolio_root_from_config()
+        if portfolio_root is None or not str(portfolio_root).strip():
+            portfolio_root = _portfolio_root_from_config()
+        if portfolio_root is None or not str(portfolio_root).strip():
+            # 失败关闭，但必须说清楚怎么才能打开。缩略图与作品集规划都依赖这个根，
+            # 报错若只写"未配置"，用户只会看到功能凭空消失，以为是坏了。
+            raise ProjectLayoutError(
+                "portfolio_root 未配置：缩略图与作品集功能已停用。"
+                '请在 config.toml 的 [app] 下设置 portfolio_root = "/你的/作品集目录"，'
+                f"或用环境变量 {PORTFOLIO_ROOT_ENV_VAR} 临时指定。"
+                "该目录必须已存在，且不能与应用目录互相包含。"
+            )
 
     app_path = _coerce_root(application_root, "application_root")
     portfolio_path = _coerce_root(portfolio_root, "portfolio_root")

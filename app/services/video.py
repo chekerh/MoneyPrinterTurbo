@@ -80,13 +80,16 @@ _MIN_MATERIAL_DIMENSION = 480
 # 既能放行仅仅因为取整而略低于阈值的素材，也仍然能挡住真正的低清素材。
 _MIN_DIMENSION_TOLERANCE = 10
 _DEFAULT_VIDEO_CODEC = "libx264"
+# Order matters: hardware encoders first for auto-detection, then software fallback.
+# On macOS with Apple Silicon, h264_videotoolbox/hevc_videotoolbox are preferred.
 _SUPPORTED_VIDEO_CODECS = (
-    "libx264",
+    "h264_videotoolbox",
+    "hevc_videotoolbox",
     "h264_nvenc",
     "h264_amf",
     "h264_qsv",
     "h264_mf",
-    "h264_videotoolbox",
+    "libx264",
 )
 _runtime_disabled_video_codecs = set()
 
@@ -174,17 +177,40 @@ def _get_configured_video_codec() -> str:
     该配置面向高级用户，用于尝试启用 NVENC/AMF/QSV/VideoToolbox 等硬件
     编码。这里刻意只允许固定白名单，避免开放任意 FFmpeg 参数后，用户填错
     参数导致输出格式不可控，甚至让生成任务在后续阶段才失败。
+
+    如果配置为 "auto"（默认），自动检测并使用可用的硬件编码器，
+    优先顺序：VideoToolbox (macOS) > NVENC/AMF/QSV > libx264。
     """
     configured_codec = str(
-        config.app.get("video_codec", _DEFAULT_VIDEO_CODEC) or _DEFAULT_VIDEO_CODEC
-    ).strip()
+        config.app.get("video_codec", "auto") or "auto"
+    ).strip().lower()
+
+    # "auto" = 自动检测并使用最佳可用编码器
+    if configured_codec == "auto":
+        return _auto_select_best_codec()
+
     if configured_codec not in _SUPPORTED_VIDEO_CODECS:
         logger.warning(
             f"unsupported video codec configured: {configured_codec}, "
-            f"fallback to {_DEFAULT_VIDEO_CODEC}"
+            f"fallback to auto"
         )
-        return _DEFAULT_VIDEO_CODEC
+        return _auto_select_best_codec()
     return configured_codec
+
+
+def _auto_select_best_codec() -> str:
+    """
+    自动检测并返回当前系统上可用的最佳视频编码器。
+
+    优先级：VideoToolbox (macOS) > NVENC/AMF/QSV > libx264。
+    """
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    for codec in _SUPPORTED_VIDEO_CODECS:
+        if _ffmpeg_encoder_exists(ffmpeg_binary, codec):
+            logger.info(f"auto-selected video codec: {codec}")
+            return codec
+    logger.warning("no supported video codec found, falling back to libx264")
+    return _DEFAULT_VIDEO_CODEC
 
 
 @lru_cache(maxsize=16)
@@ -289,6 +315,29 @@ def _fallback_write_videofile(clip, output_file: str, failed_codec: str, reason:
     return _DEFAULT_VIDEO_CODEC
 
 
+def _build_ffmpeg_params() -> list[str]:
+    """
+    构建传递给 ffmpeg 的编码参数。
+
+    从配置读取：
+    - video_preset: 编码预设 (ultrafast ~ veryslow)，默认 medium
+    - video_crf: 质量因子 (0-51，越小质量越好)，默认 23
+    - video_tune: 内容调优 (film, animation, grain, stillimage, fastdecode, zerolatency)，默认 film
+    """
+    preset = str(config.app.get("video_preset", "medium") or "medium").strip()
+    crf = str(config.app.get("video_crf", "23") or "23").strip()
+    tune = str(config.app.get("video_tune", "film") or "film").strip()
+
+    params = []
+    if preset:
+        params.extend(["-preset", preset])
+    if crf:
+        params.extend(["-crf", crf])
+    if tune:
+        params.extend(["-tune", tune])
+    return params
+
+
 def _write_videofile_with_codec_fallback(clip, output_file: str, codec: str, **kwargs):
     """
     使用指定编码器写出视频，失败时自动用 libx264 重试一次。
@@ -297,8 +346,22 @@ def _write_videofile_with_codec_fallback(clip, output_file: str, codec: str, **k
     生成任务不能因为高级编码器不可用而整体失败，所以这里把回退集中处理。
     """
     effective_codec = _get_effective_video_codec(codec)
+    ffmpeg_params = _build_ffmpeg_params()
+    # 合并用户传入的 ffmpeg_params（如果有）
+    user_ffmpeg_params = kwargs.pop("ffmpeg_params", None)
+    if user_ffmpeg_params:
+        if isinstance(user_ffmpeg_params, list):
+            ffmpeg_params.extend(user_ffmpeg_params)
+        else:
+            ffmpeg_params.append(str(user_ffmpeg_params))
+
     try:
-        clip.write_videofile(output_file, codec=effective_codec, **kwargs)
+        clip.write_videofile(
+            output_file,
+            codec=effective_codec,
+            ffmpeg_params=ffmpeg_params,
+            **kwargs,
+        )
         return effective_codec
     except Exception as exc:
         if effective_codec == _DEFAULT_VIDEO_CODEC:
@@ -527,6 +590,20 @@ def get_bgm_file(bgm_type: str = "random", bgm_file: str = ""):
     if bgm_type == "random":
         files = bgm_service.list_bgm_files()
         # 当背景音乐目录为空时，直接回退为“不使用 BGM”，避免 random.choice([]) 抛异常。
+        if not files:
+            logger.warning("no background music files found")
+            return ""
+        return random.choice(files)
+
+    if bgm_type == "blastoff":
+        files = bgm_service.list_blastoff_bgm_files()
+        if files:
+            return random.choice(files)
+        logger.warning(
+            "no Blast Off licensed background music found in storage/bgm/blastoff; "
+            "falling back to the default pool"
+        )
+        files = bgm_service.list_bgm_files()
         if not files:
             logger.warning("no background music files found")
             return ""
@@ -988,6 +1065,64 @@ def subtitle_font_supports_text(font_path: str, text: str) -> bool:
     return _subtitle_font_supports_sample(font_path, sample)
 
 
+def _highlighted_caption_clips(
+    subtitle_path: str,
+    size: tuple[int, int],
+    font_path: str,
+    font_size: int,
+    background,
+    enabled: bool,
+):
+    """
+    生成逐词高亮的字幕片段；拿不到词级时间时返回空列表，由调用方退回原样。
+
+    每个词高亮一次，每次一张图。词很多时片段数会变多，但每个片段只是一张
+    静态图，MoviePy 合成开销可以接受——换来的是高亮和语音严格对齐。
+    """
+    if not enabled or not subtitle_path or not os.path.exists(subtitle_path):
+        return []
+
+    try:
+        import numpy as np
+        from moviepy import ImageClip
+
+        from app.services.caption_highlight import (
+            build_highlight_timeline,
+            parse_srt,
+            read_word_timings,
+        )
+        from app.services.caption_render import CaptionStyle, render_caption_frame
+    except Exception as exc:  # noqa: BLE001 - 缺依赖就退回原样，不该挡住出片
+        logger.warning(f"word highlight unavailable, using plain subtitles: {exc}")
+        return []
+
+    words = read_word_timings(subtitle_path)
+    if not words:
+        return []
+
+    cues = parse_srt(subtitle_path, words)
+    if not cues:
+        return []
+
+    style = CaptionStyle(background=background)
+    clips = []
+    for cue in cues:
+        timeline = build_highlight_timeline(cue)
+        if not timeline:
+            continue
+        for w_start, w_end, active in timeline:
+            frame = render_caption_frame(
+                [w.text for w in cue.words], active, size, font_path, font_size, style
+            )
+            array = np.array(frame)
+            clips.append(
+                ImageClip(array)
+                .with_start(max(0.0, w_start))
+                .with_duration(max(0.04, min(w_end, cue.end) - max(0.0, w_start)))
+            )
+    return clips
+
+
 def generate_video(
     video_path: str,
     audio_path: str,
@@ -1223,10 +1358,32 @@ def generate_video(
                     make_textclip=make_textclip,
                 )
             )
-            text_clips = []
-            for item in sub.subtitles:
-                clip = create_text_clip(subtitle_item=item)
-                text_clips.append(clip)
+            try:
+                highlighted = _highlighted_caption_clips(
+                    subtitle_path=subtitle_path,
+                    size=(video_width, video_height),
+                    font_path=font_path,
+                    font_size=int(params.font_size),
+                    background=(
+                        resolve_subtitle_background_color()
+                        if getattr(params, "rounded_subtitle_background", False)
+                        else None
+                    ),
+                    enabled=bool(getattr(params, "caption_word_highlight", False)),
+                )
+            except Exception as exc:  # noqa: BLE001 - 高亮失败必须退回整句字幕
+                logger.warning(
+                    f"word highlight failed, falling back to plain subtitles: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                highlighted = []
+            if highlighted:
+                # 有词级时间：走逐词高亮，不再叠加整句字幕
+                text_clips = highlighted
+            else:
+                text_clips = [
+                    create_text_clip(subtitle_item=item) for item in sub.subtitles
+                ]
             video_clip = CompositeVideoClip([video_clip, *text_clips])
             clip_stack.callback(video_clip.close)
 

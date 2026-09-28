@@ -58,13 +58,50 @@ _EXTRACT_TIMEOUT_SECONDS = 30
 _PROBE_TIMEOUT_SECONDS = 20
 
 #: 允许出现在叠加文字里的字符：可打印 ASCII、常见拉丁补充、空白。
-_ALLOWED_TEXT = re.compile(r"^[A-Za-z0-9 \u00A0-\u024F\u2010-\u203A\u20AC-\u20BF'\",.!?%&()+*#:;/\[\]-]*$")
+#: 不可见 / 可伪装的字符。
+#:
+#: 这里刻意**不**按语言划白名单。早先的正则只放行拉丁字符，把中文、西里尔、
+#: 韩文、阿拉伯文和符号全部挡在门外——而本项目的界面本身就是中文的，等于把
+#: 功能对主要用户关闭。真正需要拦的是"看不见、但会改变显示或欺骗读者"的字符：
+#: 零宽字符能伪装词边界，变体选择符会改字形，行分隔符会撑破排版。
+#: ASCII 控制字符与双向覆盖字符分别由 _CONTROL 和 _BIDI_AND_FORMAT 负责。
+#:
+#: 全部用 \uXXXX 转义书写：直接把这些字符打进源码里，文件本身就变成了肉眼
+#: 不可读的代码，review 时看不出到底禁了什么。
+_INVISIBLE_TEXT = re.compile(
+    "["
+    "\u00ad"                # SOFT HYPHEN：是否显示取决于断行位置
+    "\u034f"                # COMBINING GRAPHEME JOINER
+    "\u061c"                # ARABIC LETTER MARK
+    "\u115f\u1160"          # HANGUL CHOSEONG/JUNGSEONG FILLER
+    "\u17b4\u17b5"          # KHMER INVISIBLE SYMBOLS
+    "\u180e"                # MONGOLIAN VOWEL SEPARATOR
+    "\u200b-\u200d"          # ZERO WIDTH SPACE / NON-JOINER / JOINER
+    "\u2028\u2029"          # LINE / PARAGRAPH SEPARATOR
+    "\u2060-\u2064"          # WORD JOINER + INVISIBLE OPERATORS
+    "\u3164"                # HANGUL FILLER
+    "\u034f"                # (combining grapheme joiner)
+    "\u180b-\u180e"          # MONGOLIAN FORMAT CHARACTERS
+    "\u200b-\u200f"          # ZERO WIDTH + LRM/RLM
+    "\u202a-\u202e"          # BIDI EMBEDDING / OVERRIDE
+    "\u2066-\u2069"          # BIDI ISOLATES
+    "\u2e00-\u2e7f"          # SUPPLEMENTARY PUNCTUATION (invisible blocks)
+    "\ufe00-\ufe0f"          # VARIATION SELECTORS
+    "\ufeff"                # ZERO WIDTH NO-BREAK SPACE / BOM
+    "\uffa0"                # HALFWIDTH HANGUL FILLER
+    "\U000e0100-\U000e01ef"  # VARIATION SELECTORS SUPPLEMENT
+    "\U000e0020-\U000e007f"  # TAG characters
+    "]+"
+)
 
 #: 双向覆盖与方向控制字符：显示顺序可以与实际内容不一致。
 _BIDI_AND_FORMAT = re.compile("[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 
-#: ASCII 控制字符。
-_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# ASCII 控制字符。
+#
+# 原先这个范围刻意跳过了 \t \n \r，因为旧的拉丁白名单顺带拦下了它们。移除白名单
+# 后这三者就漏了（换行会把文字顶出安全区），所以这里必须覆盖完整的 C0 区。
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class ThumbnailError(RuntimeError):
@@ -94,6 +131,46 @@ class RenderResult:
     width: int
     height: int
     font_id: str
+
+
+#: YouTube 会在画面右下角叠时间戳，底部 20% 留给它。
+OVERLAY_BAND_TOP = 0.80
+#: 默认把文字放在上三分之一：缩略图在大图和小图两种尺寸下都最先被看到。
+OVERLAY_BAND_UPPER = "upper"
+OVERLAY_BAND_LOWER = "lower"
+#: 文字最大字号。720p 画面上 132px 左右在手机上仍然清晰。
+_OVERLAY_FONT_START = 132
+_OVERLAY_FONT_MIN = 44
+_OVERLAY_MARGIN = 64
+#: 候选帧数量：给用户挑选的余地。选帧是这个功能最关键的一步。
+CANDIDATE_FRAME_COUNT = 3
+
+
+def candidate_timestamps(duration_ms: int, count: int = CANDIDATE_FRAME_COUNT) -> list[float]:
+    """
+    给出一条视频的候选抽帧时刻，供用户挑选。
+
+    铺开在正片里：最早的候选也跳过前 8%，那里通常是黑场或 logo，
+    当缩略图会像坏片。最晚的不贴片尾。
+    """
+    if isinstance(duration_ms, bool) or not isinstance(duration_ms, int):
+        raise ThumbnailError(f"duration_ms 必须是整数，收到 {duration_ms!r}")
+    if duration_ms <= 0:
+        raise ThumbnailError(f"duration_ms 必须为正数，收到 {duration_ms}")
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        raise ThumbnailError(f"count 必须是正整数，收到 {count!r}")
+
+    total = duration_ms / 1000.0
+    # 末帧之前的余量必须给够：只留 0.15 秒时，seek 会落到最后一帧之后，
+    # ffmpeg 直接不产出任何帧（"FFmpeg 未产出抽帧结果"）。
+    # 10% 再减 0.5 秒对 3 秒和 3 分钟的片子都够。
+    latest = max(total * 0.90 - 0.5, total * 0.5)
+    first = min(total * 0.08, latest / (count + 1))
+    if latest <= first:
+        return [round(latest / 2, 3)] * count
+
+    step = (latest - first) / (count - 1) if count > 1 else 0
+    return [round(first + step * index, 3) for index in range(count)]
 
 
 def plan_frame_timestamp(duration_ms: int) -> float:
@@ -136,8 +213,8 @@ def _validate_text(text: object) -> str:
         raise ThumbnailError("叠加文字不能包含控制字符")
     if _BIDI_AND_FORMAT.search(stripped):
         raise ThumbnailError("叠加文字不能包含双向覆盖或方向控制字符")
-    if not _ALLOWED_TEXT.match(stripped):
-        raise ThumbnailError("叠加文字包含不允许的字符")
+    if _INVISIBLE_TEXT.search(stripped):
+        raise ThumbnailError("叠加文字不能包含不可见或伪装字符")
     return stripped
 
 
@@ -255,8 +332,44 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _draw_overlay(image_path: Path, text: str, font_path: Path) -> None:
-    """把文字画在底部安全区内。就地修改 image_path。"""
+def _wrap_to_width(draw, text: str, font, max_width: int, max_lines: int = 3) -> list[str]:
+    """把文字折成不超过 ``max_lines`` 行、每行不超过 ``max_width`` 的若干行。"""
+    words = text.split()
+    if not words:
+        return []
+
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+            if len(lines) == max_lines:
+                break
+    if len(lines) < max_lines:
+        lines.append(current)
+    return lines[:max_lines]
+
+
+def _draw_overlay(
+    image_path: Path,
+    text: str,
+    font_path: Path,
+    band: str = OVERLAY_BAND_UPPER,
+) -> None:
+    """
+    把文字画在画面上。就地修改 image_path。
+
+    与第一版的差别，都是为了"能上传、能点得动"：
+
+    * **自动缩字 + 折行**，写不下不再报错；
+    * **默认上三分之一**，避开 YouTube 叠时间戳的底部 20%；
+    * **压暗背景而不是盖黑方块**，画面主体仍然看得见；
+    * **加描边**，浅色画面上也不会糊掉。
+    """
     if not text:
         return
 
@@ -266,48 +379,85 @@ def _draw_overlay(image_path: Path, text: str, font_path: Path) -> None:
         canvas = source.convert("RGB")
 
     draw = ImageDraw.Draw(canvas)
-    font_size = 64
+    max_width = TARGET_WIDTH - _OVERLAY_MARGIN * 2
+
     font = None
-    for candidate in (font_size, 56, 48, 40, 32):
+    lines: list[str] = []
+    for size in range(_OVERLAY_FONT_START, _OVERLAY_FONT_MIN - 1, -4):
         try:
-            font = ImageFont.truetype(str(font_path), candidate)
+            candidate = ImageFont.truetype(str(font_path), size)
         except OSError:
             continue
-        break
-    if font is None:
-        raise ThumbnailError(f"字体无法加载：{font_path}")
-
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
-    if text_width <= 0 or text_height <= 0:
-        raise ThumbnailError("叠加文字无法测量")
-
-    max_width = TARGET_WIDTH - 80
-    if text_width > max_width:
-        raise ThumbnailError(
-            f"叠加文字在 {font_size}px 下宽 {text_width}px，超过可用宽度 {max_width}px"
+        wrapped = _wrap_to_width(draw, text, candidate, max_width)
+        widest = max(
+            (draw.textbbox((0, 0), line, font=candidate)[2] for line in wrapped),
+            default=0,
         )
+        if widest and widest <= max_width:
+            font, lines = candidate, wrapped
+            break
+    if font is None:
+        try:
+            font = ImageFont.truetype(str(font_path), _OVERLAY_FONT_MIN)
+        except OSError as exc:
+            raise ThumbnailError(f"字体无法加载：{font_path}") from exc
+        lines = _wrap_to_width(draw, text, font, max_width, max_lines=1)
+    if not lines:
+        return
 
-    y = TARGET_HEIGHT - _OVERLAY_BAND_PX // 2 - text_height // 2
-    if y < 0:
-        raise ThumbnailError("叠加文字超出画面下边界")
+    heights = []
+    widths = []
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font)
+        widths.append(bbox[2] - bbox[0])
+        heights.append(bbox[3] - bbox[1])
 
-    # 半透明黑底保证对比度，不依赖调用方提供的颜色。
-    pad = 16
-    draw.rectangle(
-        [
-            40 - pad,
-            y - pad,
-            40 + text_width + pad,
-            y + text_height + pad,
-        ],
-        fill=(0, 0, 0),
-    )
-    draw.text((40, y - bbox[1]), text, fill=(255, 255, 255), font=font)
+    line_gap = max(4, int(font.size * 0.18))
+    block_height = sum(heights) + line_gap * (len(lines) - 1)
+
+    if band == OVERLAY_BAND_LOWER:
+        top = int(TARGET_HEIGHT * OVERLAY_BAND_TOP) - block_height - _OVERLAY_MARGIN // 2
+    else:
+        top = max(_OVERLAY_MARGIN, int(TARGET_HEIGHT * 0.10))
+    top = max(0, min(top, TARGET_HEIGHT - block_height - _OVERLAY_MARGIN // 2))
+
+    _dim_band(canvas, top - _OVERLAY_MARGIN // 2,
+              top + block_height + _OVERLAY_MARGIN // 2)
+
+    y = top
+    for line, width, height in zip(lines, widths, heights):
+        bbox = draw.textbbox((0, 0), line, font=font)
+        x = _OVERLAY_MARGIN
+        # 描边：浅色画面上白字会糊掉
+        for dx, dy in ((-3, 0), (3, 0), (0, -3), (0, 3), (-2, -2), (2, 2)):
+            draw.text((x + dx, y - bbox[1] + dy), line, fill=(0, 0, 0), font=font)
+        draw.text((x, y - bbox[1]), line, fill=(255, 255, 255), font=font)
+        y += height + line_gap
 
     # 不带任何 exif/icc 写出，保证可复现。
     canvas.save(image_path, format="JPEG", quality=_JPEG_QUALITY, optimize=False)
+
+
+def _dim_band(canvas, top: int, bottom: int) -> None:
+    """
+    在文字后面铺一层由淡到浓的压暗渐变。
+
+    不用不透明矩形：黑方块会把画面主体挡死，缩略图就只剩一行字。
+    渐变既保证文字对比度，又保留底下的画面。
+    """
+    from PIL import Image
+
+    top = max(0, int(top))
+    bottom = min(canvas.height, int(bottom))
+    if bottom <= top:
+        return
+    height = bottom - top
+    gradient = Image.new("L", (1, height))
+    for row in range(height):
+        ratio = row / max(1, height - 1)
+        gradient.putpixel((0, row), int(70 + 120 * ratio))
+    overlay = Image.new("RGB", (canvas.width, height), (0, 0, 0))
+    canvas.paste(overlay, (0, top), gradient.resize((canvas.width, height)))
 
 
 def _strip_jpeg_metadata(path: Path) -> None:

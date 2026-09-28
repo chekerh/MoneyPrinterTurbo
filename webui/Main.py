@@ -44,8 +44,11 @@ from app.services.result_descriptor import (
     read_result_descriptor,
 )
 from app.services.thumbnail_files import ThumbnailFilesError
-from app.utils.strict_media_tools import MediaToolsError, probe_media_tools
-from webui.thumbnail_panel import render_thumbnail_panel
+from webui.thumbnail_panel import (
+    _should_request_refresh as should_refresh,
+    render_thumbnail_panel,
+    watch_for_completion,
+)
 from app.models.llm_provider import (
     DEFAULT_LLM_PROVIDER_ID,
     LLM_PROVIDER_REGISTRY,
@@ -59,6 +62,7 @@ from app.models.schema import (
     VideoParams,
     VideoTransitionMode,
 )
+from app.services.plan_meta import plan_meta_path
 from app.services import bgm as bgm_service
 from app.services import (
     cache_manager,
@@ -138,6 +142,7 @@ DEFAULT_SUBTITLE_SETTINGS = {
     "subtitle_background_enabled": False,
     "subtitle_background_color": "#000000",
     "rounded_subtitle_background": False,
+    "caption_word_highlight": True,
 }
 LOCAL_MATERIAL_EXTENSIONS = {
     ".mp4",
@@ -155,6 +160,19 @@ _FINAL_VIDEO_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _DOWNLOAD_FILENAME_INVALID_PATTERN = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# ffprobe 超时。探测只读取文件头，正常短视频在亚秒级返回；超过 3 秒基本可以
+# 判定为文件损坏或 ffprobe 异常，直接当作「无法解析」而不是拖住 2 秒轮询。
+_MEDIA_PROBE_TIMEOUT_SECONDS = 3
+# 成片写入完成后的静默窗口。任务面板每 2 秒轮询一次，窗口取 3 秒可以让
+# 「刚写完就被扫到」和「还在写」这两种情况稳定区分开。
+_VIDEO_SETTLE_SECONDS = 3
+# 视频预览尺寸上限。竖屏成片按最大高度反推宽度，横屏成片按最大宽度封顶，
+# 这样 9:16 和 16:9 都不会铺满整行，播放器也不会退化成固定高度的横向黑框。
+_VIDEO_PLAYER_MAX_HEIGHT = 420
+_VIDEO_PLAYER_MAX_WIDTH = 480
+_VIDEO_PLAYER_MIN_WIDTH = 200
+_VIDEO_PLAYER_FALLBACK_WIDTH = 240
+_VIDEO_DIMENSIONS_CACHE: dict = {}
 _RUNTIME_CONFIG_SECTIONS = {
     "app": config.app,
     "azure": config.azure,
@@ -615,12 +633,97 @@ def _safe_load_task_script(task_path):
         return {}
 
 
+def _probe_video_dimensions(video_file: str):
+    """返回视频的 ``(宽, 高)``；文件缺失、损坏或 ffprobe 不可用时返回 ``None``。
+
+    结果按「路径 + 大小 + mtime」缓存。同一文件在同一进程内只探测一次，因此
+    2 秒轮询的任务面板不会反复起 ffprobe 子进程；文件被重写后缓存自动失效。
+    """
+    try:
+        stat_result = os.stat(video_file)
+    except OSError:
+        return None
+
+    cache_key = (video_file, stat_result.st_size, stat_result.st_mtime_ns)
+    if cache_key in _VIDEO_DIMENSIONS_CACHE:
+        return _VIDEO_DIMENSIONS_CACHE[cache_key]
+
+    dimensions = None
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0:s=x",
+                video_file,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_MEDIA_PROBE_TIMEOUT_SECONDS,
+        )
+        width, height = (probe.stdout or "").strip().split("x")[:2]
+        width, height = int(width), int(height)
+        if width > 0 and height > 0:
+            dimensions = (width, height)
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        # 截断或 0 字节的成片会让 ffprobe 无法解析出尺寸，这正是「文件已损坏」
+        # 的信号，调用方据此拒绝播放而不是渲染一个坏掉的播放器。
+        logger.debug(f"failed to probe video dimensions: {video_file}, {e}")
+
+    _VIDEO_DIMENSIONS_CACHE[cache_key] = dimensions
+    return dimensions
+
+
+def _video_player_width(video_file: str) -> int:
+    """按视频真实宽高比换算播放器宽度，使预览不会被拉伸成巨大的黑框。
+
+    ``st.video`` 只有在传入具体像素宽度时，浏览器才会按视频自身的宽高比推导
+    高度；``width="stretch"`` 会得到一个固定高度的横向盒子，竖屏成片在其中被
+    压成一条窄带。这里以固定的最大高度反推宽度，并限制上限，避免横屏视频
+    铺满整行。
+    """
+    dimensions = _probe_video_dimensions(video_file)
+    if not dimensions:
+        return _VIDEO_PLAYER_FALLBACK_WIDTH
+    width, height = dimensions
+    scaled = round(_VIDEO_PLAYER_MAX_HEIGHT * width / height)
+    return max(_VIDEO_PLAYER_MIN_WIDTH, min(_VIDEO_PLAYER_MAX_WIDTH, scaled))
+
+
+def _render_video_player(video_file: str):
+    """渲染一个按真实比例显示的视频播放器；文件损坏时给出明确提示。
+
+    三处预览（任务面板、生成结果页、媒体库）共用这一个入口，保证比例上限和
+    损坏提示完全一致，避免同一文件在不同面板表现不同。注意 ``st.video`` 不接受
+    ``key`` 参数，多个播放器只能靠所在容器区分。
+    """
+    if not os.path.isfile(video_file):
+        st.warning(tr("Video File Missing").format(name=os.path.basename(video_file)))
+        return
+    if _probe_video_dimensions(video_file) is None:
+        st.error(tr("Video File Unreadable").format(name=os.path.basename(video_file)))
+        return
+    st.video(video_file, width=_video_player_width(video_file))
+
+
 def _find_final_task_video(task_path: str) -> str:
     """
-    返回任务目录中序号最小的最终成片。
+    返回任务目录中序号最小的、且已确认写入完成的最终成片。
 
     合成流程还会产生 combined、temp-clip 和 MoviePy 临时文件，这些文件不能
     表示任务已成功完成，因此这里只接受 ``final-<序号>.<扩展名>``。
+
+    仅凭文件名判断会让「刚开始写入」的成片立刻被当成完成态：ffmpeg 先创建
+    目标文件，2 秒轮询的任务面板就会看到它，随后归档把半截文件复制进媒体库。
+    因此这里额外要求文件可被 ffprobe 解析出尺寸，并确认两次轮询之间大小没有
+    变化。代价是每个候选文件多一次 stat 与一次 ffprobe（结果有缓存），收益是
+    归档链路不会再产出损坏成片。
     """
     try:
         files = os.listdir(task_path)
@@ -637,7 +740,33 @@ def _find_final_task_video(task_path: str) -> str:
         return ""
 
     _, file_name = min(candidates, key=lambda item: item[0])
-    return os.path.join(task_path, file_name)
+    video_file = os.path.join(task_path, file_name)
+    if not _is_settled_video_file(video_file):
+        return ""
+    return video_file
+
+
+def _is_settled_video_file(video_file: str) -> bool:
+    """确认成片已经写完：可解析出尺寸，且大小在两次轮询之间保持稳定。
+
+    单独的大小稳定性判断不足以排除「刚好写完但仍是坏文件」的情况，所以两者
+    都要求。稳定窗口用文件 mtime 与当前时间的差值近似：写入中的文件 mtime 一直
+    是「刚刚」，写完一段时间后才会超过阈值。
+    """
+    dimensions = _probe_video_dimensions(video_file)
+    if dimensions is None:
+        return False
+
+    try:
+        stat_result = os.stat(video_file)
+    except OSError:
+        return False
+
+    if stat_result.st_size <= 0:
+        return False
+
+    # mtime 明显早于本次检查，说明文件在上一轮扫描之后没有再被写过。
+    return (time.time() - stat_result.st_mtime) > _VIDEO_SETTLE_SECONDS
 
 
 def _build_restore_upload_requirements(params: Mapping) -> dict:
@@ -904,29 +1033,180 @@ def _is_headless_server():
     return not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def _open_task_path(task_path):
-    tasks_root = os.path.abspath(utils.task_dir())
-    normalized_path = os.path.abspath(task_path)
-    if not normalized_path.startswith(tasks_root + os.sep):
-        logger.warning(f"invalid task folder path: {normalized_path}")
-        return
-    if not os.path.isdir(normalized_path):
-        return
+def _is_within_root(candidate: str, root: str) -> bool:
+    """判断 ``candidate`` 是否严格位于 ``root`` 之内。
+
+    使用 ``realpath`` + ``commonpath`` 而不是字符串前缀比较：``storage/tasks``
+    的前缀匹配会把同级的 ``storage/tasks-backup`` 误判为子目录。解析符号链接
+    之后再比较，才能真正防止「用一个指向外部的软链接目录绕过限制」。
+    """
+    try:
+        resolved_root = os.path.realpath(root)
+        resolved_candidate = os.path.realpath(candidate)
+    except OSError:
+        return False
+    if resolved_candidate == resolved_root:
+        return False
+    try:
+        return os.path.commonpath([resolved_root, resolved_candidate]) == resolved_root
+    except ValueError:
+        # 不同盘符 / 不同挂载点时 commonpath 会抛 ValueError，视为越界。
+        return False
+
+
+def _reveal_in_file_manager(
+    target: str,
+    allowed_root: str,
+    label: str,
+    display_base: str,
+) -> bool:
+    """在系统文件管理器中打开 ``target``，并把它限制在 ``allowed_root`` 之内。
+
+    这是任务目录和频道归档目录唯一的打开入口。历史上两处各写了一份，一份用
+    ``webbrowser.open``、一份用 ``subprocess``，且归档那一版完全没有目录约束，
+    于是两个按钮打开的地方不一样、越界检查也不一样。合并后两个入口共享同一
+    套校验和同一套无桌面降级逻辑。
+
+    ``allowed_root`` 是安全边界，``display_base`` 只是无桌面降级时用来算相对
+    路径的基准。两者必须分开：任务目录的边界是 ``storage/tasks``，但要展示的
+    路径从 ``storage`` 起算才有 ``./storage/tasks/<id>`` 这种可读形式；归档
+    目录的边界和展示基准又刚好都是 ``outputs``。分开传入才能让两个入口都
+    在根目录被替换（测试、挂载）时仍然正确。
+
+    返回是否真的调用了系统打开动作；无桌面环境下降级为路径提示并返回 ``False``。
+    """
+    if not _is_within_root(target, allowed_root):
+        logger.warning(f"refused to open path outside {allowed_root}: {target}")
+        return False
+
+    resolved = os.path.realpath(target)
+    if not os.path.exists(resolved):
+        return False
+
     if _is_headless_server():
-        # storage 目录通常以卷挂载映射回宿主机，提示相对路径即可定位文件。
-        rel_path = os.path.relpath(normalized_path, os.path.dirname(tasks_root))
-        st.toast(f"{tr('Open Task Folder')}: ./storage/{rel_path}", icon="📂")
-        return
-    webbrowser.open(f"file://{normalized_path}")
+        # 容器内拿不到宿主机桌面，但 storage / outputs 通常以卷挂载映射回宿主机，
+        # 给出相对仓库根的路径就能定位到文件。
+        # display_base 必须和 resolved 一样先解析符号链接：macOS 上 /var 是
+        # /private/var 的软链接，只解析一边会让 relpath 变成一串 ../..。
+        try:
+            relative = os.path.relpath(resolved, os.path.realpath(display_base))
+        except ValueError:
+            relative = resolved
+        st.toast(f"{label}: ./{relative}", icon=":material/folder_open:")
+        return False
+
+    # 打开目录时用系统文件管理器；目标是文件时交给系统默认程序。
+    folder = resolved if os.path.isdir(resolved) else os.path.dirname(resolved)
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", folder], stderr=subprocess.DEVNULL)
+        elif sys.platform.startswith("win"):
+            if os.path.isdir(resolved):
+                os.startfile(folder)  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["explorer", "/select,", resolved])
+        else:
+            subprocess.Popen(["xdg-open", folder], stderr=subprocess.DEVNULL)
+    except Exception as e:
+        logger.error(f"failed to open path in file manager: {resolved}, {e}")
+        return False
+    return True
+
+
+def _task_display_base() -> str:
+    """任务目录降级提示的相对路径基准，即仓库根目录。
+
+    提示要展示成 ``./storage/tasks/<id>``，所以基准是仓库根而不是 ``storage``。
+    任务目录比归档目录深一层（``storage/tasks`` vs ``outputs``），因此这里要
+    往上退两级；两个入口的目标深度不同，基准不能靠统一的层级规则推导。
+    """
+    tasks_root = os.path.abspath(utils.task_dir())
+    return os.path.dirname(os.path.dirname(tasks_root))
+
+
+def _archive_display_base() -> str:
+    """归档目录降级提示的相对路径基准，即仓库根目录（``outputs`` 的上一层）。"""
+    return os.path.dirname(os.path.abspath(plans.OUTPUTS_DIR))
+
+
+def _open_task_path(task_path):
+    """打开任务工作目录（``storage/tasks/<id>``），内含成片与全部中间产物。"""
+    return _reveal_in_file_manager(
+        task_path,
+        utils.task_dir(),
+        tr("Open Task Folder"),
+        _task_display_base(),
+    )
+
+
+def _open_archive_folder_for_task(task_path):
+    """打开任务已归档到的频道目录（``outputs/<channel>/<YYYY-MM>/videos``）。
+
+    归档目录才是长期保存、用于发布的位置；任务目录可以随时被清理。任务尚未
+    归档时没有可打开的目标，返回 ``False`` 让调用方禁用该按钮。
+    """
+    archive_dir = _resolve_task_archive_dir(task_path)
+    if not archive_dir:
+        return False
+    return _reveal_in_file_manager(
+        archive_dir,
+        plans.OUTPUTS_DIR,
+        tr("Open Archive Folder"),
+        _archive_display_base(),
+    )
+
+
+def _resolve_task_archive_dir(task_path: str) -> str:
+    """由任务目录反查它归档到的频道视频目录；未归档或已丢失时返回空串。
+
+    任务目录里的 ``plan_meta.json`` 记录了 channel / topic，而归档文件名同时
+    包含计划序号、归档日期和主题 slug。这里不重新推导文件名，而是直接在归档
+    根目录里查找与任务 ``task_id`` 关联的 ``.txt`` 边车文件——边车里就有
+    ``task_id``，因此这是唯一不需要猜测的关联方式。
+    """
+    meta_path = os.path.join(task_path, "plan_meta.json")
+    channel = ""
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                channel = str((json.load(handle) or {}).get("channel") or "").strip()
+        except (OSError, ValueError):
+            channel = ""
+    if not channel:
+        return ""
+
+    task_id = os.path.basename(os.path.normpath(task_path))
+    if not task_id:
+        return ""
+
+    channel_root = plans._outputs_channel_dir(channel)
+    if not os.path.isdir(channel_root):
+        return ""
+
+    for dirpath, _dirnames, filenames in os.walk(channel_root):
+        if os.path.basename(os.path.normpath(dirpath)) != "videos":
+            continue
+        for name in filenames:
+            if not name.endswith(".txt"):
+                continue
+            sidecar = os.path.join(dirpath, name)
+            try:
+                with open(sidecar, "r", encoding="utf-8") as handle:
+                    body = handle.read()
+            except OSError:
+                continue
+            if f"task_id: {task_id}" in body:
+                return dirpath
+    return ""
 
 
 def _open_task_video(video_file):
-    tasks_root = os.path.abspath(utils.task_dir())
-    normalized_file = os.path.abspath(video_file)
+    tasks_root = utils.task_dir()
+    normalized_file = os.path.realpath(video_file)
 
     # 视频路径来自任务目录扫描或运行期状态。这里仍然限制只能打开任务目录
     # 内的文件，避免 UI 操作被异常路径扩展成任意本地文件打开能力。
-    if not normalized_file.startswith(tasks_root + os.sep):
+    if not _is_within_root(normalized_file, tasks_root):
         logger.warning(f"invalid task video path: {normalized_file}")
         return
     if not os.path.isfile(normalized_file):
@@ -1078,9 +1358,21 @@ def _build_video_download_name(subject, index, total):
     return f"{safe_subject}{suffix}.mp4"
 
 
+# 任务表列宽。表头与每一行必须引用同一份，否则某一列只出现在表头或只出现在
+# 行里，视觉上就会整体错位。
+#
+# popover 宽 1000px，扣掉列间距后可用约 900px。每一列都按表头文字的实测宽度
+# 留够余量：「Queue #」「Thumbnail」窄于文字就会断成「Queu / e #」，
+# 「Completed」「2026-09-27 19:32」同理。操作列要放下 5 个 44px 触达目标
+# （含间距约 250px），主题列拿剩余空间并用单行省略号消化长标题。
+# 旧版把操作按钮渲染进了「主题」列，导致表头的「操作」列悬空、按钮被挤在
+# 主题文字下方；这里把宽度让给操作列后两者各自独立成列。
+_TASK_TABLE_COLUMNS = [0.6, 0.85, 1.0, 1.3, 2.0, 0.75, 2.7]
+
+
 def _render_task_table(filtered_tasks, key_prefix):
     with st.container(key=f"task_table_header_{key_prefix}"):
-        header_cols = st.columns([0.6, 0.8, 1.1, 1.7, 3.0, 0.8, 1.6], vertical_alignment="center")
+        header_cols = st.columns(_TASK_TABLE_COLUMNS, vertical_alignment="center")
         header_cols[0].caption(tr("Queue #"))
         header_cols[1].caption(tr("Thumbnail"))
         header_cols[2].caption(tr("Task Status"))
@@ -1104,6 +1396,7 @@ def _render_task_table(filtered_tasks, key_prefix):
             has_restore_data = os.path.isfile(
                 os.path.join(task["task_path"], "script.json")
             )
+            archive_dir = _resolve_task_archive_dir(task["task_path"])
             safe_task_key = "".join(ch if ch.isalnum() else "_" for ch in task_id)[:40]
 
             # 使用 Streamlit 原生 bordered container + columns 保留每行操作。
@@ -1113,7 +1406,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                 key=f"task_row_{key_prefix}_{safe_task_key}", border=True
             ):
                 row_cols = st.columns(
-                    [0.6, 0.8, 1.1, 1.7, 3.0, 0.8, 1.6],
+                    _TASK_TABLE_COLUMNS,
                     vertical_alignment="center",
                 )
                 # Queue position (only for processing/queued tasks)
@@ -1129,7 +1422,15 @@ def _render_task_table(filtered_tasks, key_prefix):
                 
                 row_cols[2].write(_task_state_label(task["state"], has_video))
                 row_cols[3].write(_format_task_time(task["mtime"]))
-                row_cols[4].write(_format_task_subject(task["subject"]))
+                # 主题渲染成带 title 的单行文本：CSS 负责省略号截断，保证每行
+                # 高度一致（多行主题会让整行的垂直居中失效），完整主题通过
+                # 原生 tooltip 保留。
+                full_subject = " ".join(str(task["subject"] or "").split())
+                row_cols[4].markdown(
+                    f'<span class="mpt-task-subject" title="{html.escape(full_subject)}">'
+                    f"{html.escape(full_subject or '-')}</span>",
+                    unsafe_allow_html=True,
+                )
                 
                 # Enhanced progress display with ETA for processing tasks
                 if _task_state_filter_key(task) == "processing":
@@ -1138,8 +1439,11 @@ def _render_task_table(filtered_tasks, key_prefix):
                 else:
                     row_cols[5].write(f"{task['progress']}%")
 
-                action_cols = row_cols[4].columns(
-                    4,
+                # 操作按钮独占第 7 列，与表头的「操作」列对齐。旧版把它们
+                # 渲染进第 5 列（主题），于是主题文字下方挤着一排按钮，而
+                # 表头的「操作」列下方完全是空白。
+                action_cols = row_cols[6].columns(
+                    5,
                     vertical_alignment="center",
                     gap="small",
                 )
@@ -1156,17 +1460,37 @@ def _render_task_table(filtered_tasks, key_prefix):
                         _open_task_video(task["video_file"])
 
                 with action_cols[1]:
+                    # 归档目录才是长期保存、用于发布的位置，因此它作为默认的
+                    # 「打开文件夹」；任务工作目录保留为紧邻的次要入口，两者
+                    # 不再共用一个含义模糊的按钮。
+                    archive_label = tr("Open Archive Folder")
+                    archive_help = (
+                        archive_label
+                        if archive_dir
+                        else tr("Task Not Archived Yet")
+                    )
+                    if st.button(
+                        archive_label,
+                        key=f"open_archive_{key_prefix}_{task_id}",
+                        width='stretch',
+                        icon=":material/folder_open:",
+                        help=archive_help,
+                        disabled=not archive_dir,
+                    ):
+                        _open_archive_folder_for_task(task["task_path"])
+
+                with action_cols[2]:
                     open_label = tr("Open Task Folder")
                     if st.button(
                         open_label,
                         key=f"open_task_{key_prefix}_{task_id}",
                         width='stretch',
-                        icon=":material/folder_open:",
+                        icon=":material/source:",
                         help=open_label,
                     ):
                         _open_task_path(task["task_path"])
 
-                with action_cols[2]:
+                with action_cols[3]:
                     restore_label = tr("Regenerate Task")
                     if st.button(
                         restore_label,
@@ -1178,7 +1502,7 @@ def _render_task_table(filtered_tasks, key_prefix):
                     ):
                         _queue_task_restore(task_id)
 
-                with action_cols[3]:
+                with action_cols[4]:
                     delete_label = tr("Delete Task")
                     delete_help = (
                         f"{delete_label} ({tr('Task Status Processing')})"
@@ -1239,9 +1563,8 @@ def _render_task_video_preview():
     if not preview_file:
         return
 
-    tasks_root = os.path.abspath(utils.task_dir())
-    if not (
-        preview_file.startswith(tasks_root + os.sep) and os.path.isfile(preview_file)
+    if not _is_within_root(preview_file, utils.task_dir()) or not os.path.isfile(
+        preview_file
     ):
         st.session_state.pop("task_preview_video_file", None)
         return
@@ -1251,15 +1574,16 @@ def _render_task_video_preview():
     task_name = os.path.basename(os.path.dirname(preview_file))
     preview_cols[0].caption(f"{os.path.basename(preview_file)} · {task_name}")
     closed = preview_cols[1].button(
-        "✕",
+        tr("Close"),
         key="close_task_video_preview",
         width='stretch',
+        icon=":material/close:",
         help=tr("Close"),
     )
     if closed:
         st.session_state.pop("task_preview_video_file", None)
         return
-    st.video(preview_file)
+    _render_video_player(preview_file)
 
 
 def _plan_topic_recorded(channel, topic) -> bool:
@@ -1313,6 +1637,14 @@ def _auto_archive_plan_tasks() -> bool:
                 plans_root=plans.PLANS_DIR,
                 copy_media=True,
             )
+        except archive_video.ArchiveError as exc:
+            # 归档失败（成片缺失、无法解析、复制不完整）时不写 .plan_archived，
+            # 任务会在后续轮询里继续重试，直到成片真正写完。
+            logger.warning(
+                f"deferred archiving plan video: task_id={task['task_id']}, "
+                f"channel={channel}, topic={topic}, reason={exc}"
+            )
+            continue
         except Exception as exc:
             logger.warning(
                 f"failed to archive plan video: task_id={task['task_id']}, "
@@ -1325,6 +1657,7 @@ def _auto_archive_plan_tasks() -> bool:
         )
         # 主题不在 topics_30day.txt 时归档会落入「未计划录制」，iter_all_plan_rows
         # 不会把它读成已录制记录；用按任务持久化的标记保证只归档一次，避免反复 rerun。
+        # 标记只在归档函数确认成片已完整落盘之后才写。
         try:
             with open(os.path.join(task_path, ".plan_archived"), "w", encoding="utf-8") as handle:
                 handle.write(json.dumps({"task_id": task["task_id"]}, ensure_ascii=False))
@@ -1864,18 +2197,6 @@ def render_onboarding_tour():
 
 
 @st.cache_resource(show_spinner=False)
-def _cached_media_tools():
-    """
-    解析并固定 ffmpeg/ffprobe 的版本与哈希。
-
-    放在缓存里是因为它要跑两次 `-version` 并给两个二进制做 SHA-256；
-    每次重跑都算一遍会把 Streamlit 的重绘拖慢。该函数自身对失败关闭：
-    解析不出来就抛，由调用方降级成"缩略图不可用"。
-    """
-    return probe_media_tools()
-
-
-@st.cache_resource(show_spinner=False)
 def _cached_project_layout():
     """解析应用根与作品集根。作品集根缺失时不抛，交给调用方按不可用处理。"""
     try:
@@ -1883,6 +2204,48 @@ def _cached_project_layout():
     except Exception as exc:  # noqa: BLE001 - 配置缺失是可预期状态
         logger.warning(f"project layout unavailable, thumbnails disabled: {exc}")
         return None
+
+
+@st.fragment(run_every="500ms")
+def _thumbnail_job_watch(task_id: str, thumbnail_root: str):
+    """
+    有在途缩略图作业时轮询，全部结束后触发一次整页刷新。
+
+    没有这一层的话，后台作业跑完了界面也不会更新：结果页是静态渲染的，
+    用户必须自己点一下页面才能看到新缩略图，看起来就像功能坏了。
+    空作业列表不刷新，否则页面会无限自我刷新。
+    """
+    from app.services.thumbnail_jobs import get_job_manager
+
+    try:
+        records = get_job_manager(Path(thumbnail_root)).list_jobs(task_id)
+    except Exception as exc:  # noqa: BLE001 - 轮询失败不该打断结果页
+        logger.debug(f"thumbnail job watch skipped: task_id={task_id}, error={exc}")
+        return
+
+    if not should_refresh(records):
+        return
+
+    st.rerun(scope="app")
+
+
+def _thumbnail_unavailable_notice(reason: object) -> None:
+    """
+    作品集根没配时说明功能为什么没出现、怎么打开。
+
+    缩略图是附加能力，所以布局解析失败时绝不抛错、也绝不猜一个目录来写
+    （那会把产物落到错误的树里）。但静默不渲染和"功能坏了"在用户眼里没区别，
+    所以这里给一条折叠的说明：该功能处于关闭状态，以及具体要改哪个配置。
+    """
+    message = str(reason).strip() or "portfolio_root 未配置"
+    with st.expander(tr("Thumbnail unavailable"), expanded=False):
+        st.caption(message)
+        st.caption(
+            tr(
+                "Set portfolio_root in the [app] section of config.toml to enable "
+                "thumbnails and portfolio planning."
+            )
+        )
 
 
 def _render_thumbnail_section(task_id: str):
@@ -1895,6 +2258,9 @@ def _render_thumbnail_section(task_id: str):
     try:
         layout = _cached_project_layout()
         if layout is None:
+            _thumbnail_unavailable_notice(
+                "portfolio_root 未配置，缩略图与作品集功能处于关闭状态。"
+            )
             return
 
         descriptor_path = (
@@ -1904,8 +2270,7 @@ def _render_thumbnail_section(task_id: str):
             return
 
         descriptor = read_result_descriptor(descriptor_path)
-        tools = _cached_media_tools()
-    except (ResultDescriptorError, ThumbnailFilesError, MediaToolsError) as exc:
+    except (ResultDescriptorError, ThumbnailFilesError) as exc:
         logger.info(f"thumbnail section skipped: task_id={task_id}, reason={exc}")
         return
     except Exception as exc:  # noqa: BLE001 - 附加功能不应影响主流程
@@ -1918,13 +2283,19 @@ def _render_thumbnail_section(task_id: str):
     if not descriptor.videos:
         return
 
+    thumbnail_root = layout.thumbnail_root / task_id
+    try:
+        if watch_for_completion(task_id, thumbnail_root):
+            _thumbnail_job_watch(task_id, str(thumbnail_root))
+    except Exception as exc:  # noqa: BLE001 - 附加功能不应影响主流程
+        logger.debug(f"thumbnail job watch failed: task_id={task_id}, error={exc}")
+
     try:
         render_thumbnail_panel(
             descriptor=descriptor,
             manifest_path=layout.thumbnail_root / task_id / "manifest.json",
             thumbnail_root=layout.thumbnail_root / task_id,
             source_root=layout.storage_root / "tasks" / task_id,
-            tools=tools,
             tr=tr,
         )
     except Exception as exc:  # noqa: BLE001 - 同上，附加功能不应影响主流程
@@ -2000,7 +2371,7 @@ def _render_generation_task_snapshot(task_id, task):
         player_cols = st.columns(len(video_files) * 2 + 1)
         for i, url in enumerate(video_files):
             with player_cols[i * 2 + 1]:
-                st.video(url)
+                _render_video_player(url)
                 if not os.path.isfile(url):
                     logger.warning(
                         f"generated video is unavailable for download: "
@@ -3897,6 +4268,33 @@ def _render_script_settings(panel, params):
                 key="video_subject",
             ).strip()
 
+            # 赛道选择：决定品牌句、钩子写法与目标长度。每条视频都会带上
+            # 该赛道的固定品牌句，识别度就是靠这个建立的。
+            from app.services.niche_brand import NICHES
+
+            niche_options = [(tr("No Niche"), "")]
+            for channel, profile in sorted(NICHES.items()):
+                niche_options.append((profile.display_name, channel))
+            niche_values = [value for _, value in niche_options]
+            params.channel = stable_selectbox(
+                tr("Niche"),
+                options=niche_values,
+                default_value=(
+                    params.channel if params.channel in niche_values else ""
+                ),
+                format_func=lambda value: dict(niche_options).get(value, value),
+                key="channel",
+            )
+            if params.channel:
+                profile = NICHES[params.channel]
+                st.caption(
+                    tr("Niche Preview").format(
+                        name=profile.display_name,
+                        line=profile.brand_line,
+                        words=profile.target_words,
+                    )
+                )
+
             video_languages = [
                 (tr("Auto Detect"), ""),
             ]
@@ -5722,6 +6120,25 @@ def _render_subtitle_settings(panel, params):
             )
             _set_runtime_config("ui", "subtitle_enabled", params.subtitle_enabled)
             subtitle_settings_disabled = not params.subtitle_enabled
+
+            # 逐词高亮：正在念的词点亮，其余压暗。需要 ASR 的词级时间；
+            # 拿不到时自动退回整句原样显示。
+            st.session_state.setdefault(
+                "caption_word_highlight_checkbox",
+                _saved_ui_bool(
+                    "caption_word_highlight",
+                    DEFAULT_SUBTITLE_SETTINGS.get("caption_word_highlight", True),
+                ),
+            )
+            params.caption_word_highlight = st.checkbox(
+                tr("Highlight Spoken Words"),
+                key="caption_word_highlight_checkbox",
+                disabled=subtitle_settings_disabled,
+                help=tr("Highlight Spoken Words Help"),
+            )
+            _set_runtime_config(
+                "ui", "caption_word_highlight", params.caption_word_highlight
+            )
             font_names = get_all_fonts()
             saved_font_name = config.ui.get(
                 "font_name", DEFAULT_SUBTITLE_SETTINGS["font_name"]
@@ -6381,7 +6798,7 @@ def _submit_plan_generation(channel, topic) -> None:
     try:
         task_path = utils.task_dir(task_id)
         os.makedirs(task_path, exist_ok=True)
-        with open(os.path.join(task_path, "plan_meta.json"), "w", encoding="utf-8") as handle:
+        with open(str(plan_meta_path(task_path)), "w", encoding="utf-8") as handle:
             json.dump(plan_meta, handle, ensure_ascii=False)
     except OSError as exc:
         logger.warning(f"failed to write plan task metadata: channel={channel}, error={exc}")
@@ -6554,15 +6971,6 @@ def _render_plan_panel():
                     st.rerun()
 
 
-def _open_path_in_folder(path):
-    folder = os.path.dirname(os.path.abspath(path))
-    if sys.platform.startswith("darwin"):
-        return subprocess.Popen(["open", folder], stderr=subprocess.DEVNULL)
-    if os.name == "nt":
-        return subprocess.Popen(["explorer", "/select,", os.path.abspath(path)])
-    return subprocess.Popen(["xdg-open", folder], stderr=subprocess.DEVNULL)
-
-
 def _media_library_entries(channel):
     entries = plans.list_channel_videos(channel)
     row_index = plans.build_video_row_index(channel)
@@ -6620,17 +7028,28 @@ def _render_media_library():
             pick_index = preview_names.index(pick_name)
             entry = entries[pick_index]
             local = entry["path"]
+            readable = _probe_video_dimensions(local) is not None
             if st.checkbox(
                 tr("Show Preview"),
                 value=False,
                 key=f"media_library_show_video_{channel}",
+                disabled=not readable,
+                help=(
+                    tr("Video File Unreadable").format(name=os.path.basename(local))
+                    if not readable
+                    else None
+                ),
             ):
-                st.video(local)
+                _render_video_player(local)
             badge = (
                 "<span class='mpt-badge mpt-badge--posted'>● Posted</span>"
                 if entry["posted"]
                 else "<span class='mpt-badge mpt-badge--draft'>● Draft</span>"
             )
+            if not readable:
+                badge = (
+                    "<span class='mpt-badge mpt-badge--broken'>● Unreadable</span>"
+                )
             st.markdown(
                 f"<p class='mpt-media-caption'>{badge} "
                 f"{html.escape(entry['topic'])}</p>",
@@ -6642,7 +7061,7 @@ def _render_media_library():
                     tr("Post Video"),
                     type="primary",
                     width='stretch',
-                    disabled=entry["posted"],
+                    disabled=entry["posted"] or not readable,
                     key=f"media_library_post_{channel}_{pick_index}",
                 ):
                     with st.spinner(tr("Uploading To YouTube")):
@@ -6663,10 +7082,19 @@ def _render_media_library():
             with action_cols[1]:
                 if st.button(
                     tr("Open Folder"),
+                    icon=":material/folder_open:",
                     width='stretch',
+                    help=tr("Open Archive Folder"),
                     key=f"media_library_open_{channel}_{pick_index}",
                 ):
-                    _open_path_in_folder(local)
+                    # 媒体库里的成片本身就位于归档目录，因此这里与任务面板的
+                    # 「打开归档目录」指向同一棵树，两个面板不再各开各的。
+                    _reveal_in_file_manager(
+                        local,
+                        plans.OUTPUTS_DIR,
+                        tr("Open Archive Folder"),
+                        _archive_display_base(),
+                    )
             st.divider()
             library_rows = []
             shown_entries = entries[:_MEDIA_LIBRARY_TABLE_LIMIT]

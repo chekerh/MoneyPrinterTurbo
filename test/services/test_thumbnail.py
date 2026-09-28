@@ -540,3 +540,86 @@ class TestStripJpegMetadata(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOverlayTextSupportsRealWorldScripts(unittest.TestCase):
+    """
+    叠加文字必须支持真实世界里的文字。
+
+    原来的白名单只放行拉丁字符，导致中文、西里尔、韩文、阿拉伯文和符号
+    全部被拒——而这个项目的界面本身就是中文的，等于把功能对主要用户关掉。
+    那份白名单想防的东西（控制字符、双向覆盖）已经由 _CONTROL 和
+    _BIDI_AND_FORMAT 单独拦住了，这里要补的是"不可见/伪装"这一类，
+    而不是限制文字来自哪种语言。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name).resolve()
+        self.output = self.base / "out.jpg"
+        self.source = self.base / "src.mp4"
+        from app.utils.utils import resource_dir
+
+        self.font = (Path(resource_dir("fonts")) / "Charm-Regular.ttf").resolve()
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", "testsrc=size=1280x720:rate=1:duration=2",
+             "-pix_fmt", "yuv420p", str(self.source)],
+            check=True, capture_output=True,
+        )
+        self.tools = probe_media_tools()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _spec(self, text):
+        return ThumbnailSpec(
+            source=self.source,
+            output=self.output,
+            overlay_text=text,
+            font_path=self.font,
+        )
+
+    def test_renders_text_from_every_major_script(self):
+        """每一种主要文字都要真的能画出像素，而不只是通过校验。"""
+        for label, text in (
+            ("Chinese", "世界你好"),
+            ("Japanese", "こんにちは"),
+            ("Korean", "안녕하세요"),
+            ("Cyrillic", "Привет мир"),
+            ("Arabic", "مرحبا بالعالم"),
+            ("Greek", "Γειά σου Κόσμε"),
+            ("symbols", "★ ▲ ● →"),
+        ):
+            with self.subTest(script=label):
+                if self.output.exists():
+                    self.output.unlink()
+                result = render_thumbnail(self._spec(text), tools=self.tools)
+                self.assertTrue(self.output.is_file())
+                self.assertGreater(result.width, 0)
+
+    def test_still_rejects_invisible_and_spoofing_characters(self):
+        """放宽语言限制不等于放宽安全限制。"""
+        for label, bad in (
+            ("control", "a\x00b"),
+            ("tab", "a\tb"),
+            ("bidi override", "safe\u202egnitset"),
+            ("zero-width space", "a\u200bb"),
+            ("zero-width joiner", "a\u200db"),
+            ("word joiner", "a\u2060b"),
+            ("line separator", "a\u2028b"),
+            ("variation selector", "a\ufe0fb"),
+            ("soft hyphen", "a\u00adb"),
+        ):
+            with self.subTest(kind=label):
+                if self.output.exists():
+                    self.output.unlink()
+                with self.assertRaises(ThumbnailError):
+                    render_thumbnail(self._spec(bad), tools=self.tools)
+                self.assertFalse(self.output.exists())
+
+    def test_mixed_script_text_is_allowed(self):
+        """中英混排是中文用户的日常用法，不能被拦。"""
+        result = render_thumbnail(self._spec("第 3 集：Hello 世界"), tools=self.tools)
+        self.assertTrue(self.output.is_file())
+        self.assertEqual(result.width, TARGET_WIDTH)

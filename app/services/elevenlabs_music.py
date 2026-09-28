@@ -10,6 +10,7 @@ from loguru import logger
 
 from app.config import config
 from app.services import bgm as bgm_service
+from app.services.http_session import session_manager
 from app.utils import utils
 
 
@@ -113,10 +114,11 @@ def test_connection() -> dict[str, Any]:
     if not api_key:
         raise ElevenLabsAuthenticationError("ElevenLabs API key is required")
     try:
-        with requests.get(
+        with session_manager.get(
             f"{_base_url()}{SUBSCRIPTION_PATH}",
             headers={"xi-api-key": api_key},
             timeout=(15, 30),
+            base_url=DEFAULT_BASE_URL,
             stream=True,
         ) as response:
             if response.status_code == 401:
@@ -311,15 +313,12 @@ def _request_bgm(video_path: str, output_path: str, prompt: str) -> str:
             request_data["description"] = prompt
         try:
             with open(video_path, "rb") as video_file:
-                response = requests.post(
+                response = session_manager.post(
                     f"{_base_url()}{VIDEO_TO_MUSIC_PATH}",
                     headers={"xi-api-key": get_api_key()},
                     params={"output_format": "mp3_44100_128"},
                     files=[
                         (
-                            # 官方文档把表单数组展示为 ``videos[]``，但 2026-07-18
-                            # 生产接口会对该字段返回 422，实际 Starlette 参数名为
-                            # ``videos``。重复上传时 requests 可继续添加同名字段。
                             "videos",
                             (Path(video_path).name, video_file, "video/mp4"),
                         )
@@ -327,6 +326,7 @@ def _request_bgm(video_path: str, output_path: str, prompt: str) -> str:
                     data=request_data,
                     stream=True,
                     timeout=_request_timeout(),
+                    base_url=DEFAULT_BASE_URL,
                 )
                 with response:
                     if not response.ok:

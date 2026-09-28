@@ -59,7 +59,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
             }
         )
 
-        with patch("app.services.material.requests.get", return_value=fake_response) as get:
+        with patch("app.services.material.session_manager.get", return_value=fake_response) as get:
             results = material.search_videos_pexels("cat", minimum_duration=1)
 
         self.assertEqual(len(results), 1)
@@ -104,7 +104,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
             }
         )
 
-        with patch("app.services.material.requests.get", return_value=fake_response) as get:
+        with patch("app.services.material.session_manager.get", return_value=fake_response) as get:
             results = material.search_videos_pixabay(
                 "cat",
                 minimum_duration=1,
@@ -217,7 +217,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
         )
 
         with patch(
-            "app.services.material.requests.get",
+            "app.services.material.session_manager.get",
             return_value=pexels_response,
         ) as get:
             pexels_results = material.search_videos_pexels(
@@ -227,7 +227,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
             )
             pexels_url = get.call_args.args[0]
         with patch(
-            "app.services.material.requests.get",
+            "app.services.material.session_manager.get",
             return_value=pixabay_response,
         ):
             pixabay_results = material.search_videos_pixabay(
@@ -236,7 +236,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
                 video_aspect=material.VideoAspect.portrait,
             )
         with patch(
-            "app.services.material.requests.get",
+            "app.services.material.session_manager.get",
             return_value=coverr_response,
         ) as get:
             coverr_results = material.search_videos_coverr(
@@ -315,7 +315,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
 
         for aspect, expected_filter in cases:
             with self.subTest(aspect=aspect), patch(
-                "app.services.material.requests.get",
+                "app.services.material.session_manager.get",
                 return_value=fake_response,
             ) as get:
                 material.search_videos_coverr(
@@ -325,11 +325,11 @@ class TestMaterialTlsVerification(unittest.TestCase):
                 )
                 request_url = get.call_args.args[0]
 
-            self.assertIn("page_size=20", request_url)
-            if expected_filter:
-                self.assertIn(expected_filter, request_url)
-            else:
-                self.assertNotIn("filter=", request_url)
+                self.assertIn("page_size=20", request_url)
+                if expected_filter:
+                    self.assertIn(expected_filter, request_url)
+                else:
+                    self.assertNotIn("filter=", request_url)
 
     def test_square_search_preserves_crop_compatible_materials(self):
         """
@@ -376,7 +376,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
         )
 
         with patch(
-            "app.services.material.requests.get",
+            "app.services.material.session_manager.get",
             return_value=pixabay_response,
         ):
             pixabay_results = material.search_videos_pixabay(
@@ -385,7 +385,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
                 video_aspect=material.VideoAspect.square,
             )
         with patch(
-            "app.services.material.requests.get",
+            "app.services.material.session_manager.get",
             return_value=coverr_response,
         ):
             coverr_results = material.search_videos_coverr(
@@ -415,7 +415,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
         )
 
         with patch(
-            "app.services.material.requests.get", return_value=fake_response
+            "app.services.material.session_manager.get", return_value=fake_response
         ), patch("app.services.material.logger.info") as log:
             material.search_videos_pixabay("cat", minimum_duration=1)
 
@@ -441,7 +441,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
         )
 
         with patch(
-            "app.services.material.requests.get", return_value=fake_response
+            "app.services.material.session_manager.get", return_value=fake_response
         ), patch("app.services.material.logger.error") as log:
             results = material.search_videos_pixabay("nature", minimum_duration=1)
 
@@ -470,7 +470,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
         )
 
         with patch(
-            "app.services.material.requests.get", return_value=fake_response
+            "app.services.material.session_manager.get", return_value=fake_response
         ), patch("app.services.material.logger.error") as log:
             results = material.search_videos_pixabay("nature", minimum_duration=1)
 
@@ -498,7 +498,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
         )
 
         with patch(
-            "app.services.material.requests.get", return_value=fake_response
+            "app.services.material.session_manager.get", return_value=fake_response
         ), patch("app.services.material.logger.error") as log:
             results = material.search_videos_pixabay("nature", minimum_duration=1)
 
@@ -521,7 +521,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
         )
 
         with patch(
-            "app.services.material.requests.get", side_effect=error
+            "app.services.material.session_manager.get", side_effect=error
         ), patch("app.services.material.logger.error") as log:
             results = material.search_videos_pixabay("nature", minimum_duration=1)
 
@@ -545,7 +545,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
         )
 
         with patch(
-            "app.services.material.requests.get", side_effect=error
+            "app.services.material.session_manager.get", side_effect=error
         ), patch("app.services.material.logger.error") as log:
             results = material.search_videos_pixabay("nature", minimum_duration=1)
 
@@ -573,7 +573,7 @@ class TestMaterialTlsVerification(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch(
-                "app.services.material.requests.get", return_value=fake_response
+                "app.services.material.session_manager.get", return_value=fake_response
             ) as get, patch("app.services.material.VideoFileClip", FakeVideoFileClip):
                 video_path = material.save_video(
                     "https://example.com/video.mp4?token=abc", save_dir=temp_dir
@@ -852,7 +852,7 @@ class TestCoverrProvider(unittest.TestCase):
         )
 
         with patch(
-            "app.services.material.requests.get", return_value=fake_response
+            "app.services.material.session_manager.get", return_value=fake_response
         ) as get:
             results = material.search_videos_coverr(
                 "nature",
@@ -892,7 +892,7 @@ class TestCoverrProvider(unittest.TestCase):
         fake_response = SimpleNamespace(json=lambda: {"hits": []})
 
         with patch(
-            "app.services.material.requests.get", return_value=fake_response
+            "app.services.material.session_manager.get", return_value=fake_response
         ) as get:
             material.search_videos_coverr("nature", minimum_duration=1)
 
@@ -907,7 +907,7 @@ class TestCoverrProvider(unittest.TestCase):
         fake_response = SimpleNamespace(json=lambda: {"hits": []})
 
         with patch(
-            "app.services.material.requests.get", return_value=fake_response
+            "app.services.material.session_manager.get", return_value=fake_response
         ) as get:
             material.search_videos_coverr("nature", minimum_duration=1)
 
@@ -942,7 +942,7 @@ class TestCoverrProvider(unittest.TestCase):
         )
 
         with patch(
-            "app.services.material.requests.get", return_value=fake_response
+            "app.services.material.session_manager.get", return_value=fake_response
         ):
             results = material.search_videos_coverr("x", minimum_duration=5)
 
@@ -980,7 +980,7 @@ class TestCoverrProvider(unittest.TestCase):
         )
 
         with patch(
-            "app.services.material.requests.get", return_value=fake_response
+            "app.services.material.session_manager.get", return_value=fake_response
         ):
             results = material.search_videos_coverr("x", minimum_duration=1)
 
@@ -1002,7 +1002,7 @@ class TestCoverrProvider(unittest.TestCase):
                 json=lambda: {"error": "rate limited"}
             )
             with patch(
-                "app.services.material.requests.get", return_value=fake_response
+                "app.services.material.session_manager.get", return_value=fake_response
             ):
                 results = material.search_videos_coverr("x", minimum_duration=1)
             self.assertEqual(results, [])
@@ -1010,7 +1010,7 @@ class TestCoverrProvider(unittest.TestCase):
         # Subtest B: network exception bubbles up from requests.get
         with self.subTest("network exception"):
             with patch(
-                "app.services.material.requests.get",
+                "app.services.material.session_manager.get",
                 side_effect=requests.ConnectionError("boom"),
             ):
                 results = material.search_videos_coverr("x", minimum_duration=1)
@@ -1118,10 +1118,10 @@ class TestWaveSpeedProvider(unittest.TestCase):
 
         with (
             patch(
-                "app.services.material.requests.post", return_value=submit_response
+                "app.services.material.session_manager.post", return_value=submit_response
             ) as post,
             patch(
-                "app.services.material.requests.get", side_effect=poll_responses
+                "app.services.material.session_manager.get", side_effect=poll_responses
             ) as get,
             patch("app.services.material.time.sleep") as sleep,
         ):
@@ -1180,9 +1180,9 @@ class TestWaveSpeedProvider(unittest.TestCase):
 
         with (
             patch(
-                "app.services.material.requests.post", return_value=submit_response
+                "app.services.material.session_manager.post", return_value=submit_response
             ) as post,
-            patch("app.services.material.requests.get", return_value=poll_response),
+            patch("app.services.material.session_manager.get", return_value=poll_response),
         ):
             results = material.generate_videos_wavespeed(
                 "city timelapse",
@@ -1209,8 +1209,8 @@ class TestWaveSpeedProvider(unittest.TestCase):
         )
 
         with (
-            patch("app.services.material.requests.post", return_value=submit_response),
-            patch("app.services.material.requests.get", return_value=poll_response),
+            patch("app.services.material.session_manager.post", return_value=submit_response),
+            patch("app.services.material.session_manager.get", return_value=poll_response),
         ):
             results = material.generate_videos_wavespeed("sunrise", minimum_duration=5)
 
@@ -1221,8 +1221,8 @@ class TestWaveSpeedProvider(unittest.TestCase):
         submit_response = self._json_response({"code": 401, "message": "invalid api key"})
 
         with (
-            patch("app.services.material.requests.post", return_value=submit_response),
-            patch("app.services.material.requests.get") as get,
+            patch("app.services.material.session_manager.post", return_value=submit_response),
+            patch("app.services.material.session_manager.get") as get,
         ):
             results = material.generate_videos_wavespeed("sunrise", minimum_duration=5)
 
@@ -1235,7 +1235,7 @@ class TestWaveSpeedProvider(unittest.TestCase):
         因此提交绝不自动重试,并按"状态不明"上抛,让上层停止继续下单。
         """
         with patch(
-            "app.services.material.requests.post",
+            "app.services.material.session_manager.post",
             side_effect=requests.exceptions.ConnectionError("boom"),
         ) as post:
             with self.assertRaises(material.WaveSpeedUnconfirmedTaskError):
@@ -1249,7 +1249,7 @@ class TestWaveSpeedProvider(unittest.TestCase):
             status_code=502, json=lambda: {"code": 502, "message": "bad gateway"}
         )
 
-        with patch("app.services.material.requests.post", return_value=submit_response):
+        with patch("app.services.material.session_manager.post", return_value=submit_response):
             with self.assertRaises(material.WaveSpeedUnconfirmedTaskError):
                 material.generate_videos_wavespeed("sunrise", minimum_duration=5)
 
@@ -1273,10 +1273,10 @@ class TestWaveSpeedProvider(unittest.TestCase):
 
         with (
             patch(
-                "app.services.material.requests.post", return_value=submit_response
+                "app.services.material.session_manager.post", return_value=submit_response
             ) as post,
             patch(
-                "app.services.material.requests.get",
+                "app.services.material.session_manager.get",
                 side_effect=[
                     rate_limited,
                     requests.exceptions.ConnectionError("boom"),
@@ -1304,9 +1304,9 @@ class TestWaveSpeedProvider(unittest.TestCase):
         submit_response = self._json_response({"code": 200, "data": {"id": "pred-r2"}})
 
         with (
-            patch("app.services.material.requests.post", return_value=submit_response),
+            patch("app.services.material.session_manager.post", return_value=submit_response),
             patch(
-                "app.services.material.requests.get",
+                "app.services.material.session_manager.get",
                 side_effect=requests.exceptions.ConnectionError("boom"),
             ) as get,
             patch("app.services.material.time.sleep"),
@@ -1326,8 +1326,8 @@ class TestWaveSpeedProvider(unittest.TestCase):
         clock = iter([0.0, 0.0, material.WAVESPEED_RUN_TIMEOUT_SECONDS + 1])
 
         with (
-            patch("app.services.material.requests.post", return_value=submit_response),
-            patch("app.services.material.requests.get", return_value=processing),
+            patch("app.services.material.session_manager.post", return_value=submit_response),
+            patch("app.services.material.session_manager.get", return_value=processing),
             patch(
                 "app.services.material.time.monotonic", side_effect=lambda: next(clock)
             ),
@@ -1473,9 +1473,9 @@ class TestWaveSpeedProvider(unittest.TestCase):
 
         with (
             patch(
-                "app.services.material.requests.post", return_value=submit_response
+                "app.services.material.session_manager.post", return_value=submit_response
             ) as post,
-            patch("app.services.material.requests.get", return_value=poll_response),
+            patch("app.services.material.session_manager.get", return_value=poll_response),
         ):
             results = material.generate_videos_wavespeed("sunrise", minimum_duration=3)
 
@@ -1499,9 +1499,9 @@ class TestWaveSpeedProvider(unittest.TestCase):
 
         with (
             patch(
-                "app.services.material.requests.post", return_value=submit_response
+                "app.services.material.session_manager.post", return_value=submit_response
             ) as post,
-            patch("app.services.material.requests.get", return_value=poll_response),
+            patch("app.services.material.session_manager.get", return_value=poll_response),
         ):
             results = material.generate_videos_wavespeed("sunrise", minimum_duration=20)
 
@@ -1526,9 +1526,9 @@ class TestWaveSpeedProvider(unittest.TestCase):
 
         with (
             patch(
-                "app.services.material.requests.post", return_value=submit_response
+                "app.services.material.session_manager.post", return_value=submit_response
             ) as post,
-            patch("app.services.material.requests.get", return_value=poll_response),
+            patch("app.services.material.session_manager.get", return_value=poll_response),
         ):
             material.generate_videos_wavespeed("sunrise", minimum_duration=3)
 

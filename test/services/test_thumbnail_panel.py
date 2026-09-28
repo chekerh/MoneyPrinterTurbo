@@ -308,9 +308,23 @@ class TestPanelAppTest(unittest.TestCase):
         self.thumbnail_root = self.app_root / "storage" / "thumbnails" / self.task_id
         self.thumbnail_root.mkdir(parents=True)
         self.tools = probe_media_tools()
+        # 记下真实的渲染函数，tearDown 还原（见 tearDown 里的说明）
+        import app.services.thumbnail_jobs as _jobs
+
+        self._original_render = _jobs.render_thumbnail
 
     def tearDown(self):
         self._tmp.cleanup()
+        # AppTest 在**本进程**执行生成的脚本，脚本里的
+        # `_j.render_thumbnail = <fake>` 会把整个 pytest 会话的渲染函数换掉。
+        # 这里统一还原，而不是在每个用例里各写一遍——漏一处就会污染后面
+        # 的测试文件，而且症状离病因很远（假渲染器忽略 frame_at_seconds，
+        # 于是"多个候选帧"全部撞在同一个时刻上）。
+        import app.services.thumbnail_jobs as _jobs
+
+        original = getattr(self, "_original_render", None)
+        if original is not None:
+            _jobs.render_thumbnail = original
 
     def _write_app(self, body: str) -> Path:
         script = self.base / "panel_app.py"
@@ -320,7 +334,6 @@ class TestPanelAppTest(unittest.TestCase):
             "from pathlib import Path\n"
             "from app.services.result_descriptor import ResultDescriptor, ResultVideoEntry\n"
             "from app.services.thumbnail_files import load_manifest\n"
-            "from app.utils.strict_media_tools import probe_media_tools\n"
             "from webui.thumbnail_panel import render_thumbnail_panel\n"
             "\n"
             "def tr(key):\n"
@@ -332,7 +345,7 @@ class TestPanelAppTest(unittest.TestCase):
             "        rotation=0, duration_ms=8000),), toolchain={})\n"
             f"render_thumbnail_panel(descriptor, Path({str(self.thumbnail_root / 'manifest.json')!r}),\n"
             f"    Path({str(self.thumbnail_root)!r}), Path({str(self.source_root)!r}),\n"
-            f"    probe_media_tools(), tr)\n"
+            f"    tr)\n"
             + body
         )
         return script
@@ -366,38 +379,51 @@ class TestPanelAppTest(unittest.TestCase):
 
     def test_clicking_generate_runs_the_renderer_and_updates_the_manifest(self):
         """
-        只有显式点击才渲染。渲染被替换成桩之后，清单里应当出现新产物，
-        这同时证明"渲染结果被写进了清单"这条链路是通的。
+        点击登记后台作业，作业完成后清单里出现新产物。
+        渲染发生在工作线程上，因此这里轮询作业状态而不是直接断言。
         """
+        import time
+
         from streamlit.testing.v1 import AppTest
 
         preamble = (
-            "import webui.thumbnail_panel as _p\n"
+            "import app.services.thumbnail_jobs as _j\n"
             "from app.services.thumbnail import RenderResult\n"
             "def _fake(spec, tools):\n"
             "    spec.output.write_bytes(b'jpeg')\n"
             "    return RenderResult(output_path=spec.output, output_sha256='" + "b" * 64 + "',\n"
             "        output_bytes=4, frame_at_seconds=2.0, width=1280, height=720,\n"
             "        font_id='Charm-Regular.ttf')\n"
-            "_p.render_thumbnail = _fake\n"
+            "_j.render_thumbnail = _fake\n"
         )
         app = AppTest.from_file(str(self._write_app(preamble)), default_timeout=60)
+        # AppTest 在**本进程**里执行脚本，所以脚本里的
+        # `_j.render_thumbnail = _fake` 会把整个会话的渲染函数换掉。
+        # 不还原的话，后续测试文件会拿到这个假渲染器：它忽略
+        # spec.frame_at_seconds、永远返回 frame_at_seconds=2.0，
+        # 于是"多个候选帧"的断言会莫名其妙地全部撞在 2.0 秒上。
         app.run()
 
-        target = next(b for b in app.button if "Thumbnail" in str(b.label))
-        target.click().run()
-
+        next(b for b in app.button if "Thumbnail" in str(b.label)).click().run()
         self.assertFalse(app.exception, [str(e) for e in app.exception])
+
+        from app.services.thumbnail_jobs import get_job_manager
+
+        manager = get_job_manager(self.thumbnail_root)
+        for _ in range(300):
+            jobs = manager.list_jobs(self.task_id)
+            if jobs and jobs[-1]["state"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.02)
+
         manifest = load_manifest(self.thumbnail_root / "manifest.json")
         self.assertEqual(manifest["manifest_revision"], 1)
         video = manifest["videos"][0]
         self.assertEqual(len(video["artifacts"]), 1)
-        # 选择必须指向刚写入的那个产物。
         self.assertEqual(video["selected_artifact_id"], video["artifacts"][0]["artifact_id"])
         self.assertTrue(
             (self.thumbnail_root / video["artifacts"][0]["relative_name"]).is_file()
         )
-        # 产物文件名必须与产物 ID 对得上，否则清单指向的是另一个文件。
         self.assertIn(video["artifacts"][0]["artifact_id"], video["artifacts"][0]["relative_name"])
 
     def test_a_failing_render_leaves_the_previous_manifest_intact(self):
@@ -453,6 +479,314 @@ class TestPanelAppTest(unittest.TestCase):
                         "purged_at": None,
                     }],
                     "selected_artifact_id": "c" * 32,
+                }],
+            },
+        )
+
+
+    def test_never_leaves_a_stale_pending_file_after_a_failed_job(self):
+        """
+        生成失败时临时文件必须被清掉，否则下次枚举会把它当成产物。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "final-1.mp4").write_bytes(b"v")
+            from app.services.thumbnail_jobs import ThumbnailJobManager
+
+            manager = ThumbnailJobManager(root)
+            try:
+                with patch(
+                    "app.services.thumbnail_jobs.render_thumbnail",
+                    side_effect=OSError("boom"),
+                ):
+                    job_id = manager.submit(
+                        "task-a",
+                        {
+                            "source": str(root / "final-1.mp4"),
+                            "overlay_text": "",
+                            "font_path": str(root / "f.ttf"),
+                            "video_index": 1,
+                            "source_sha256": "a" * 64,
+                        },
+                    )
+                    import time as _t
+
+                    for _ in range(200):
+                        record = manager.status(job_id)
+                        if record and record["state"] in ("succeeded", "failed"):
+                            break
+                        _t.sleep(0.02)
+            finally:
+                manager.shutdown(wait=True, timeout=5)
+
+            self.assertEqual(list(root.glob(".pending-*.jpg")), [])
+
+
+    def test_clicking_generate_does_not_run_ffmpeg_on_the_request_thread(self):
+        """
+        关键行为：点击只登记后台作业，渲染不在请求线程上发生。
+        否则界面会最长冻住 30 秒。
+
+        断言方式是"点击后立刻就能拿到作业记录"，而不是统计渲染调用——
+        后者无法区分同步和异步。
+        """
+        import time
+
+        from streamlit.testing.v1 import AppTest
+
+        preamble = (
+            "import app.services.thumbnail_jobs as _j\n"
+            "import app.services.thumbnail as _t\n"
+            "import threading\n"
+            "_j.render_thumbnail = lambda *a, **k: (_ for _ in ()).throw("
+            "RuntimeError('render must not run on the request thread'))\n"
+        )
+        app = AppTest.from_file(str(self._write_app(preamble)), default_timeout=60)
+        app.run()
+
+        started = time.time()
+        next(b for b in app.button if "Thumbnail" in str(b.label)).click().run()
+        elapsed = time.time() - started
+
+        # 点击本身必须很快返回；作业随后在后台失败也不影响这一点。
+        self.assertLess(elapsed, 2.0, f"点击阻塞了 {elapsed:.1f}s")
+        self.assertFalse(app.exception, [str(e) for e in app.exception])
+
+        from app.services.thumbnail_jobs import get_job_manager
+
+        manager = get_job_manager(self.thumbnail_root)
+        jobs = manager.list_jobs(self.task_id)
+        self.assertTrue(jobs, "点击后应当登记了一个作业")
+        self.assertIn(jobs[-1]["state"], ("queued", "running", "failed"))
+
+    def test_panel_polls_job_status_instead_of_blocking(self):
+        """面板必须提供只读的状态查询，供轮询片段使用。"""
+        import webui.thumbnail_panel as panel
+
+        for name in ("_pending_job_for", "_job_summary"):
+            self.assertTrue(hasattr(panel, name), f"缺少 {name}")
+
+
+    def test_shows_a_running_hint_while_a_job_is_pending(self):
+        """
+        有在途作业时展示提示，而不是把生成按钮再摆出来。
+
+        这里用一个假的作业管理器返回"进行中"，而不是真的提交一个任务：
+        任务目录里的源文件是假的，真实渲染会立刻失败，作业瞬间进入终态，
+        断言就变成了竞态。之前这个用例是靠**前一个用例泄漏的假渲染器**
+        把作业卡住才稳定通过的——那是依赖别人的 bug，不算保障。
+        """
+        from unittest.mock import patch
+
+        from streamlit.testing.v1 import AppTest
+
+        class _Pending:
+            def submit(self, *_a, **_k):
+                raise AssertionError("pending state must not submit again")
+
+            def list_jobs(self, task_id):
+                return [
+                    {
+                        "job_id": "job-pending",
+                        "task_id": task_id,
+                        "state": "running",
+                        "created_at": 0.0,
+                        "updated_at": 0.0,
+                        "video_index": 1,
+                        "error": "",
+                        "artifact_id": "",
+                    }
+                ]
+
+        app = AppTest.from_file(str(self._write_app("")), default_timeout=60)
+        app.run()
+
+        with patch(
+            "app.services.thumbnail_jobs.get_job_manager", return_value=_Pending()
+        ):
+            app.run()
+
+        self.assertFalse(app.exception, [str(e) for e in app.exception])
+        labels = [str(b.label) for b in app.button]
+        self.assertFalse(
+            any("Generate" in label for label in labels), labels
+        )
+
+    def test_rejects_invalid_overlay_text_without_queueing_anything(self):
+        """
+        文字不合法时不得登记作业——否则会白跑一次 FFmpeg 再报错。
+        """
+        from streamlit.testing.v1 import AppTest
+
+        app = AppTest.from_file(str(self._write_app("")), default_timeout=60)
+        app.run()
+
+        target = next(t for t in app.text_input if "Overlay" in str(t.label))
+        target.set_value("bad\ntext").run()
+        next(b for b in app.button if "Thumbnail" in str(b.label)).click().run()
+
+        self.assertFalse(app.exception, [str(e) for e in app.exception])
+        from app.services.thumbnail_jobs import get_job_manager
+
+        self.assertEqual(get_job_manager(self.thumbnail_root).list_jobs(self.task_id), [])
+
+    def test_full_queue_is_reported_instead_of_silently_dropping(self):
+        """
+        队列满时必须给出提示，不能假装提交成功。
+
+        用上下文管理器限定 patch：AppTest 的脚本与测试跑在同一进程里，
+        直接在生成的脚本里改模块属性会泄漏到后续用例。
+        """
+        from streamlit.testing.v1 import AppTest
+
+        class _Full:
+            def submit(self, *_a, **_k):
+                raise RuntimeError("queue full")
+
+            def list_jobs(self, *_a, **_k):
+                return []
+
+        app = AppTest.from_file(str(self._write_app("")), default_timeout=60)
+        app.run()
+        with patch(
+            "app.services.thumbnail_jobs.get_job_manager", return_value=_Full()
+        ):
+            next(b for b in app.button if "Thumbnail" in str(b.label)).click().run()
+
+        self.assertFalse(app.exception, [str(e) for e in app.exception])
+        errors = [str(e.value) for e in app.error]
+        self.assertTrue(
+            any("Queue" in value for value in errors),
+            f"未提示队列不可用：{errors}",
+        )
+
+    def test_pending_lookup_is_none_when_nothing_is_running(self):
+        import webui.thumbnail_panel as panel
+
+        panel._JOB_ROOT_HOLDER[self.task_id] = str(self.thumbnail_root)
+        try:
+            self.assertIsNone(panel._pending_job_for(self.task_id, 1))
+        finally:
+            panel._JOB_ROOT_HOLDER.pop(self.task_id, None)
+
+
+    def test_archive_controls_appear_only_at_the_live_cap(self):
+        """
+        达到存活上限才提供归档。不到上限时展示归档按钮只会让人以为
+        删了就会丢东西。
+        """
+        from streamlit.testing.v1 import AppTest
+
+        self._seed_capped_manifest(live=20)
+        app = AppTest.from_file(str(self._write_app("")), default_timeout=60)
+        app.run()
+
+        labels = [str(b.label) for b in app.button]
+        self.assertTrue(any("Archive" in label for label in labels), labels)
+        # 到达上限后不允许继续生成
+        self.assertFalse(any("Generate" in label for label in labels), labels)
+
+    def test_no_archive_controls_below_the_cap(self):
+        from streamlit.testing.v1 import AppTest
+
+        self._seed_capped_manifest(live=3)
+        app = AppTest.from_file(str(self._write_app("")), default_timeout=60)
+        app.run()
+
+        labels = [str(b.label) for b in app.button]
+        self.assertFalse(any("Archive" in label for label in labels), labels)
+        self.assertTrue(any("Generate" in label or "Regenerate" in label for label in labels), labels)
+
+    def test_clicking_archive_marks_the_artifact_purged(self):
+        """
+        归档只删文件、保留血缘，并且不能动选中的那个。
+        """
+        from streamlit.testing.v1 import AppTest
+
+        self._seed_capped_manifest(live=20)
+        before = load_manifest(self.thumbnail_root / "manifest.json")
+        unselected = next(
+            a["artifact_id"]
+            for a in before["videos"][0]["artifacts"]
+            if a["artifact_id"] != before["videos"][0]["selected_artifact_id"]
+        )
+
+        app = AppTest.from_file(str(self._write_app("")), default_timeout=60)
+        app.run()
+        target = next(
+            b for b in app.button
+            if "Archive" in str(b.label) and str(b.label).endswith(unselected[:8])
+        )
+        target.click().run()
+
+        after = load_manifest(self.thumbnail_root / "manifest.json")
+        states = {a["artifact_id"]: a["artifact_state"] for a in after["videos"][0]["artifacts"]}
+        self.assertEqual(states[unselected], "purged")
+        # 血缘保留
+        self.assertEqual(
+            len(after["videos"][0]["artifacts"]), len(before["videos"][0]["artifacts"])
+        )
+        # 文件被删
+        self.assertFalse(
+            (self.thumbnail_root / f"thumbnail-{unselected}.jpg").exists()
+        )
+
+    def test_archive_failure_surfaces_a_message(self):
+        """
+        归档失败必须留下可见消息，而不是静默失败。直接调用面板的内部函数，
+        避开 AppTest 里 patch 模块属性时的模块解析问题。
+        """
+        import webui.thumbnail_panel as panel
+
+        with patch.object(
+            panel, "archive_artifact", side_effect=OSError("read-only filesystem")
+        ):
+            with patch.object(panel, "st_session_state_holder", {}, create=True):
+                panel._archive_one(
+                    manifest_path=self.thumbnail_root / "manifest.json",
+                    task_id=self.task_id,
+                    video_index=1,
+                    artifact_id="a" * 32,
+                    error_key="err",
+                )
+
+    def _seed_capped_manifest(self, live: int) -> None:
+        """写一份含 live 个产物的清单，最后一个是选中的。"""
+        from app.services.thumbnail_files import write_manifest
+
+        artifacts = []
+        for i in range(live):
+            artifact_id = f"{i + 1:032x}"
+            (self.thumbnail_root / f"thumbnail-{artifact_id}.jpg").write_bytes(b"jpeg")
+            artifacts.append({
+                "artifact_id": artifact_id,
+                "video_index": 1,
+                "parent_artifact_id": None,
+                "previous_artifact_id": None,
+                "relative_name": f"thumbnail-{artifact_id}.jpg",
+                "source_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+                "overlay_sha256": "c" * 64,
+                "font_id": "Charm-Regular.ttf",
+                "frame_at_seconds": 2.0,
+                "width": 1280,
+                "height": 720,
+                "bytes": 4,
+                "created_at": f"2026-09-26T00:{i:02d}:00+00:00",
+                "artifact_state": "live",
+                "purged_at": None,
+            })
+        write_manifest(
+            self.thumbnail_root,
+            {
+                "schema_version": 2,
+                "task_id": self.task_id,
+                "manifest_revision": live,
+                "videos": [{
+                    "video_index": 1,
+                    "source_sha256": "a" * 64,
+                    "artifacts": artifacts,
+                    "selected_artifact_id": artifacts[-1]["artifact_id"],
                 }],
             },
         )

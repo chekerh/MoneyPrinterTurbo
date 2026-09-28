@@ -67,7 +67,7 @@
     "Delete Task": "Excluir tarefa",
     "Task Deleted": "Tarefa excluída",
     "Task Delete Failed": "Falha ao excluir a tarefa",
-    "Open Task Folder": "Abrir pasta",
+    "Open Task Folder": "Abrir ficheiros da tarefa",
     "Generating Video Script and Keywords": "A IA está gerando o roteiro do vídeo e as palavras-chave...",
     "Generating Video Keywords": "A IA está gerando as palavras-chave do vídeo...",
     "Video Keywords": "Palavras-chave do vídeo (inglês, opcional)",
@@ -390,6 +390,23 @@
     "Thumbnail Overlay Invalid": "O texto sobreposto contém caracteres não permitidos.",
     "Thumbnail Generate Failed": "Não foi possível gerar a miniatura. A anterior permanece inalterada.",
     "Thumbnail Record Failed": "Não foi possível atualizar o registro de miniaturas. A anterior permanece inalterada.",
-    "Thumbnail Archive Failed": "Não foi possível arquivar essa miniatura."
+    "Thumbnail Archive Failed": "Não foi possível arquivar essa miniatura.",
+    "Thumbnail Queued": "Na fila para gerar.",
+    "Thumbnail Generating": "Gerando miniatura…",
+    "Thumbnail Queue Unavailable": "Não é possível colocar a geração na fila. Tente novamente.",
+    "Open Archive Folder": "Abrir pasta de arquivo",
+    "Task Not Archived Yet": "Esta tarefa ainda não foi arquivada",
+    "Video File Missing": "Ficheiro de vídeo em falta: {name}",
+    "Video File Unreadable": "O ficheiro de vídeo está vazio ou danificado: {name}",
+    "Thumbnail unavailable": "Miniatura indisponível",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "Defina portfolio_root na seção [app] do config.toml para ativar miniaturas e planejamento de portfólio.",
+    "Niche": "Nicho",
+    "No Niche": "Sem nicho",
+    "Niche Preview": "{name}: {line} (cerca de {words} palavras)",
+    "Choose Thumbnail": "Escolher miniatura",
+    "Thumbnail Candidate {index}": "Candidato {index}",
+    "Thumbnail Select Failed": "Não foi possível trocar a miniatura",
+    "Highlight Spoken Words": "Destacar a palavra falada",
+    "Highlight Spoken Words Help": "Legendas palavra a palavra: a palavra falada é destacada. Precisa de marcações por palavra do reconhecimento de voz; sem elas volta a legendas de linha inteira."
   }
 }

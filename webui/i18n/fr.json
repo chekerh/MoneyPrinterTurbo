@@ -67,7 +67,7 @@
     "Delete Task": "Supprimer la tâche",
     "Task Deleted": "Tâche supprimée",
     "Task Delete Failed": "Échec de la suppression de la tâche",
-    "Open Task Folder": "Ouvrir le dossier",
+    "Open Task Folder": "Ouvrir les fichiers de la tâche",
     "Generating Video Script and Keywords": "L'IA génère le script et les mots-clés...",
     "Generating Video Keywords": "L'IA génère les mots-clés vidéo...",
     "Video Keywords": "Mots-clés vidéo (Anglais, Optionnel)",
@@ -390,6 +390,23 @@
     "Thumbnail Overlay Invalid": "Le texte en surimpression contient des caractères non autorisés.",
     "Thumbnail Generate Failed": "Impossible de générer la miniature. La précédente reste inchangée.",
     "Thumbnail Record Failed": "Impossible de mettre à jour l'enregistrement des miniatures. La précédente reste inchangée.",
-    "Thumbnail Archive Failed": "Impossible d'archiver cette miniature."
+    "Thumbnail Archive Failed": "Impossible d'archiver cette miniature.",
+    "Thumbnail Queued": "En attente de génération.",
+    "Thumbnail Generating": "Génération de la miniature…",
+    "Thumbnail Queue Unavailable": "Impossible de mettre la génération en file. Réessayez.",
+    "Open Archive Folder": "Ouvrir le dossier d’archive",
+    "Task Not Archived Yet": "Cette tâche n’a pas encore été archivée",
+    "Video File Missing": "Fichier vidéo introuvable : {name}",
+    "Video File Unreadable": "Le fichier vidéo est vide ou endommagé : {name}",
+    "Thumbnail unavailable": "Miniature indisponible",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "Définissez portfolio_root dans la section [app] de config.toml pour activer les miniatures et la planification du portfolio.",
+    "Niche": "Niche",
+    "No Niche": "Sans niche",
+    "Niche Preview": "{name} : {line} (environ {words} mots)",
+    "Choose Thumbnail": "Choisir la miniature",
+    "Thumbnail Candidate {index}": "Candidat {index}",
+    "Thumbnail Select Failed": "Impossible de changer la miniature",
+    "Highlight Spoken Words": "Mettre en évidence le mot prononcé",
+    "Highlight Spoken Words Help": "Sous-titres mot à mot : le mot prononcé est mis en évidence. Nécessite les minutages par mots de la reconnaissance vocale ; sinon retour aux sous-titres de ligne entière."
   }
 }

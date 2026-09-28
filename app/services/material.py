@@ -14,6 +14,7 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
 from app.services import material_cache, task_artifacts, volcengine_seedance
+from app.services.http_session import session_manager
 from app.utils import utils
 
 # Thread-safe counter for API key rotation
@@ -312,12 +313,13 @@ def search_videos_pexels(
     logger.info(f"searching videos on pexels: term={search_term!r}")
 
     try:
-        r = requests.get(
+        r = session_manager.get(
             query_url,
             headers=headers,
             proxies=config.proxy,
             verify=_get_tls_verify(),
             timeout=(30, 60),
+            base_url="https://api.pexels.com",
         )
         response = r.json()
         video_items = []
@@ -399,8 +401,12 @@ def search_videos_pixabay(
     )
 
     try:
-        r = requests.get(
-            query_url, proxies=config.proxy, verify=_get_tls_verify(), timeout=(30, 60)
+        r = session_manager.get(
+            query_url,
+            proxies=config.proxy,
+            verify=_get_tls_verify(),
+            timeout=(30, 60),
+            base_url="https://pixabay.com",
         )
         status_code = int(getattr(r, "status_code", 200))
         headers = getattr(r, "headers", {}) or {}
@@ -543,12 +549,13 @@ def search_videos_coverr(
     logger.info(f"searching videos on coverr: term={search_term!r}")
 
     try:
-        r = requests.get(
+        r = session_manager.get(
             query_url,
             headers=headers,
             proxies=config.proxy,
             verify=_get_tls_verify(),
             timeout=(30, 60),
+            base_url="https://api.coverr.co",
         )
         response = r.json()
         video_items: List[MaterialInfo] = []
@@ -744,13 +751,14 @@ def generate_videos_wavespeed(
     # 提交 POST 绝不自动重试：请求可能已经在远端创建了付费任务，重发会造成
     # 重复生成和重复扣费（与官方 SDK 的 submission 策略一致）。
     try:
-        submit_response = requests.post(
+        submit_response = session_manager.post(
             f"{WAVESPEED_API_BASE_URL}/{model_id}",
             json=payload,
             headers=headers,
             proxies=config.proxy,
             verify=_get_tls_verify(),
             timeout=(30, 60),
+            base_url=WAVESPEED_API_BASE_URL,
         )
     except Exception as e:
         # 没有收到响应并不代表任务没有创建。此时状态不明，必须终止整个生成
@@ -868,12 +876,13 @@ def _wait_for_wavespeed_prediction(
     consecutive_failures = 0
     while True:
         try:
-            response = requests.get(
+            response = session_manager.get(
                 f"{WAVESPEED_API_BASE_URL}/predictions/{prediction_id}/result",
                 headers=headers,
                 proxies=config.proxy,
                 verify=_get_tls_verify(),
                 timeout=(30, 60),
+                base_url=WAVESPEED_API_BASE_URL,
             )
             status_code = _wavespeed_status_code(response)
             if status_code in WAVESPEED_RETRYABLE_STATUS_CODES:
@@ -1013,7 +1022,7 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     # if video does not exist, download it
     with open(video_path, "wb") as f:
         f.write(
-            requests.get(
+            session_manager.get(
                 video_url,
                 headers=headers,
                 proxies=config.proxy,

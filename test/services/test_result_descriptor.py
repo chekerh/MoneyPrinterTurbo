@@ -70,7 +70,11 @@ class _LayoutFixture(unittest.TestCase):
         self._tmp.cleanup()
 
     def _task_dir(self, task_id: str) -> Path:
-        path = self.tasks / task_id
+        """
+        成片现在落在 ``outputs_root``（唯一长期留存的视频），不再在任务工作
+        目录里——后者位于内存盘，任务结束就没了。描述符跟着成片走。
+        """
+        path = self.portfolio / "outputs" / task_id
         path.mkdir(parents=True, exist_ok=True)
         return path
 

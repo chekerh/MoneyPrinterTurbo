@@ -342,6 +342,86 @@ class TestCli(unittest.TestCase):
         self.assertEqual(params.bgm_type, "sonilo")
         self.assertEqual(params.sonilo_bgm_prompt, "warm acoustic")
 
+    def test_zoom_transitions_map_to_video_params(self):
+        for cli_value, expected in (("zoom-in", "ZoomIn"), ("zoom-out", "ZoomOut")):
+            args = cli.parse_args(
+                ["--video-subject", "test", "--video-transition-mode", cli_value]
+            )
+            params = cli.build_video_params(args)
+            self.assertEqual(params.video_transition_mode, expected)
+
+    def test_video_clip_speed_maps_to_video_params(self):
+        args = cli.parse_args(
+            ["--video-subject", "test", "--video-clip-speed", "1.5"]
+        )
+        params = cli.build_video_params(args)
+        self.assertEqual(params.video_clip_speed, 1.5)
+
+    def test_video_clip_speed_rejects_out_of_range(self):
+        for bad in ("0.0", "0.49", "2.01", "5"):
+            with self.assertRaises(SystemExit) as cm:
+                cli.parse_args(
+                    ["--video-subject", "test", "--video-clip-speed", bad]
+                )
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_video_music_prompt_implies_elevenlabs_bgm_mode(self):
+        args = cli.parse_args(
+            ["--video-subject", "test", "--video-music-prompt", "synthwave underscore"]
+        )
+        self.assertEqual(args.bgm_type, "elevenlabs")
+        params = cli.build_video_params(args)
+        self.assertEqual(params.bgm_type, "elevenlabs")
+        self.assertEqual(params.video_music_prompt, "synthwave underscore")
+
+    def test_video_music_prompt_rejects_non_music_bgm_type(self):
+        with self.assertRaises(SystemExit) as cm:
+            cli.parse_args(
+                [
+                    "--video-subject",
+                    "test",
+                    "--bgm-type",
+                    "random",
+                    "--video-music-prompt",
+                    "upbeat",
+                ]
+            )
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_video_music_prompt_allows_sonilo_bgm_type(self):
+        args = cli.parse_args(
+            [
+                "--video-subject",
+                "test",
+                "--bgm-type",
+                "sonilo",
+                "--video-music-prompt",
+                "lofi",
+            ]
+        )
+        params = cli.build_video_params(args)
+        self.assertEqual(params.bgm_type, "sonilo")
+        self.assertEqual(params.video_music_prompt, "lofi")
+
+    def test_video_music_prompt_rejects_oversized_input(self):
+        with self.assertRaises(SystemExit) as cm:
+            cli.parse_args(
+                [
+                    "--video-subject",
+                    "test",
+                    "--video-music-prompt",
+                    "x" * 2001,
+                ]
+            )
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_bgm_type_elevenlabs_is_accepted(self):
+        args = cli.parse_args(
+            ["--video-subject", "test", "--bgm-type", "elevenlabs"]
+        )
+        params = cli.build_video_params(args)
+        self.assertEqual(params.bgm_type, "elevenlabs")
+
     def test_local_material_filename_resolved_to_absolute_path(self):
         """After preprocess_video, material.url should be an absolute path, not a bare filename."""
         import os
@@ -1096,6 +1176,56 @@ class TestCli(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "line 2"):
                 cli._load_batch_manifest(str(manifest))
+
+    def test_batch_accepts_elevenlabs_bgm_type(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = Path(temp_dir) / "tasks.json"
+            manifest.write_text(
+                json.dumps(
+                    [
+                        {
+                            "video_subject": "elevenlabs task",
+                            "video_script": "elevenlabs script",
+                            "bgm_type": "elevenlabs",
+                            "video_music_prompt": "cinematic",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with patch(
+                "app.services.task.start",
+                return_value={"state": 1, "script": "elevenlabs script"},
+            ) as start, patch(
+                "app.utils.utils.get_uuid", return_value="task-elevenlabs-batch"
+            ):
+                code = cli.run_cli(
+                    ["--batch-file", str(manifest), "--stop-at", "script"]
+                )
+            self.assertEqual(code, 0)
+            start.assert_called()
+
+    def test_batch_rejects_music_prompt_with_random_bgm(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = Path(temp_dir) / "tasks.json"
+            manifest.write_text(
+                json.dumps(
+                    [
+                        {
+                            "video_subject": "conflicting task",
+                            "bgm_type": "random",
+                            "video_music_prompt": "upbeat",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with patch("app.services.task.start") as start:
+                code = cli.run_cli(
+                    ["--batch-file", str(manifest), "--stop-at", "script"]
+                )
+            self.assertEqual(code, 2)
+            start.assert_not_called()
 
     def test_manifest_relative_custom_audio_uses_manifest_directory(self):
         with (

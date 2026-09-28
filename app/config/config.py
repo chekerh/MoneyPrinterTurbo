@@ -473,6 +473,126 @@ def load_config():
     return _load_toml_config(config_file)
 
 
+def _current_payload():
+    """构造准备落盘的配置：内存里的标量，加上各 section 的当前值。"""
+    payload = dict(_cfg)
+    payload["app"] = dict(app)
+    payload["azure"] = dict(azure)
+    payload["siliconflow"] = dict(siliconflow)
+    payload["minimax_tts"] = dict(minimax_tts)
+    payload["elevenlabs"] = dict(elevenlabs)
+    payload["chatterbox"] = dict(chatterbox)
+    payload["fish_audio"] = dict(fish_audio)
+    payload["ui"] = dict(ui)
+    return payload
+
+
+def _remember_saved_payload(payload) -> None:
+    """记录刚落盘（或刚读入）的内容，作为下次保存的差异基线。"""
+    _last_known_payload.clear()
+    _last_known_payload.update(payload)
+
+
+def _resolve_key(
+    label,
+    disk_value,
+    in_disk,
+    memory_value,
+    in_memory,
+    baseline_value,
+    in_baseline,
+):
+    """
+    决定某个键最终写什么，返回 ``(是否保留, 值)``。
+
+    三方各有立场：我们（内存相对基线的差异）、对方（磁盘相对基线的差异）、
+    都没动。按下面的优先级裁决：
+
+    1. 只有我们改过 → 用内存值；
+    2. 我们和对方都改过 → 以内存为准。这是用户刚刚在界面上做的选择，
+       而磁盘上的改动很可能来自某个仍在运行的旧进程（正是要修的那个问题），
+       所以它更可能是陈旧值。但必须记日志，否则这次覆盖就是无声的；
+    3. 只有对方改过 → 用磁盘值，保留别人的手工修改；
+    4. 我们删掉而磁盘没变 → 保持删除（合并不能退化成只增不减）。
+    """
+    our_change = in_memory and (not in_baseline or memory_value != baseline_value)
+    their_change = in_disk and (not in_baseline or disk_value != baseline_value)
+
+    if our_change:
+        if their_change and in_baseline and memory_value != disk_value:
+            logger.warning(
+                f"config conflict on {label}: keeping the value set in this "
+                f"session ({memory_value!r}) and discarding the on-disk value "
+                f"({disk_value!r})"
+            )
+        return True, memory_value
+    if their_change:
+        return True, disk_value
+    if in_baseline and not in_memory:
+        return False, None
+    if in_memory:
+        return True, memory_value
+    if in_disk:
+        return True, disk_value
+    return False, None
+
+
+def _merge_with_disk(payload):
+    """
+    把内存相对基线的改动叠加到磁盘当前内容上，返回要写入的配置。
+
+    直接整份写入 ``_cfg`` 会丢掉两种东西：进程启动之后别人对文件的手工修改，
+    以及本进程根本不认识的键。真正属于"我们"的只有相对基线的那点差异，
+    只把它叠加上去即可，其余内容原样保留。
+    """
+    try:
+        with open(config_file, mode="r", encoding="utf-8") as handle:
+            on_disk = toml.load(handle)
+    except (OSError, UnicodeError, toml.TomlDecodeError):
+        # 读不出来就不要卡住服务：退回整份写入，让用户还能重新配置。
+        logger.warning(
+            "config file unreadable, falling back to a full in-memory write: "
+            f"path={config_file}"
+        )
+        return payload
+
+    if not isinstance(on_disk, dict):
+        return payload
+
+    merged = {}
+    for key in set(on_disk) | set(payload) | set(_last_known_payload):
+        disk_value = on_disk.get(key)
+        memory_value = payload.get(key)
+        baseline_value = _last_known_payload.get(key)
+
+        if not isinstance(baseline_value, dict) or not isinstance(memory_value, dict):
+            keep, value = _resolve_key(
+                key,
+                disk_value, key in on_disk,
+                memory_value, key in payload,
+                baseline_value, key in _last_known_payload,
+            )
+            if keep:
+                merged[key] = value
+            continue
+
+        section = dict(disk_value) if isinstance(disk_value, dict) else {}
+        for name in set(memory_value) | set(baseline_value) | set(section):
+            keep, value = _resolve_key(
+                f"[{key}].{name}",
+                section.get(name), name in section,
+                memory_value.get(name), name in memory_value,
+                baseline_value.get(name, _MISSING), name in baseline_value,
+            )
+            if keep:
+                section[name] = value
+            else:
+                section.pop(name, None)
+        merged[key] = section
+
+    return merged
+
+
 def save_config():
     """
     原子保存运行时配置。
@@ -490,15 +610,8 @@ def save_config():
     主要用于避免多标签页或快速 rerun 时损坏配置文件。
     """
     with _config_save_lock:
-        config_to_save = dict(_cfg)
-        config_to_save["app"] = dict(app)
-        config_to_save["azure"] = dict(azure)
-        config_to_save["siliconflow"] = dict(siliconflow)
-        config_to_save["minimax_tts"] = dict(minimax_tts)
-        config_to_save["elevenlabs"] = dict(elevenlabs)
-        config_to_save["chatterbox"] = dict(chatterbox)
-        config_to_save["fish_audio"] = dict(fish_audio)
-        config_to_save["ui"] = dict(ui)
+        payload = _current_payload()
+        config_to_save = _merge_with_disk(payload)
         serialized_config = toml.dumps(config_to_save)
 
         # WebUI 完整 rerun 结束时会调用保存。内容没有变化时直接返回，避免每次
@@ -539,12 +652,20 @@ def save_config():
                     os.fsync(f.fileno())
             _cfg.clear()
             _cfg.update(config_to_save)
+            # 磁盘上的内容（含别人的修改）成为新基线，
+            # 否则下一轮保存会把它当成"我们没动过"而再次丢弃。
+            _remember_saved_payload(config_to_save)
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
 
+_MISSING = object()
 
+# 上一次读入或落盘的内容。保存时只把相对它的差异写回磁盘，
+# 这样进程启动之后别人对 config.toml 的修改不会被陈旧快照覆盖。
+_last_known_payload: dict = {}
 _cfg = load_config()
+_remember_saved_payload(_cfg)
 app = _SynchronizedConfig(_cfg.get("app", {}))
 whisper = _cfg.get("whisper", {})
 proxy = _cfg.get("proxy", {})
@@ -566,7 +687,9 @@ ui = _SynchronizedConfig(
 hostname = socket.gethostname()
 
 log_level = _cfg.get("log_level", "DEBUG")
-listen_host = _cfg.get("listen_host", "0.0.0.0")
+listen_host = _cfg.get("listen_host", "127.0.0.1")
+# 非回环绑定必须显式开启：api_key 默认为空，放开监听等于无鉴权暴露。
+allow_non_loopback_bind = _cfg.get("allow_non_loopback_bind", False)
 listen_port = _cfg.get("listen_port", 8080)
 project_name = _cfg.get("project_name", "MoneyPrinterTurbo")
 project_description = _cfg.get(

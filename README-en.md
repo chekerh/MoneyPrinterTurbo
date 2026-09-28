@@ -134,13 +134,16 @@ Thanks to [Kimi](https://platform.kimi.ai?track_id=track-f6b0a640d35c41deb03b247
 - [x] Supports **batch video generation**, allowing the creation of multiple videos at once, then selecting the most
       satisfactory one
 - [x] Supports setting the **duration of video clips**, facilitating adjustments to material switching frequency
+- [x] Supports **clip playback speed** (0.5x–2.0x) and **camera transitions** (fade in/out, slide in/out, zoom in/out, shuffle)
 - [x] Supports **multilingual video script** generation
-- [x] Supports **Edge TTS**, **Azure Speech**, **SiliconFlow**, **Google Gemini**, **Xiaomi MiMo**, **ElevenLabs**, **Chatterbox**, and **Fish Audio** speech synthesis with real-time previews
+- [x] Supports **Edge TTS**, **Azure Speech**, **SiliconFlow**, **Google Gemini**, **Xiaomi MiMo**, **MiniMax TTS**, **ElevenLabs**, **Chatterbox**, and **Fish Audio** speech synthesis with real-time previews
 - [x] Supports **subtitle generation** with configurable fonts, position, color, size, outline, and background styles
 - [x] Supports random or custom **background music** with adjustable volume
+- [x] Supports **AI-generated background music**: **Sonilo** and **ElevenLabs Music** compose a custom score from a text description
 - [x] Supports your own **local assets** and free-to-use HD footage from **Pexels**, **Pixabay**, and **Coverr**
-- [x] Supports **AI-generated footage**: [WaveSpeed AI](https://wavespeed.ai) text-to-video models (Seedance by default) create brand-new visuals from your script keywords instead of relying on stock libraries
+- [x] Supports **AI-generated footage**: [WaveSpeed AI](https://wavespeed.ai) text-to-video models (Seedance by default) and **LoomLoom** create brand-new visuals from your script keywords instead of relying on stock libraries
 - [x] Supports native **Volcano Engine Ark Seedance** text-to-video generation with configurable model/Endpoint ID, bounded polling, and paid-task confirmation
+- [x] Supports **TwelveLabs** semantic video-material reranking so footage better matches the script
 - [x] Supports leading model providers including **Kimi / Moonshot AI**, **OpenAI**, **Anthropic Claude**, **Google Gemini**, **DeepSeek**, **Alibaba Cloud Qwen**, **Microsoft Azure OpenAI**, **ByteDance VolcEngine Ark**, **xAI Grok**, **MiniMax**, and **Xiaomi MiMo**, plus unified gateways, aggregators, and local runtimes such as **Cloudflare AI Gateway**, **Alibaba ModelScope**, **AIHubMix**, **AIML API**, **EvoLink**, **Ollama**, **OneAPI**, **LiteLLM**, **Groq**, and **Pollinations AI**
 - [x] Supports one-click **cross-platform publishing** to **TikTok**, **Instagram**, and **YouTube Shorts** after video generation
 - [x] Supports **exporting and importing generation settings** as a preset file, and backing up and restoring every **API key** from the settings dialog
@@ -197,6 +200,35 @@ All examples below were generated with MoneyPrinterTurbo.
 
 - If you mainly rely on cloud LLMs, cloud TTS, and online material sources, CPU and RAM matter more than GPU
 - If you use `faster-whisper`, batch generation, or heavier local processing, a GPU will improve throughput noticeably
+
+## Thumbnail generation 🖼️
+
+After a task finishes you can generate a 1280×720 thumbnail for each finished
+video, with a line of your own text overlaid.
+
+**Set a portfolio directory first**, otherwise the feature stays off and the
+result page says so:
+
+```toml
+# config.toml
+[app]
+portfolio_root = "/your/portfolio/directory"
+```
+
+The `MPT_PORTFOLIO_ROOT` environment variable overrides the config file.
+
+A few notes:
+
+- **The directory must already exist** and must not contain — or be contained
+  by — the application directory. The app never guesses: silently falling back
+  would write your output into the wrong tree.
+- Thumbnails render on a **background thread**, so the page never freezes while
+  FFmpeg works.
+- Overlay text supports Chinese, Cyrillic, Korean, Arabic and other scripts.
+  Control characters, bidirectional overrides and zero-width characters are
+  rejected so display order cannot be spoofed.
+- Output lands in `storage/thumbnails/<task_id>/`, with state in
+  `manifest.json`.
 
 ## Quick Start 🚀
 

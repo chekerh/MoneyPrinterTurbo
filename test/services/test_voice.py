@@ -1471,6 +1471,497 @@ class TestElevenLabsVoice(unittest.TestCase):
         )
 
 
+class _BoundaryConnection:
+    """Captures the word-boundary callback registered by azure_tts_v2."""
+
+    def __init__(self):
+        self.callback = None
+
+    def connect(self, callback):
+        self.callback = callback
+
+
+def _fake_speechsdk_module(synthesizer_cls):
+    """Build a fake `azure.cognitiveservices.speech` module for azure_tts_v2 tests."""
+    import types
+
+    speechsdk = types.ModuleType("azure.cognitiveservices.speech")
+    speechsdk.audio = types.ModuleType("azure.cognitiveservices.speech.audio")
+
+    def _audio_output_config(filename=None, use_default_speaker=None):
+        return SimpleNamespace(filename=filename, use_default_speaker=use_default_speaker)
+
+    speechsdk.audio.AudioOutputConfig = _audio_output_config
+
+    class _FakeSpeechConfig:
+        def __init__(self, subscription=None, region=None):
+            self.subscription = subscription
+            self.region = region
+            self.speech_synthesis_voice_name = None
+            self.property_args = None
+            self.output_format = None
+
+        def set_property(self, property_id, value):
+            self.property_args = (property_id, value)
+
+        def set_speech_synthesis_output_format(self, fmt):
+            self.output_format = fmt
+
+    speechsdk.SpeechConfig = _FakeSpeechConfig
+    speechsdk.SpeechSynthesizer = synthesizer_cls
+    speechsdk.PropertyId = SimpleNamespace(
+        SpeechServiceResponse_RequestWordBoundary="word-boundary"
+    )
+    speechsdk.SpeechSynthesisOutputFormat = SimpleNamespace(
+        Audio48Khz192KBitRateMonoMp3="mp3"
+    )
+    speechsdk.ResultReason = SimpleNamespace(
+        SynthesizingAudioCompleted="completed", Canceled="canceled"
+    )
+    speechsdk.CancellationReason = SimpleNamespace(Error="error")
+    speechsdk.SessionEventArgs = dict
+    return speechsdk
+
+
+def _patch_azure_speech_sdk(synthesizer_cls):
+    """Patch sys.modules so `import azure.cognitiveservices.speech` yields a fake."""
+    import types
+
+    fake_speechsdk = _fake_speechsdk_module(synthesizer_cls)
+    return patch.dict(
+        sys.modules,
+        {
+            "azure": types.ModuleType("azure"),
+            "azure.cognitiveservices": types.ModuleType("azure.cognitiveservices"),
+            "azure.cognitiveservices.speech": fake_speechsdk,
+            "azure.cognitiveservices.speech.audio": fake_speechsdk.audio,
+        },
+    )
+
+
+class TestAzureV2VoiceCoverage(unittest.TestCase):
+    """Covers azure_tts_v2 and _build_azure_v2_ssml branch gaps."""
+
+    def test_azure_tts_v2_rejects_invalid_voice_name(self):
+        """A voice without the -V2 suffix raises ValueError immediately."""
+        with self.assertRaisesRegex(ValueError, "invalid voice name"):
+            vs.azure_tts_v2(
+                text="any", voice_name="zh-CN-XiaoxiaoNeural-Female", voice_file="/tmp/x.mp3"
+            )
+
+    def test_azure_tts_v2_success_populates_legacy_submaker(self):
+        """Successful synthesis fires word-boundary events into subs/offset."""
+        captured_synthesizers = []
+        captured_ssml = []
+
+        class _SuccessSynthesizer:
+            def __init__(self, audio_config=None, speech_config=None):
+                self.audio_config = audio_config
+                self.speech_config = speech_config
+                self.synthesis_word_boundary = _BoundaryConnection()
+                captured_synthesizers.append(self)
+
+            def speak_ssml_async(self, ssml):
+                captured_ssml.append(ssml)
+                if self.synthesis_word_boundary.callback:
+                    # str duration + float offset -> str branch + default(0) branch
+                    self.synthesis_word_boundary.callback(
+                        SimpleNamespace(duration="00:00:00.500000", audio_offset=1.5, text="第一句")
+                    )
+                    # str duration + int offset -> int branch
+                    self.synthesis_word_boundary.callback(
+                        SimpleNamespace(duration="00:00:00.700000", audio_offset=25000000, text="第二句")
+                    )
+                return SimpleNamespace(
+                    get=lambda: SimpleNamespace(reason="completed", cancellation_details=None)
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, _patch_azure_speech_sdk(
+            _SuccessSynthesizer
+        ), patch.object(vs.config, "azure", {"speech_key": "k", "speech_region": "eastus"}):
+            voice_file = str(Path(tmp_dir) / "azure-v2.mp3")
+            sub_maker = vs.azure_tts_v2(
+                text="第一句。第二句。",
+                voice_name="zh-CN-XiaoxiaoMultilingualNeural-V2-Female",
+                voice_file=voice_file,
+                voice_rate=1.2,
+            )
+
+        self.assertIsNotNone(sub_maker)
+        self.assertEqual(getattr(sub_maker, "subs", []), ["第一句", "第二句"])
+        self.assertEqual(
+            getattr(sub_maker, "offset", []),
+            [(0, 5000000), (25000000, 32000000)],
+        )
+        self.assertEqual(len(captured_ssml), 1)
+        self.assertIn('xml:lang="zh-CN"', captured_ssml[0])
+        self.assertIn('rate="1.2"', captured_ssml[0])
+        synthesizer = captured_synthesizers[0]
+        self.assertEqual(
+            synthesizer.speech_config.speech_synthesis_voice_name,
+            "zh-CN-XiaoxiaoMultilingualNeural",
+        )
+        self.assertEqual(
+            synthesizer.speech_config.property_args,
+            ("word-boundary", "true"),
+        )
+        self.assertEqual(
+            synthesizer.speech_config.output_format,
+            "mp3",
+        )
+
+    def test_azure_tts_v2_returns_none_when_speech_key_missing(self):
+        """Missing Azure credentials short-circuit to None without synthesizing."""
+
+        class _UnusedSynthesizer:
+            def __init__(self, audio_config=None, speech_config=None):
+                raise AssertionError("synthesizer must not be constructed")
+
+        with _patch_azure_speech_sdk(_UnusedSynthesizer), patch.object(
+            vs.config, "azure", {"speech_key": "", "speech_region": ""}
+        ):
+            result = vs.azure_tts_v2("text", "zh-CN-XiaoxiaoNeural-V2-Female", "/tmp/x.mp3")
+        self.assertIsNone(result)
+
+    def test_azure_tts_v2_canceled_with_error_returns_none(self):
+        """A Canceled result with CancellationReason.Error retries, then returns None."""
+        captured_synthesizers = []
+
+        class _CanceledSynthesizer:
+            def __init__(self, audio_config=None, speech_config=None):
+                self.synthesis_word_boundary = _BoundaryConnection()
+                captured_synthesizers.append(self)
+
+            def speak_ssml_async(self, ssml):
+                return SimpleNamespace(
+                    get=lambda: SimpleNamespace(
+                        reason="canceled",
+                        cancellation_details=SimpleNamespace(
+                            reason="error", error_details="boom"
+                        ),
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, _patch_azure_speech_sdk(
+            _CanceledSynthesizer
+        ), patch.object(vs.config, "azure", {"speech_key": "k", "speech_region": "eastus"}):
+            voice_file = str(Path(tmp_dir) / "azure-v2-canceled.mp3")
+            result = vs.azure_tts_v2("text", "zh-CN-XiaoxiaoNeural-V2-Female", voice_file)
+
+        self.assertIsNone(result)
+        self.assertEqual(len(captured_synthesizers), 3)
+
+    def test_azure_tts_v2_retries_then_returns_none_on_exception(self):
+        """A raised synthesis exception is retried 3 times, then returns None."""
+
+        class _BoomSynthesizer:
+            def __init__(self, audio_config=None, speech_config=None):
+                self.synthesis_word_boundary = _BoundaryConnection()
+
+            def speak_ssml_async(self, ssml):
+                raise RuntimeError("network down")
+
+        with tempfile.TemporaryDirectory() as tmp_dir, _patch_azure_speech_sdk(
+            _BoomSynthesizer
+        ), patch.object(vs.config, "azure", {"speech_key": "k", "speech_region": "eastus"}):
+            voice_file = str(Path(tmp_dir) / "azure-v2-boom.mp3")
+            result = vs.azure_tts_v2("text", "zh-CN-XiaoxiaoNeural-V2-Female", voice_file)
+
+        self.assertIsNone(result)
+        self.assertFalse(Path(voice_file).exists())
+
+    def test_build_azure_v2_ssml_falls_back_on_invalid_rate_and_locale(self):
+        """Non-numeric rates fall back to 1.0; short voice names default to en-US."""
+        ssml = vs._build_azure_v2_ssml("测试", "VoiceName", "fast")
+        self.assertIn('rate="1"', ssml)
+        self.assertIn('xml:lang="en-US"', ssml)
+
+    def test_is_azure_v2_voice_true_and_false(self):
+        self.assertEqual(
+            vs.is_azure_v2_voice("zh-CN-XiaoxiaoMultilingualNeural-V2-Female"),
+            "zh-CN-XiaoxiaoMultilingualNeural",
+        )
+        self.assertEqual(vs.is_azure_v2_voice("zh-CN-XiaoxiaoNeural-Female"), "")
+
+    def test_get_all_azure_voices_filter_with_no_matches(self):
+        self.assertEqual(vs.get_all_azure_voices(filter_locals=["xx-ZZ"]), [])
+
+
+class TestNoVoiceAndSilentCoverage(unittest.TestCase):
+    """Covers the no-voice TTS branch, silent audio failure and duration estimate."""
+
+    def test_estimate_no_voice_duration_empty_text_returns_minimum(self):
+        self.assertEqual(vs.estimate_no_voice_duration(""), 3.0)
+        self.assertEqual(vs.estimate_no_voice_duration("   "), 3.0)
+        self.assertEqual(vs.estimate_no_voice_duration(None), 3.0)
+
+    def test_generate_silent_audio_returns_false_on_ffmpeg_error(self):
+        """A non-zero FFmpeg return code makes generate_silent_audio return False."""
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.utils, "get_ffmpeg_binary", return_value="/tmp/fake-ffmpeg"
+        ), patch.object(
+            vs.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+        ):
+            voice_file = str(Path(tmp_dir) / "silent.mp3")
+            self.assertFalse(vs.generate_silent_audio(3.0, voice_file))
+
+    def test_tts_no_voice_returns_none_when_silent_audio_fails(self):
+        """When silent audio generation fails, tts() returns None like a TTS failure."""
+        with patch.object(vs, "generate_silent_audio", return_value=False) as gen:
+            result = vs.tts("some text", vs.NO_VOICE_NAME, 1.0, "/tmp/silent.mp3")
+        self.assertIsNone(result)
+        gen.assert_called_once()
+
+    def test_populate_legacy_submaker_empty_text_keeps_structure(self):
+        """Empty/whitespace text leaves the legacy subs/offset structure untouched."""
+        sub_maker = vs.ensure_legacy_submaker_fields(vs.SubMaker())
+        result = vs.populate_legacy_submaker_with_full_text(sub_maker, "   ", 1.0)
+        self.assertEqual(result.subs, [])
+        self.assertEqual(result.offset, [])
+
+
+class TestTtsDispatchCoverage(unittest.TestCase):
+    """Covers remaining provider dispatch branches in tts()."""
+
+    def test_tts_invalid_siliconflow_format_returns_none(self):
+        with patch.object(vs, "siliconflow_tts") as dispatch:
+            result = vs.tts("text", "siliconflow:bare", 1.0, "/tmp/a.mp3")
+        self.assertIsNone(result)
+        dispatch.assert_not_called()
+
+    def test_tts_siliconflow_dispatch_strips_gender_suffix(self):
+        sentinel = object()
+        with patch.object(vs, "siliconflow_tts", return_value=sentinel) as dispatch:
+            result = vs.tts("text", "siliconflow:model:alex-Male", 1.0, "/tmp/a.mp3", 1.0)
+        self.assertIs(result, sentinel)
+        dispatch.assert_called_once_with("text", "model", "model:alex", 1.0, "/tmp/a.mp3", 1.0)
+
+    def test_tts_gemini_malformed_returns_none(self):
+        with patch.object(vs, "gemini_tts") as dispatch:
+            result = vs.tts("text", "gemini:", 1.0, "/tmp/a.mp3")
+        self.assertIsNone(result)
+        dispatch.assert_not_called()
+
+    def test_tts_mimo_dispatch_strips_gender_suffix(self):
+        sentinel = object()
+        with patch.object(vs, "mimo_tts", return_value=sentinel) as dispatch:
+            result = vs.tts("text", "mimo:冰糖-Female", 1.0, "/tmp/a.mp3")
+        self.assertIs(result, sentinel)
+        dispatch.assert_called_once_with("text", "冰糖", 1.0, "/tmp/a.mp3", 1.0)
+
+    def test_tts_mimo_malformed_returns_none(self):
+        with patch.object(vs, "mimo_tts") as dispatch:
+            result = vs.tts("text", "mimo", 1.0, "/tmp/a.mp3")
+        self.assertIsNone(result)
+        dispatch.assert_not_called()
+
+    def test_tts_minimax_empty_voice_id_returns_none(self):
+        with patch.object(vs, "minimax_tts") as dispatch:
+            result = vs.tts("text", "minimax:   ", 1.0, "/tmp/a.mp3")
+        self.assertIsNone(result)
+        dispatch.assert_not_called()
+
+    def test_tts_elevenlabs_dispatch(self):
+        sentinel = object()
+        with patch.object(vs, "elevenlabs_tts", return_value=sentinel) as dispatch:
+            result = vs.tts("text", "elevenlabs:abc:Adam", 1.0, "/tmp/a.mp3", 1.0)
+        self.assertIs(result, sentinel)
+        dispatch.assert_called_once_with("text", "abc", "/tmp/a.mp3", 1.0, 1.0)
+
+    def test_tts_elevenlabs_malformed_returns_none(self):
+        with patch.object(vs, "elevenlabs_tts") as dispatch:
+            result = vs.tts("text", "elevenlabs", 1.0, "/tmp/a.mp3")
+        self.assertIsNone(result)
+        dispatch.assert_not_called()
+
+    def test_tts_chatterbox_dispatch_strips_gender_suffix(self):
+        sentinel = object()
+        with patch.object(vs, "chatterbox_tts", return_value=sentinel) as dispatch:
+            result = vs.tts("text", "chatterbox:default-Female", 1.0, "/tmp/a.mp3")
+        self.assertIs(result, sentinel)
+        dispatch.assert_called_once_with("text", "default", "/tmp/a.mp3", 1.0, 1.0)
+
+    def test_tts_chatterbox_malformed_returns_none(self):
+        with patch.object(vs, "chatterbox_tts") as dispatch:
+            result = vs.tts("text", "chatterbox:   ", 1.0, "/tmp/a.mp3")
+        self.assertIsNone(result)
+        dispatch.assert_not_called()
+
+    def test_tts_fish_audio_default_and_named_reference(self):
+        sentinel = object()
+        with patch.object(vs, "fish_audio_tts", return_value=sentinel) as dispatch:
+            result = vs.tts("text", "fish_audio:default:Default Voice", 1.0, "/tmp/a.mp3", 1.0)
+            self.assertIs(result, sentinel)
+            dispatch.assert_called_once_with(
+                "text", "/tmp/a.mp3", 1.0, 1.0, reference_id=None
+            )
+        with patch.object(vs, "fish_audio_tts", return_value=sentinel) as dispatch:
+            result = vs.tts("text", "fish_audio:abc123:My Voice", 1.0, "/tmp/a.mp3", 1.0)
+            self.assertIs(result, sentinel)
+            dispatch.assert_called_once_with(
+                "text", "/tmp/a.mp3", 1.0, 1.0, reference_id="abc123"
+            )
+
+
+class TestSubtitleMatchingCoverage(unittest.TestCase):
+    """Covers create_subtitle/_match_script_line/subtitle aggregation borders."""
+
+    def test_match_script_line_out_of_range_and_no_match(self):
+        self.assertEqual(vs._match_script_line(["目标"], "", 3), "")
+        self.assertEqual(vs._match_script_line(["目标"], "完全不同", 0), "")
+        self.assertEqual(vs._match_script_line(["Hello world!"], "Hello world!", 0), "Hello world!")
+        self.assertEqual(vs._match_script_line(["Hello world!"], "Hello__world??", 0), "Hello world!")
+
+    def test_edge_cue_aggregation_warns_on_unmatched_text(self):
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="unmatched",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.5),
+                )
+            ]
+        )
+        items = vs._build_subtitle_items_from_edge_cues(sub_maker, ["目标台词"])
+        self.assertEqual(items, [])
+
+    def test_legacy_subtitle_aggregation_warns_on_unmatched_text(self):
+        sub_maker = SimpleNamespace(
+            subs=["完全不匹配的内容"],
+            offset=[(0, 10000000)],
+        )
+        items = vs._build_subtitle_items_from_legacy_submaker(sub_maker, ["目标台词"])
+        self.assertEqual(items, [])
+
+    def test_create_subtitle_returns_without_writing_on_line_mismatch(self):
+        """When aggregated subtitles don't match script lines, no SRT is written."""
+        text = "第一句"
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="完全不同的内容",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.8),
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = str(Path(tmp_dir) / "subtitle.srt")
+            vs.create_subtitle(sub_maker, text, subtitle_file)
+            self.assertFalse(Path(subtitle_file).exists())
+
+    def test_create_subtitle_catches_inner_exception(self):
+        """A broken sub_maker (non-iterable cues) is caught without raising."""
+        sub_maker = SimpleNamespace(cues=42)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = str(Path(tmp_dir) / "subtitle.srt")
+            vs.create_subtitle(sub_maker, "text", subtitle_file)
+            self.assertFalse(Path(subtitle_file).exists())
+
+    def test_write_subtitle_items_removes_file_on_parse_error(self):
+        """A moviepy parse failure removes the SRT and returns False."""
+
+        def _broken_parser(*args, **kwargs):
+            raise RuntimeError("bad srt")
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs, "subtitles", SimpleNamespace(file_to_subtitles=_broken_parser)
+        ):
+            subtitle_file = str(Path(tmp_dir) / "subtitle.srt")
+            self.assertFalse(
+                vs._write_subtitle_items(
+                    ["1\n00:00:00,000 --> 00:00:01,000\nx\n"], subtitle_file
+                )
+            )
+            self.assertFalse(Path(subtitle_file).exists())
+
+    def test_write_subtitle_items_accepts_empty_sbs(self):
+        """An empty parse result yields duration 0 and still returns True."""
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs, "subtitles", SimpleNamespace(file_to_subtitles=lambda *a, **k: [])
+        ):
+            subtitle_file = str(Path(tmp_dir) / "subtitle.srt")
+            self.assertTrue(vs._write_subtitle_items(["dummy"], subtitle_file))
+            self.assertTrue(Path(subtitle_file).exists())
+
+
+class TestAudioDurationCoverage(unittest.TestCase):
+    """Covers get_audio_duration branch gaps."""
+
+    def test_get_audio_duration_prefers_cues_over_legacy(self):
+
+        class _Dummy:
+            pass
+
+        with patch.object(vs, "SubMaker", _Dummy):
+            with_cues = _Dummy()
+            with_cues.cues = [SimpleNamespace(end=timedelta(seconds=2.5))]
+            self.assertEqual(vs.get_audio_duration(with_cues), 2.5)
+
+            without_offsets = _Dummy()
+            without_offsets.offset = []
+            self.assertEqual(vs.get_audio_duration(without_offsets), 0.0)
+
+    def test_get_audio_duration_rejects_unknown_target_type(self):
+        self.assertEqual(vs.get_audio_duration(123), 0.0)
+
+    def test_get_audio_duration_from_file_handles_decode_error(self):
+        with patch.object(vs.os.path, "exists", return_value=True), patch.object(
+            vs, "AudioFileClip", side_effect=RuntimeError("decode failed")
+        ):
+            self.assertEqual(vs.get_audio_duration("broken.mp3"), 0.0)
+
+
+class TestVoiceCatalogConfigCoverage(unittest.TestCase):
+    """Covers get_fish_audio_voices / get_chatterbox_voices config variants."""
+
+    def test_get_fish_audio_voices_normalizes_config_entries(self):
+        with patch.object(
+            vs.config,
+            "fish_audio",
+            {
+                "voices": [
+                    "ref1:Display Name",
+                    "ref2",
+                    "fish_audio:ref3:Prefixed",
+                    "",
+                    "  ",
+                ]
+            },
+        ):
+            voices = vs.get_fish_audio_voices()
+        self.assertEqual(
+            voices,
+            [
+                "fish_audio:2324c907b9a94c64ab4afb941e5b3408:Clear Female-Female",
+                "fish_audio:7b6131ba75ba47c98a46c847db729ab6:Clear Male-Male",
+                "fish_audio:default:Default Voice",
+                "fish_audio:ref1:Display Name",
+                "fish_audio:ref2:ref2",
+                "fish_audio:ref3:Prefixed",
+            ],
+        )
+
+    def test_get_fish_audio_voices_accepts_comma_string(self):
+        with patch.object(vs.config, "fish_audio", {"voices": "ref1:Display , ref2 ,"}):
+            voices = vs.get_fish_audio_voices()
+        self.assertIn("fish_audio:ref1:Display", voices)
+        self.assertIn("fish_audio:ref2:ref2", voices)
+
+    def test_get_chatterbox_voices_skips_empty_entries(self):
+        with patch.object(
+            vs.config,
+            "chatterbox",
+            {"voices": ["", "  ", "narrator", "chatterbox:host"]},
+        ):
+            self.assertEqual(
+                vs.get_chatterbox_voices(),
+                ["chatterbox:narrator", "chatterbox:host"],
+            )
+
+
 if __name__ == "__main__":
     # python -m unittest test.services.test_voice.TestVoiceService.test_azure_tts_v1
     # python -m unittest test.services.test_voice.TestVoiceService.test_azure_tts_v2

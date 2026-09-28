@@ -67,7 +67,7 @@
     "Delete Task": "Hapus tugas",
     "Task Deleted": "Tugas dihapus",
     "Task Delete Failed": "Gagal menghapus tugas",
-    "Open Task Folder": "Buka folder",
+    "Open Task Folder": "Buka berkas tugas",
     "Generating Video Script and Keywords": "AI sedang menghasilkan skrip video dan kata kunci...",
     "Generating Video Keywords": "AI sedang menghasilkan kata kunci video...",
     "Video Keywords": "Kata Kunci Video (Inggris, Opsional)",
@@ -390,6 +390,23 @@
     "Thumbnail Overlay Invalid": "Teks overlay berisi karakter yang tidak diizinkan.",
     "Thumbnail Generate Failed": "Miniatur tidak dapat dibuat. Yang sebelumnya tetap utuh.",
     "Thumbnail Record Failed": "Catatan miniatur tidak dapat diperbarui. Yang sebelumnya tetap utuh.",
-    "Thumbnail Archive Failed": "Miniatur itu tidak dapat diarsipkan."
+    "Thumbnail Archive Failed": "Miniatur itu tidak dapat diarsipkan.",
+    "Thumbnail Queued": "Antre untuk dibuat.",
+    "Thumbnail Generating": "Sedang membuat miniatur…",
+    "Thumbnail Queue Unavailable": "Tidak dapat mengantrekan pembuatan. Coba lagi.",
+    "Open Archive Folder": "Buka folder arsip",
+    "Task Not Archived Yet": "Tugas ini belum diarsipkan",
+    "Video File Missing": "File video tidak ada: {name}",
+    "Video File Unreadable": "File video kosong atau rusak: {name}",
+    "Thumbnail unavailable": "Thumbnail tidak tersedia",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "Atur portfolio_root pada bagian [app] di config.toml untuk mengaktifkan thumbnail dan perencanaan portofolio.",
+    "Niche": "Niche",
+    "No Niche": "Tanpa niche",
+    "Niche Preview": "{name}: {line} (sekitar {words} kata)",
+    "Choose Thumbnail": "Pilih thumbnail",
+    "Thumbnail Candidate {index}": "Kandidat {index}",
+    "Thumbnail Select Failed": "Tidak bisa mengganti thumbnail",
+    "Highlight Spoken Words": "Sorot kata yang diucapkan",
+    "Highlight Spoken Words Help": "Subtitle kata demi kata: kata yang diucapkan disorot. Membutuhkan penanda waktu per kata dari pengenalan suara; tanpa itu kembali ke subtitle satu baris."
   }
 }

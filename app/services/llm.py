@@ -1,6 +1,8 @@
 import json
 import logging
+import random as _random
 import re
+import time as _time
 from time import perf_counter
 from typing import List
 
@@ -11,11 +13,37 @@ from openai.types.chat import ChatCompletion
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
 
-_max_retries = 5
+_max_retries = max(1, int(config.app.get("llm_max_retries", 8)))
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
 MAX_SCRIPT_PARAGRAPH_NUMBER = 10
 MAX_SCRIPT_PROMPT_LENGTH = 2000
 MAX_SCRIPT_SYSTEM_PROMPT_LENGTH = 8000
+_transient_retry_seconds_baseline = max(1, int(config.app.get("llm_retry_baseline_seconds", 5)))
+_transient_retry_seconds_cap = max(10, int(config.app.get("llm_retry_cap_seconds", 120)))
+_transient_status_codes = {408, 429, 500, 502, 503, 504}
+_transient_error_markers = (
+    "high demand",
+    "try again",
+    "rate limit",
+    "quota",
+    "resource exhausted",
+    "resource_exhausted",
+    "unavailable",
+    "temporarily",
+)
+# 429 with these markers is a permanent billing/exhaustion state, not a throttle:
+# retrying it only burns backoff time. Anything else on 429 stays transient.
+_permanent_429_markers = (
+    "insufficient_quota",
+    "insufficient quota",
+    "no quota",
+    "no remaining quota",
+    "billing hard limit",
+    "billing limit",
+    "payment required",
+    "no active account balance",
+    "no credits",
+)
 _THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think>", re.IGNORECASE | re.DOTALL)
 _UNCLOSED_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*$", re.IGNORECASE | re.DOTALL)
 _URL_USERINFO_RE = re.compile(
@@ -35,12 +63,58 @@ Generate a script for a video, depending on the subject of the video.
 ## Constrains:
 1. the script is to be returned as a string with the specified number of paragraphs.
 2. do not under any circumstance reference this prompt in your response.
-3. get straight to the point, don't start with unnecessary things like, "welcome to this video".
+3. get straight to the point. never open with "welcome to this video", a greeting,
+   or any stage-setting. when a channel brand line is specified below, it goes after
+   the hook, never in place of it.
 4. you must not include any type of markdown or formatting in the script, never use a title.
 5. only return the raw content of the script.
 6. do not include "voiceover", "narrator" or similar indicators of what should be spoken at the beginning of each paragraph or line.
 7. you must not mention the prompt, or anything about the script itself. also, never talk about the amount of paragraphs or lines. just write the script.
 8. respond in the same language as the video subject.
+
+## Retention (hook first):
+- open with the hook: state the problem and promise the payoff in the first line.
+- no run-up. strip "let's dive in", "here's what you need to know", "the thing is",
+  and "in this video". the first line is the hook, and it arrives before any
+  greeting or channel identification.
+- deliver a payoff before attention wanes; every next sentence must feel earned.
+- tight pacing: no "dead air" filler sentences. treat the script like a short-form
+  edit where every frame must earn its place.
+
+## Voice:
+Write like a human host speaking to one specific viewer, not a chatbot writing for
+everyone. choices should be uneven and specific, not the most average phrasing.
+vary sentence length: alternate short and long sentences. read each line aloud;
+it must be comfortable to speak and must add something the viewer did not already know.
+
+## Banned AI patterns (humanizer):
+- no "not X but Y" contrasts, no one-line closers ("that is the real win", "let that
+  sink in"), and no arguing with no one ("this isn't about X", "to be clear").
+- no forced triads ("innovation, inspiration, insights") unless the meaning truly
+  has three parts.
+- no em dashes or en dashes; use periods, commas, or parentheses instead.
+- no inflated words: actually, additionally, enhance, fostering, pivotal, showcase,
+  testament, underscore, vibrant, delve, robust, rich.
+- no inflated significance ("stands as a testament", "the future looks bright").
+- no sales language: boasts, nestled, stunning, breathtaking, must-visit.
+- no chatbot residue ("I hope this helps", "let me know", "great question").
+- no bold labels, headings, emojis, bullets, or decorative formatting.
+- no sayings that pose as depth: "the real question is", "at its core", "what
+  really matters", "the deeper issue", "the heart of the matter", "X is the Y
+  of Z". state the specific claim instead.
+- no arguing with nobody: "to be clear", "don't get me wrong", "this isn't
+  mainly about", "I'm not saying", "one might be tempted to". delete the
+  objection nobody made.
+- no knowledge-limit hedging: "as of", "up to my last update", "it is believed
+  that", "not publicly available". either state what is known or leave it out.
+  never present a guess as fact.
+- use "is", "are", "has" rather than "serves as", "stands as", "functions as",
+  "boasts", "features", "offers", "maintains", "refers to".
+- no "-ing" rider bolted onto a plain fact (highlighting, underscoring,
+  showcasing, fostering, ensuring) unless it carries real meaning.
+- no unnamed authority: "experts argue", "studies show" without naming who.
+  if no source exists, do not invent one.
+- vary sentence openings. do not start three sentences the same way.
 """.strip()
 
 
@@ -139,7 +213,7 @@ def _extract_qwen_generation_text(response) -> str:
     return _normalize_text_response(text, "qwen")
 
 
-def _generate_response(prompt: str, app_config=None) -> str:
+def _generate_response_once(prompt: str, app_config=None) -> str:
     try:
         # WebUI 在视频生成期间允许用户准备下一条文案。调用方可以传入提交瞬间
         # 的配置快照，确保模型请求重试期间不会因为后台任务结束并应用新配置，
@@ -403,8 +477,59 @@ def _generate_response(prompt: str, app_config=None) -> str:
                 f"[{llm_provider}] returned an empty response, please check your network connection and try again."
             )
 
-    except Exception as e:
-        return f"Error: {_sanitize_error_message(e)}"
+    except Exception:
+        raise
+
+
+def _is_transient_llm_error(error) -> bool:
+    """Detect transport-level and quota/throttle failures worth retrying.
+
+    Gemini and other providers surface temporary overload as HTTP 429/5xx or as
+    a plain-text message inside the exception. Anything else (bad key, invalid
+    model, network refuse) is permanent and must fail immediately.
+    """
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(error, "code", None)
+    if isinstance(status, str):
+        status = status.split(" ", 1)[0]
+    try:
+        code = int(status)
+    except (TypeError, ValueError):
+        code = 0
+    text = str(error or "").lower()
+    if code and code in _transient_status_codes:
+        if code == 429 and any(marker in text for marker in _permanent_429_markers):
+            return False
+        return True
+    return any(marker in text for marker in _transient_error_markers)
+
+
+def _generate_response(prompt: str, app_config=None, *, retries: int | None = None) -> str:
+    """Single-call wrapper that retries transient provider failures.
+
+    Transient errors (429/5xx, quota/overload) are retried with capped
+    exponential backoff and jitter. Permanent errors return immediately as the
+    same "Error: ..." string as before, preserving the public contract.
+    """
+    attempts = _max_retries if retries is None else max(0, int(retries))
+    for attempt in range(attempts):
+        try:
+            return _generate_response_once(prompt, app_config)
+        except Exception as e:
+            if not _is_transient_llm_error(e) or attempt >= attempts - 1:
+                return f"Error: {_sanitize_error_message(e)}"
+            delay = min(
+                _transient_retry_seconds_cap,
+                _transient_retry_seconds_baseline * (2 ** attempt),
+            )
+            delay *= 0.8 + 0.4 * _random.random()
+            logger.warning(
+                f"llm transient error on attempt {attempt + 1}/{attempts}, "
+                f"retrying in {delay:.1f}s: {_sanitize_error_message(e)}"
+            )
+            _time.sleep(delay)
+    return f"Error: llm request failed after {attempts} attempts"
 
 
 def test_connection() -> tuple[bool, str, float]:
@@ -416,7 +541,10 @@ def test_connection() -> tuple[bool, str, float]:
     用户的视频主题或文案。返回值依次为成功状态、错误信息和请求耗时。
     """
     started_at = perf_counter()
-    response = _generate_response(prompt="Reply with exactly: OK")
+    response = _generate_response(
+        prompt="Reply with exactly: OK",
+        retries=1,
+    )
     elapsed = perf_counter() - started_at
 
     if not response:
@@ -470,6 +598,7 @@ def build_script_prompt(
     paragraph_number: int = 1,
     video_script_prompt: str = "",
     custom_system_prompt: str = "",
+    channel: str = "",
 ) -> str:
     paragraph_number = _normalize_script_paragraph_number(paragraph_number)
     video_script_prompt = _limit_script_text(
@@ -482,6 +611,15 @@ def build_script_prompt(
     # 将“脚本生成规则”和“运行时上下文”分开拼接。这样高级用户即使覆盖默认
     # system prompt，也不会漏掉视频主题、语言、段落数这些每次生成都必须带上的参数。
     prompt = custom_system_prompt or DEFAULT_SCRIPT_SYSTEM_PROMPT
+
+    # 赛道品牌指令。放在"运行时上下文"之前，让它和默认脚本规则同属一条指令链：
+    # 高级用户覆盖 system prompt 时仍然会拿到（品牌句是频道资产，不能被覆盖掉）。
+    from app.services.niche_brand import script_directives
+
+    directives = script_directives(channel)
+    if directives:
+        prompt += "\n\n" + directives
+
     prompt += f"""
 
 # Initialization:
@@ -507,6 +645,7 @@ def generate_script(
     video_script_prompt: str = "",
     custom_system_prompt: str = "",
     app_config=None,
+    channel: str = "",
 ) -> str:
     paragraph_number = _normalize_script_paragraph_number(paragraph_number)
     video_script_prompt = _limit_script_text(
@@ -521,8 +660,10 @@ def generate_script(
         paragraph_number=paragraph_number,
         video_script_prompt=video_script_prompt,
         custom_system_prompt=custom_system_prompt,
+        channel=channel,
     )
     final_script = ""
+    last_error = ""
     logger.info(
         "generating video script: "
         f"subject={video_subject}, paragraph_number={paragraph_number}, "
@@ -566,13 +707,23 @@ def generate_script(
             if final_script and "当日额度已消耗完" in final_script:
                 raise ValueError(final_script)
 
+            # An "Error: ..." string means _generate_response already gave up
+            # (or returned a permanent error). Remember it, then clear it so
+            # the retry loop tries the next attempt instead of breaking.
+            if final_script and final_script.startswith("Error: "):
+                last_error = final_script
+                final_script = ""
+
             if final_script:
                 break
         except Exception as e:
+            last_error = f"Error: {_sanitize_error_message(e)}"
             logger.error(f"failed to generate script: {e}")
 
         if i < _max_retries - 1:
             logger.warning(f"failed to generate video script, trying again... {i + 1}")
+    if not final_script and last_error:
+        final_script = last_error
     if "Error: " in final_script:
         logger.error(f"failed to generate video script: {final_script}")
     else:

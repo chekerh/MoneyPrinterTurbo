@@ -67,7 +67,7 @@
     "Delete Task": "작업 삭제",
     "Task Deleted": "작업이 삭제되었습니다",
     "Task Delete Failed": "작업 삭제에 실패했습니다",
-    "Open Task Folder": "폴더 열기",
+    "Open Task Folder": "작업 파일 열기",
     "Generating Video Script and Keywords": "AI가 영상 스크립트와 키워드를 생성 중입니다...",
     "Generating Video Keywords": "AI가 영상 키워드를 생성 중입니다...",
     "Video Keywords": "영상 키워드 (영어, 선택)",
@@ -390,6 +390,23 @@
     "Thumbnail Overlay Invalid": "오버레이 텍스트에 허용되지 않는 문자가 있습니다.",
     "Thumbnail Generate Failed": "썸네일을 만들 수 없습니다. 이전 썸네일은 그대로입니다.",
     "Thumbnail Record Failed": "썸네일 기록을 갱신할 수 없습니다. 이전 썸네일은 그대로입니다.",
-    "Thumbnail Archive Failed": "해당 썸네일을 보관할 수 없습니다."
+    "Thumbnail Archive Failed": "해당 썸네일을 보관할 수 없습니다.",
+    "Thumbnail Queued": "생성 대기 중입니다.",
+    "Thumbnail Generating": "썸네일을 만드는 중입니다.",
+    "Thumbnail Queue Unavailable": "지금은 생성을 대기열에 넣을 수 없습니다. 다시 시도하세요.",
+    "Open Archive Folder": "보관 폴더 열기",
+    "Task Not Archived Yet": "이 작업은 아직 보관되지 않았습니다",
+    "Video File Missing": "동영상 파일을 찾을 수 없습니다: {name}",
+    "Video File Unreadable": "동영상 파일이 비어 있거나 손상되었습니다: {name}",
+    "Thumbnail unavailable": "썸네일을 사용할 수 없습니다",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "config.toml의 [app] 섹션에서 portfolio_root를 설정하면 썸네일과 포트폴리오 계획이 활성화됩니다.",
+    "Niche": "니치",
+    "No Niche": "니치 없음",
+    "Niche Preview": "{name}: {line}(약 {words}단어)",
+    "Choose Thumbnail": "썸네일 선택",
+    "Thumbnail Candidate {index}": "후보 {index}",
+    "Thumbnail Select Failed": "썸네일을 바꿀 수 없습니다",
+    "Highlight Spoken Words": "읽는 단어 강조",
+    "Highlight Spoken Words Help": "단어별 자막: 읽는 단어가 강조됩니다. 음성 인식의 단어 단위 타이밍이 필요하며 없으면 줄 전체 자막으로 돌아갑니다."
   }
 }

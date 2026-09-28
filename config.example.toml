@@ -7,9 +7,32 @@
 # =============================================================================
 # Log level: DEBUG, INFO, WARNING, or ERROR.
 log_level = "DEBUG"
-# Use 127.0.0.1 for local-only access. 0.0.0.0 listens on all network interfaces.
-listen_host = "0.0.0.0"
+# Bind address. 127.0.0.1 keeps the service on this machine only.
+# 监听地址。127.0.0.1 表示只允许本机访问。
+listen_host = "127.0.0.1"
+# Refuse to start on a non-loopback address unless this is explicitly enabled.
+# api_key is empty by default, so opening the bind address would expose tasks and
+# generated files to everyone on the same network. Set an api_key as well.
+# 除非显式开启，否则拒绝以非回环地址启动。api_key 默认为空，
+# 放开监听会把任务与生成产物暴露给同一网络内的任何人，请同时配置 api_key。
+allow_non_loopback_bind = false
 listen_port = 8080
+
+# Where the FINAL videos are kept — the only files that stay on your SSD.
+# 成片存放目录：唯一会长期留在硬盘上的文件。默认 <portfolio_root>/outputs。
+# 没配置 portfolio_root 时退回 <应用根>/output。
+# output_dir = ""
+
+# 中间产物（配音、字幕、脚本、下载素材、拼接片段、AI 生成的 BGM）放在哪里。
+#   ram  = 内存盘（macOS 用 diskutil image attach ram:// 实现），只在 RAM 里，
+#          任务结束即删，不碰 SSD。推荐。
+#   disk = 系统临时目录：内存盘不可用时的降级方案，中间产物仍会写盘。
+#   off  = 关掉：中间产物写回应用 storage 目录（等于回到旧行为）。
+scratch_mode = "ram"
+
+# 内存盘大小（MB）。下载素材缓存是跨任务共享的，会一直占着额度，
+# 所以别设太小；退出时整个内存盘被卸载，这些内容随之消失。
+scratch_size_mb = 4096
 
 [app]
 
@@ -488,6 +511,13 @@ hide_log = false
 # Open the task folder automatically after video generation completes.
 # 视频生成完成后是否自动打开任务目录；关闭后仍可在任务管理中手动打开。
 open_task_folder_on_completion = true
+
+# Word-by-word captions: the word currently being spoken lights up, the rest
+# stay dimmed. Needs word-level timings from speech recognition; when those are
+# unavailable the caption falls back to whole-line rendering automatically.
+# 逐词高亮字幕：正在念的词点亮，其余压暗。需要语音识别的词级时间；
+# 取不到时自动退回整句字幕，不会按字数均分去猜。
+caption_word_highlight = true
 
 # The WebUI writes the remaining preferences automatically. Uncomment values
 # below only when you want to define initial defaults manually.

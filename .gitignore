@@ -42,3 +42,13 @@ htmlcov/
 .codegraph
 /docs/superpowers
 .understand-anything
+
+# graphify knowledge-graph output: generated, ~40 MB, rebuilt with
+# `graphify . --update --code-only`. Never commit it.
+graphify-out/
+
+# Local secrets. config.toml is already ignored, but .env must never
+# be committed either.
+.env
+.env.*
+!.env.example

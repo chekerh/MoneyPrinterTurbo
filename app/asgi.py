@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
@@ -14,6 +14,7 @@ from app.config import config
 from app.controllers import base
 from app.models.exception import HttpException
 from app.router import root_api_router
+from app.services.metrics import registry, start_metrics_collection, stop_metrics_collection
 from app.utils import utils
 
 
@@ -35,6 +36,10 @@ async def application_lifespan(_: FastAPI):
             "API key authentication is misconfigured: app.api_key must be a string"
         )
 
+    # 启动指标收集器（Prometheus /metrics）
+    start_metrics_collection(interval=30.0)
+    logger.info("metrics collector started")
+
     # 跨平台发布由当前进程线程池执行，不会在服务重启后恢复。启动时把 Redis
     # 中确认已失去执行进程的活动状态收敛为失败，避免任务永久无法删除。
     from app.services import task as task_service
@@ -43,6 +48,7 @@ async def application_lifespan(_: FastAPI):
     try:
         yield
     finally:
+        stop_metrics_collection()
         logger.info("shutdown event")
 
 
@@ -79,6 +85,12 @@ def get_application() -> FastAPI:
     instance.include_router(root_api_router)
     instance.add_exception_handler(HttpException, exception_handler)
     instance.add_exception_handler(RequestValidationError, validation_exception_handler)
+
+    # Prometheus metrics endpoint
+    @instance.get("/metrics", include_in_schema=False)
+    async def metrics():
+        return PlainTextResponse(registry.export_prometheus(), media_type="text/plain")
+
     return instance
 
 

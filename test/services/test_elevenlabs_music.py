@@ -131,7 +131,7 @@ class TestElevenLabsMusicService(unittest.TestCase):
                 {"api_key": "test-key"},
             ),
             patch.object(
-                elevenlabs_music.requests,
+                elevenlabs_music.session_manager,
                 "get",
                 return_value=response,
             ) as request,
@@ -175,7 +175,7 @@ class TestElevenLabsMusicService(unittest.TestCase):
                 {"api_key": "test-key"},
             ),
             patch.object(
-                elevenlabs_music.requests,
+                elevenlabs_music.session_manager,
                 "get",
                 return_value=response,
             ) as request,
@@ -221,7 +221,7 @@ class TestElevenLabsMusicService(unittest.TestCase):
                     {"api_key": "test-key"},
                 ),
                 patch.object(
-                    elevenlabs_music.requests,
+                    elevenlabs_music.session_manager,
                     "get",
                     return_value=response,
                     side_effect=request_error,
@@ -278,7 +278,7 @@ class TestElevenLabsMusicService(unittest.TestCase):
                 {"api_key": "test-key"},
             ),
             patch.object(
-                elevenlabs_music.requests,
+                elevenlabs_music.session_manager,
                 "get",
                 return_value=response,
             ),
@@ -416,7 +416,7 @@ class TestElevenLabsMusicService(unittest.TestCase):
                     },
                 ),
                 patch.object(
-                    elevenlabs_music.requests,
+                    elevenlabs_music.session_manager,
                     "post",
                     return_value=response,
                 ) as post,
@@ -485,7 +485,7 @@ class TestElevenLabsMusicService(unittest.TestCase):
                         {"api_key": "test-key"},
                     ),
                     patch.object(
-                        elevenlabs_music.requests,
+                        elevenlabs_music.session_manager,
                         "post",
                         return_value=response,
                     ),

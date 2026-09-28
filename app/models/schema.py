@@ -79,6 +79,9 @@ class VideoParams(BaseModel):
     """
 
     video_subject: str
+    # 赛道（Niche）：决定品牌句、钩子写法与目标长度。
+    # 见 app/services/niche_brand.py。留空则使用通用写法（没有品牌句）。
+    channel: str = ""
     video_script: str = ""  # Script used to generate the video
     video_terms: Optional[str | list] = None  # Keywords used to generate the video
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
@@ -119,6 +122,9 @@ class VideoParams(BaseModel):
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
+    # 逐词高亮：正在念的词点亮，其余压暗。需要 ASR 的词级时间；
+    # 拿不到时自动退回整句原样显示，不会按字数均分去猜。
+    caption_word_highlight: bool = True
 
     font_size: int = 60
     stroke_color: Optional[str] = "#000000"
@@ -143,6 +149,9 @@ class SubtitleRequest(BaseModel):
     text_fore_color: Optional[str] = "#FFFFFF"
     text_background_color: Union[bool, str] = False
     rounded_subtitle_background: bool = False
+    # 逐词高亮：正在念的词点亮，其余压暗。需要 ASR 的词级时间；
+    # 拿不到时自动退回整句原样显示，不会猜。
+    caption_word_highlight: bool = True
     font_size: int = 60
     stroke_color: Optional[str] = "#000000"
     stroke_width: float = 1.5

@@ -91,11 +91,24 @@ def root_dir():
 
 
 def storage_dir(sub_dir: str = "", create: bool = False):
-    d = os.path.join(root_dir(), "storage")
-    if sub_dir:
-        d = os.path.join(d, sub_dir)
+    """
+    storage 下的目录。
+
+    中间产物目录（cache_videos、temp、tasks…）会被重定向到内存盘，
+    这样"下载的素材、配音、字幕、拼接片段"就不会落到 SSD 上。
+    用户自己的东西（local_videos、credentials、bgm…）保持原位。
+    判定规则集中在 :mod:`app.utils.storage_policy`，不在这里逐个硬编码。
+    """
+    from app.utils.storage_policy import is_scratch_subdir, scratch_path
+
+    if sub_dir and is_scratch_subdir(sub_dir):
+        d = scratch_path(sub_dir)
+    else:
+        d = os.path.join(root_dir(), "storage")
+        if sub_dir:
+            d = os.path.join(d, sub_dir)
     if create and not os.path.exists(d):
-        os.makedirs(d)
+        os.makedirs(d, exist_ok=True)
 
     return d
 
@@ -108,11 +121,20 @@ def resource_dir(sub_dir: str = ""):
 
 
 def task_dir(sub_dir: str = ""):
-    d = os.path.join(storage_dir(), "tasks")
+    """
+    单个任务的工作目录（脚本、字幕、配音、拼接片段）。
+
+    落在内存盘里：任务结束或进程退出后就没了。最终成片不写这里，
+    它去 :func:`app.utils.storage_policy.output_dir`。
+    """
+    from app.utils.storage_policy import scratch_path
+
+    parts = ["tasks"]
     if sub_dir:
-        d = os.path.join(d, sub_dir)
+        parts.append(str(sub_dir))
+    d = scratch_path(*parts)
     if not os.path.exists(d):
-        os.makedirs(d)
+        os.makedirs(d, exist_ok=True)
     return d
 
 

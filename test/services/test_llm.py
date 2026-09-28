@@ -108,6 +108,27 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIn("- number of paragraphs: 2", prompt)
         self.assertIn("- language: en", prompt)
 
+    def test_default_system_prompt_embeds_retention_and_humanizer_rules(self):
+        prompt = llm.build_script_prompt(
+            video_subject="咖啡",
+            language="zh-CN",
+            paragraph_number=3,
+        )
+
+        self.assertIn("# Role: Video Script Generator", prompt)
+        self.assertIn("hook first", prompt)
+        self.assertIn("no em dashes or en dashes", prompt)
+        self.assertIn("no forced triads", prompt)
+        self.assertIn("specific viewer", prompt)
+
+    def test_default_system_prompt_stays_under_length_limit(self):
+        prompt = llm.build_script_prompt(
+            video_subject="coffee",
+            language="en",
+            paragraph_number=5,
+        )
+        self.assertLessEqual(len(prompt), llm.MAX_SCRIPT_SYSTEM_PROMPT_LENGTH)
+
     def test_generate_script_sends_custom_prompt_to_llm(self):
         captured = {}
 
@@ -260,7 +281,9 @@ class TestLLMConnection(unittest.TestCase):
         ):
             result = llm.test_connection()
 
-        generate.assert_called_once_with(prompt="Reply with exactly: OK")
+        generate.assert_called_once_with(
+            prompt="Reply with exactly: OK", retries=1
+        )
         self.assertEqual(result, (True, "", 0.25))
 
     def test_connection_returns_provider_error(self):
@@ -286,6 +309,115 @@ class TestLLMConnection(unittest.TestCase):
             result = llm.test_connection()
 
         self.assertEqual(result, (False, "LLM returned an empty response", 1.0))
+
+
+class TestGenerateResponseRetry(unittest.TestCase):
+    """临时性 5xx/429/配额错误应触发退避重试，永久错误应立即失败。"""
+
+    def test_retries_transient_errors_then_succeeds(self):
+        attempts = {"n": 0}
+
+        def fake_once(prompt, app_config=None):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                error = Exception("503 UNAVAILABLE: please try again in a few seconds")
+                error.status_code = 503
+                raise error
+            return "ok"
+
+        with patch.object(llm, "_generate_response_once", side_effect=fake_once):
+            result = llm._generate_response("prompt", retries=5)
+        self.assertEqual(attempts["n"], 3)
+        self.assertEqual(result, "ok")
+
+    def test_gives_up_after_exhausted_retries(self):
+        def fake_once(prompt, app_config=None):
+            error = Exception("backend 500")
+            error.status_code = 500
+            raise error
+
+        fake_time = type("FakeTime", (), {"sleep": lambda *_: None})()
+        fake_random = type("FakeRandom", (), {"random": lambda *_: 0.5})()
+        with (
+            patch.object(llm, "_generate_response_once", side_effect=fake_once),
+            patch.object(llm, "_random", fake_random),
+            patch.object(llm, "_time", fake_time),
+            patch.object(llm, "_transient_retry_seconds_baseline", 0.0001),
+            patch.object(llm, "_transient_retry_seconds_cap", 0.001),
+        ):
+            result = llm._generate_response("prompt", retries=3)
+        self.assertEqual(result, "Error: backend 500")
+
+    def test_permanent_errors_fail_immediately_without_retry(self):
+        attempts = {"n": 0}
+
+        def fake_once(prompt, app_config=None):
+            attempts["n"] += 1
+            raise ValueError("invalid API key")
+
+        fake_time = type("FakeTime", (), {"sleep": lambda *_: None})()
+        with (
+            patch.object(llm, "_generate_response_once", side_effect=fake_once),
+            patch.object(llm, "_time", fake_time),
+            patch.object(llm, "_transient_retry_seconds_baseline", 0.0001),
+            patch.object(llm, "_transient_retry_seconds_cap", 0.001),
+        ):
+            result = llm._generate_response("prompt", retries=5)
+        self.assertEqual(attempts["n"], 1)
+        self.assertEqual(result, "Error: invalid API key")
+
+    def test_billing_429_is_permanent_and_does_not_retry(self):
+        """OpenAI 的 insufficient_quota 429 属于永久账务状态，不应按瞬时限流退避重试。"""
+        attempts = {"n": 0}
+
+        def make_billing_error():
+            error = Exception(
+                "Error code: 429 - {'error': {'message': 'You have no quota for "
+                "gpt-4o-mini. Please increase your account spending limit', "
+                "'type': 'insufficient_quota'}}"
+            )
+            error.status_code = 429
+            return error
+
+        def fake_once(prompt, app_config=None):
+            attempts["n"] += 1
+            raise make_billing_error()
+
+        fake_time = type("FakeTime", (), {"sleep": lambda *_: None})()
+        with (
+            patch.object(llm, "_generate_response_once", side_effect=fake_once),
+            patch.object(llm, "_time", fake_time),
+            patch.object(llm, "_transient_retry_seconds_baseline", 0.0001),
+            patch.object(llm, "_transient_retry_seconds_cap", 0.001),
+        ):
+            self.assertFalse(llm._is_transient_llm_error(make_billing_error()))
+            result = llm._generate_response("prompt", retries=5)
+        self.assertEqual(attempts["n"], 1)
+        self.assertTrue(result.startswith("Error: Error code: 429"))
+        self.assertIn("insufficient_quota", result)
+
+    def test_plain_429_rate_limit_is_still_transient(self):
+        """无账单关键词的 429（限流）应保持瞬时、继续退避重试。"""
+        attempts = {"n": 0}
+
+        def fake_once(prompt, app_config=None):
+            attempts["n"] += 1
+            if attempts["n"] < 2:
+                error = Exception("rate limit reached")
+                error.status_code = 429
+                raise error
+            return "ok"
+
+        fake_time = type("FakeTime", (), {"sleep": lambda *_: None})()
+        with (
+            patch.object(llm, "_generate_response_once", side_effect=fake_once),
+            patch.object(llm, "_time", fake_time),
+            patch.object(llm, "_transient_retry_seconds_baseline", 0.0001),
+            patch.object(llm, "_transient_retry_seconds_cap", 0.001),
+        ):
+            result = llm._generate_response("prompt", retries=3)
+        self.assertEqual(attempts["n"], 2)
+        self.assertEqual(result, "ok")
 
 
 class TestLiteLLMProvider(unittest.TestCase):

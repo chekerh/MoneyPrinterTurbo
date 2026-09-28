@@ -1,4 +1,7 @@
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +15,21 @@ from app.utils import utils
 ROOT_DIR = Path(__file__).parent.parent.parent
 WEBUI_MAIN = ROOT_DIR / "webui" / "Main.py"
 
+_REAL_SUBPROCESS_RUN = subprocess.run
+
+
+def _stub_ffprobe(monkeypatch):
+    """只拦截 ffprobe，其余 subprocess 调用原样放行。"""
+
+    def fake_run(command, *args, **kwargs):
+        if isinstance(command, (list, tuple)) and "ffprobe" in command:
+            return subprocess.CompletedProcess(
+                args=command, returncode=0, stdout="1080x1920\n", stderr=""
+            )
+        return _REAL_SUBPROCESS_RUN(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
 
 @pytest.fixture
 def headless_task_app(tmp_path, monkeypatch):
@@ -23,8 +41,14 @@ def headless_task_app(tmp_path, monkeypatch):
     task_dir.mkdir(parents=True)
     video_file = task_dir / "final-1.mp4"
     video_file.write_bytes(b"test video payload")
+    # 任务面板现在要求成片能解析出尺寸、且 mtime 已静默超过一个轮询窗口才算完成。
+    # payload 是占位字节，所以回退 mtime 并打桩 ffprobe，让本用例专注于无桌面
+    # 环境下的播放预览与打开目录降级行为。
+    old = time.time() - 3600
+    os.utime(video_file, (old, old))
 
     monkeypatch.setattr(utils, "task_dir", lambda: str(tasks_dir))
+    _stub_ffprobe(monkeypatch)
     monkeypatch.setattr(sm.state, "get_all_tasks", lambda *_args, **_kwargs: ([], 0))
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.delenv("DISPLAY", raising=False)

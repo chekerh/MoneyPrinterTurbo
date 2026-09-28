@@ -77,7 +77,7 @@
     "Delete Task": "删除任务",
     "Task Deleted": "任务已删除",
     "Task Delete Failed": "任务删除失败",
-    "Open Task Folder": "打开目录",
+    "Open Task Folder": "打开任务目录",
     "Generating Video Script and Keywords": "AI正在生成视频文案和关键词...",
     "Generating Video Keywords": "AI正在生成视频关键词...",
     "Video Keywords": "视频关键词（英文，可选）",
@@ -516,6 +516,23 @@
     "Thumbnail Overlay Invalid": "叠加文字包含不被允许的字符。",
     "Thumbnail Generate Failed": "缩略图生成失败，之前的缩略图保持不变。",
     "Thumbnail Record Failed": "缩略图记录更新失败，之前的缩略图保持不变。",
-    "Thumbnail Archive Failed": "无法归档该缩略图。"
+    "Thumbnail Archive Failed": "无法归档该缩略图。",
+    "Thumbnail Queued": "已排队等待生成。",
+    "Thumbnail Generating": "正在生成缩略图…",
+    "Thumbnail Queue Unavailable": "暂时无法排队生成，请稍后重试。",
+    "Open Archive Folder": "打开归档目录",
+    "Task Not Archived Yet": "该任务尚未归档",
+    "Video File Missing": "视频文件不存在：{name}",
+    "Video File Unreadable": "视频文件为空或已损坏：{name}",
+    "Thumbnail unavailable": "缩略图不可用",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "在 config.toml 的 [app] 段设置 portfolio_root 即可启用缩略图与作品集规划。",
+    "Niche": "赛道",
+    "No Niche": "不指定赛道",
+    "Niche Preview": "{name}：{line}（目标约 {words} 词）",
+    "Choose Thumbnail": "选择缩略图",
+    "Thumbnail Candidate {index}": "候选 {index}",
+    "Thumbnail Select Failed": "无法切换缩略图",
+    "Highlight Spoken Words": "高亮正在念的词",
+    "Highlight Spoken Words Help": "逐词高亮字幕：正在念的词会点亮。需要语音识别提供词级时间，取不到时自动退回整句字幕。"
   }
 }

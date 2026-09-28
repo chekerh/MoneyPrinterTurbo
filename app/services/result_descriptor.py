@@ -318,12 +318,19 @@ def build_result_descriptor(
     layout: ProjectLayout,
     task_id: object,
     tools: MediaTools,
+    output_dir: Path | None = None,
 ) -> ResultDescriptor:
-    """枚举并探测一个任务的全部成片，返回描述符。不写盘。"""
+    """
+    枚举并探测一个任务的全部成片，返回描述符。不写盘。
+
+    成片现在落在 ``output_dir``（唯一长期留存的视频），不再在任务工作目录里
+    ——后者位于内存盘，任务结束就没了。``output_dir`` 为 ``None`` 时取配置
+    里的成片目录；显式传入便于测试。
+    """
     safe_task_id = _require_safe_task_id(task_id)
-    task_dir = layout.storage_root / "tasks" / safe_task_id
+    task_dir = layout.outputs_root / safe_task_id
     if not task_dir.is_dir():
-        raise ResultDescriptorError(f"任务目录不存在：{safe_task_id}")
+        raise ResultDescriptorError(f"成片目录不存在：{task_dir}")
 
     entries: list[ResultVideoEntry] = []
     for index, path in _enumerate_final_videos(task_dir):

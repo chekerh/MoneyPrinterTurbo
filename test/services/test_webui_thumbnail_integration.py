@@ -50,7 +50,9 @@ class _MainThumbnailFixture(unittest.TestCase):
             path.mkdir(parents=True, exist_ok=True)
 
         self.task_id = "task-thumbnail-smoke"
-        self.task_dir = self.storage / "tasks" / self.task_id
+        # 成片落在 outputs_root（唯一长期留存的视频），不在任务工作目录里。
+        self.task_dir = self.portfolio / "outputs" / self.task_id
+        self.task_dir.mkdir(parents=True, exist_ok=True)
         _make_video(self.task_dir / "final-1.mp4")
 
         self.layout = ProjectLayout(
@@ -223,5 +225,72 @@ def _panel_keys(source: str) -> list[str]:
     return sorted(set(found))
 
 
+class TestPanelRefreshesWhenBackgroundJobFinishes(unittest.TestCase):
+    """
+    后台作业完成后，界面必须自己更新。
+
+    这是异步化之后最容易漏掉的一环：作业在后台跑完了，但结果页是静态渲染的，
+    用户不点一下页面就永远看不到新缩略图——功能看起来像坏了。
+    """
+
+    def test_refresh_is_requested_only_after_every_job_reaches_a_terminal_state(self):
+        from webui.thumbnail_panel import _should_request_refresh
+
+        def rec(state):
+            return {"job_id": state, "task_id": "t", "state": state, "created_at": 0.0,
+                    "updated_at": 0.0, "video_index": 1, "error": "", "artifact_id": ""}
+
+        # 还没有作业：不该触发刷新，否则会变成永远停不下来的轮询
+        self.assertFalse(_should_request_refresh([]))
+        # 仍有在途作业：不刷新
+        self.assertFalse(_should_request_refresh([rec("running")]))
+        self.assertFalse(_should_request_refresh([rec("queued")]))
+        # 混合状态也还不刷新
+        self.assertFalse(_should_request_refresh([rec("succeeded"), rec("running")]))
+        # 全部结束：立刻刷新，让新产物出现
+        self.assertTrue(_should_request_refresh([rec("succeeded")]))
+        self.assertTrue(_should_request_refresh([rec("failed"), rec("succeeded")]))
+        self.assertTrue(_should_request_refresh([rec("cancelled")]))
+
+    def test_result_view_watches_for_job_completion(self):
+        """
+        结构性断言：结果视图里确实挂了一个会轮询的 fragment。
+        没有它，后台作业跑完也不会反映到界面上。
+        """
+        source = WEBUI_MAIN.read_text(encoding="utf-8")
+        self.assertIn("_thumbnail_job_watch", source)
+        self.assertIn("@st.fragment", source)
+        # 轮询片段必须在缩略图段落里被调用
+        watch_call = source.index("_thumbnail_job_watch(task_id, str(thumbnail_root))")
+        section = source.index("def _render_thumbnail_section")
+        self.assertLess(section, watch_call)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUnconfiguredFeatureExplainsItself(unittest.TestCase):
+    """
+    作品集根没配时，功能必须失败关闭（不猜目录），但不能静默消失。
+
+    之前 _cached_project_layout() 返回 None 就直接 return，用户看到的是
+    "成片下面什么都没有"，和"功能坏了"完全无法区分。这里要求给出一条
+    说明，让用户知道功能只是没开、以及怎么打开。
+    """
+
+    def test_layout_failure_is_reported_to_the_user(self):
+        source = WEBUI_MAIN.read_text(encoding="utf-8")
+        start = source.index("def _render_thumbnail_section")
+        body = source[start : start + 1600]
+        self.assertIn(
+            "_thumbnail_unavailable_notice",
+            body,
+            "布局不可用时必须给出说明，而不是静默 return",
+        )
+
+    def test_notice_names_the_setting_the_user_must_change(self):
+        source = WEBUI_MAIN.read_text(encoding="utf-8")
+        start = source.index("def _thumbnail_unavailable_notice")
+        body = source[start : start + 1200]
+        self.assertIn("portfolio_root", body)

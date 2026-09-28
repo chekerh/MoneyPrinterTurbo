@@ -67,7 +67,7 @@
     "Delete Task": "Удалить задачу",
     "Task Deleted": "Задача удалена",
     "Task Delete Failed": "Не удалось удалить задачу",
-    "Open Task Folder": "Открыть папку",
+    "Open Task Folder": "Открыть файлы задачи",
     "Generating Video Script and Keywords": "ИИ генерирует сценарий и ключевые слова...",
     "Generating Video Keywords": "ИИ генерирует ключевые слова...",
     "Video Keywords": "Ключевые слова видео (англ., необязательно)",
@@ -390,6 +390,23 @@
     "Thumbnail Overlay Invalid": "Текст поверх видео содержит недопустимые символы.",
     "Thumbnail Generate Failed": "Не удалось создать миниатюру. Предыдущая осталась без изменений.",
     "Thumbnail Record Failed": "Не удалось обновить запись миниатюр. Предыдущая осталась без изменений.",
-    "Thumbnail Archive Failed": "Не удалось архивировать эту миниатюру."
+    "Thumbnail Archive Failed": "Не удалось архивировать эту миниатюру.",
+    "Thumbnail Queued": "В очереди на генерацию.",
+    "Thumbnail Generating": "Создание миниатюры…",
+    "Thumbnail Queue Unavailable": "Не удалось поставить генерацию в очередь. Повторите попытку.",
+    "Open Archive Folder": "Открыть папку архива",
+    "Task Not Archived Yet": "Эта задача ещё не заархивирована",
+    "Video File Missing": "Видеофайл не найден: {name}",
+    "Video File Unreadable": "Видеофайл пуст или повреждён: {name}",
+    "Thumbnail unavailable": "Миниатюра недоступна",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "Задайте portfolio_root в секции [app] файла config.toml, чтобы включить миниатюры и планирование портфеля.",
+    "Niche": "Ниша",
+    "No Niche": "Без ниши",
+    "Niche Preview": "{name}: {line} (около {words} слов)",
+    "Choose Thumbnail": "Выбрать миниатюру",
+    "Thumbnail Candidate {index}": "Кандидат {index}",
+    "Thumbnail Select Failed": "Не удалось сменить миниатюру",
+    "Highlight Spoken Words": "Выделять произносимое слово",
+    "Highlight Spoken Words Help": "Субтитры по словам: произносимое слово выделяется. Нужны словесные метки из распознавания речи; без них возвращаются построчные субтитры."
   }
 }

@@ -67,7 +67,7 @@
     "Delete Task": "Görevi sil",
     "Task Deleted": "Görev silindi",
     "Task Delete Failed": "Görev silinemedi",
-    "Open Task Folder": "Klasörü aç",
+    "Open Task Folder": "Görev dosyalarını aç",
     "Generating Video Script and Keywords": "Yapay zeka video senaryosu ve anahtar kelimeleri oluşturuyor...",
     "Generating Video Keywords": "Yapay zeka video anahtar kelimelerini oluşturuyor...",
     "Video Keywords": "Video Anahtar Kelimeleri (İngilizce, İsteğe Bağlı)",
@@ -390,6 +390,23 @@
     "Thumbnail Overlay Invalid": "Kaplama metni izin verilmeyen karakterler içeriyor.",
     "Thumbnail Generate Failed": "Küçük resim oluşturulamadı. Önceki değişmedi.",
     "Thumbnail Record Failed": "Küçük resim kaydı güncellenemedi. Önceki değişmedi.",
-    "Thumbnail Archive Failed": "O küçük resim arşivlenemedi."
+    "Thumbnail Archive Failed": "O küçük resim arşivlenemedi.",
+    "Thumbnail Queued": "Oluşturma için sırada.",
+    "Thumbnail Generating": "Küçük resim oluşturuluyor…",
+    "Thumbnail Queue Unavailable": "Şu anda oluşturma sıraya alınamıyor. Tekrar deneyin.",
+    "Open Archive Folder": "Arşiv klasörünü aç",
+    "Task Not Archived Yet": "Bu görev henüz arşivlenmedi",
+    "Video File Missing": "Video dosyası bulunamadı: {name}",
+    "Video File Unreadable": "Video dosyası boş veya bozuk: {name}",
+    "Thumbnail unavailable": "Küçük resim kullanılamıyor",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "Küçük resimleri ve portföy planlamayı etkinleştirmek için config.toml'un [app] bölümünde portfolio_root ayarlayın.",
+    "Niche": "Niş",
+    "No Niche": "Niş yok",
+    "Niche Preview": "{name}: {line} (yaklaşık {words} kelime)",
+    "Choose Thumbnail": "Küçük resim seç",
+    "Thumbnail Candidate {index}": "Aday {index}",
+    "Thumbnail Select Failed": "Küçük resim değiştirilemedi",
+    "Highlight Spoken Words": "Okunan kelimeyi vurgula",
+    "Highlight Spoken Words Help": "Kelime kelime altyazı: okunan kelime vurgulanır. Konuşma tanımanın kelime zamanlamaları gerekir; yoksa tam satır altyazıya döner."
   }
 }

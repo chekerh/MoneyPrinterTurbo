@@ -384,6 +384,47 @@ def append_artifact(
     return manifest
 
 
+def select_artifact(manifest_path: Path, video_index: int, artifact_id: str) -> str:
+    """
+    把某个存活产物设为当前选中的缩略图。
+
+    追加产物时会自动把选择移到最新一张，但"最新"不等于"最好看"——
+    选帧必须由人来决定，这也是 YouTube 允许上传前指定缩略图的意义。
+    """
+    manifest = load_manifest(manifest_path)
+    video = _find_video(manifest, int(video_index))
+    target = None
+    for artifact in video["artifacts"]:
+        if artifact["artifact_id"] == artifact_id:
+            target = artifact
+            break
+    if target is None:
+        raise ThumbnailFilesError(
+            f"video {video_index} 没有产物 {artifact_id!r}"
+        )
+    if target["artifact_state"] != "live":
+        raise ThumbnailFilesError(
+            f"产物 {artifact_id!r} 已归档（{target['artifact_state']}），不能选为缩略图"
+        )
+
+    if video["selected_artifact_id"] == artifact_id:
+        return artifact_id
+    video["selected_artifact_id"] = artifact_id
+    manifest["manifest_revision"] = manifest["manifest_revision"] + 1
+    write_manifest(manifest_path.parent, _validate_manifest(manifest, manifest["task_id"]))
+    return artifact_id
+
+
+def artifact_path(manifest_path: Path, artifact_id: str) -> Path | None:
+    """返回某个产物在磁盘上的绝对路径；找不到返回 ``None``。"""
+    manifest = load_manifest(manifest_path)
+    for video in manifest["videos"]:
+        for artifact in video["artifacts"]:
+            if artifact["artifact_id"] == artifact_id:
+                return manifest_path.parent / artifact["relative_name"]
+    return None
+
+
 def read_selection(manifest_path: Path, video_index: int) -> str | None:
     """返回某个视频当前选中的产物 ID；没有则返回 ``None``。"""
     try:

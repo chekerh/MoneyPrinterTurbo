@@ -1,12 +1,14 @@
 import math
 import os
 import re
+import shutil
 import socket
 import threading
 import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from functools import partial
 from os import path
+from pathlib import Path
 from uuid import uuid4
 
 from loguru import logger
@@ -85,6 +87,65 @@ _VIDEO_MUSIC_PROVIDERS = {
         "display_name": "ElevenLabs",
     },
 }
+
+
+def resolve_task_channel(task_id: str, params) -> str:
+    """
+    决定这条视频属于哪个赛道。
+
+    优先级：显式 ``params.channel`` → 任务目录里的 ``plan_meta.json``（记录了
+    channel / topic）。都拿不到就是通用写法，不报错。
+    """
+    explicit = str(getattr(params, "channel", "") or "").strip()
+    if explicit:
+        return explicit
+    try:
+        from app.services.plan_meta import read_plan_meta
+        from app.utils.utils import task_dir
+
+        channel = read_plan_meta(task_dir(task_id)).get("channel")
+        if channel:
+            return str(channel).strip()
+    except Exception:  # noqa: BLE001 - 赛道识别失败不该挡住出片
+        pass
+    return ""
+
+
+def _purge_task_scratch(task_id: str, space=None) -> None:
+    """
+    任务结束后立刻删掉它的中间产物目录。
+
+    正常结束、失败、异常都会走到这里。成片已经落在 ``outputs_root``，
+    缩略图与结果描述符在应用 storage 里，都不受影响。
+
+    ``space`` 只为测试可注入而存在；生产路径一律用进程内那个全局内存盘。
+    """
+    try:
+        from app.utils.scratch import scratch_space
+
+        space = space if space is not None else scratch_space()
+        if space.root is None:
+            return
+        target = Path(space.root) / "tasks" / str(task_id)
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+    except Exception as exc:  # noqa: BLE001 - 清理失败不该影响任务结果
+        logger.warning(
+            f"failed to purge task scratch: task_id={task_id}, error={exc}"
+        )
+
+
+def _final_video_output_path(task_id: str, index: int) -> str:
+    """
+    最终成片的落盘位置：``output_dir/<task_id>/final-<index>.mp4``。
+
+    成片是唯一需要长期留存的视频，因此按任务分目录，避免不同任务的
+    ``final-1.mp4`` 互相覆盖。其余产物（配音、字幕、脚本、拼接片段、
+    下载的素材）都留在内存盘里，任务结束即消失。
+    """
+    from app.utils.storage_policy import final_video_dir
+
+    return os.path.join(final_video_dir(task_id), f"final-{index}.mp4")
 
 
 def _get_video_music_prompt(params: VideoParams) -> str:
@@ -296,6 +357,9 @@ def generate_script(task_id, params):
             paragraph_number=params.paragraph_number,
             video_script_prompt=params.video_script_prompt,
             custom_system_prompt=params.custom_system_prompt,
+            # 赛道决定品牌句、钩子写法和目标长度。认不出来就退回通用写法，
+            # 不能因为赛道名拼错就让整条视频生成失败。
+            channel=resolve_task_channel(task_id, params),
         )
     else:
         logger.debug(f"video script: \n{video_script}")
@@ -836,7 +900,9 @@ def generate_final_videos(
         _progress += 50 / params.video_count / 2
         sm.state.update_task(task_id, progress=_progress)
 
-        final_video_path = path.join(utils.task_dir(task_id), f"final-{index}.mp4")
+        # 最终成片是唯一需要长期留在磁盘上的东西：落在 output_dir，
+        # 而不是任务工作目录（那个在内存盘里，任务结束就没了）。
+        final_video_path = _final_video_output_path(task_id, index)
 
         # 视频配乐模式先明确禁用默认 BGM 解析，避免旧任务残留的 bgm_file 被
         # 误用。只有音量大于 0 才生成代理并调用付费 API；0 音量统一跳过。
@@ -1448,6 +1514,20 @@ def _run_pipeline(
         f"task {task_id} finished, generated {len(final_video_paths)} videos."
     )
 
+    # 记一笔赛道产出。这个账本刻意写在 storage/niche_stats.json——不在 tasks/
+    # 也不在内存盘里，否则清理一次就再也答不出"这个赛道一共做了几条"。
+    try:
+        from app.services.niche_stats import niche_ledger
+
+        niche_ledger().record(
+            resolve_task_channel(task_id, params),
+            params.video_subject,
+            task_id=task_id,
+            videos=len(final_video_paths),
+        )
+    except Exception as exc:  # noqa: BLE001 - 统计失败不该影响出片
+        logger.warning(f"failed to record niche stats: task_id={task_id}, error={exc}")
+
     # 7. 先完成视频生成任务，再按需提交跨平台发布。第三方上传可能耗时
     # 数分钟，不应阻塞视频结果返回，也不能反向影响已经生成的成片。
     upload_post_ready = (
@@ -1626,6 +1706,10 @@ def start(
             "pipeline",
             f"{type(exc).__name__}: {exc}",
         )
+    finally:
+        # 中间产物用完即删：脚本、字幕、配音、拼接片段、AI 生成的 BGM。
+        # 成片不在这里（在 outputs_root），所以这一步不会碰到要交付的东西。
+        _purge_task_scratch(task_id)
 
 
 if __name__ == "__main__":

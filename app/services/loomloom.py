@@ -18,6 +18,8 @@ from urllib.parse import quote, urlsplit
 import requests
 from loguru import logger
 
+from app.services.http_session import session_manager
+
 
 DEFAULT_RESULT_PORT_NAME = "output"
 DEFAULT_BASE_URL = "https://loomloom.shengsuanyun.com/loom/v1"
@@ -272,7 +274,8 @@ class LoomLoomScriptBackend:
     ):
         settings.validate(require_api_token=credential_provider is None)
         self.settings = settings
-        self._session = session or requests.Session()
+        # Use pooled session manager for connection reuse and retry handling
+        self._session = session or session_manager.get_session(settings.base_url)
         self._credential_provider = credential_provider or (lambda: settings.api_token)
         self._sleep = sleep
         self._clock = clock

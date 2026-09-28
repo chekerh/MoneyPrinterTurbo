@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import time
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -23,18 +25,15 @@ from app.services.result_descriptor import ResultDescriptor
 from app.services.thumbnail import (
     MAX_OVERLAY_CHARS,
     ThumbnailError,
-    ThumbnailSpec,
-    render_thumbnail,
 )
 from app.services.thumbnail_files import (
     MAX_LIVE_ARTIFACTS_PER_VIDEO,
     ThumbnailFilesError,
-    append_artifact,
     archive_artifact,
     load_manifest,
-    next_artifact_id,
+    select_artifact,
 )
-from app.utils.strict_media_tools import MediaTools
+from app.services.thumbnail import CANDIDATE_FRAME_COUNT as FRAME_CANDIDATE_COUNT
 
 __all__ = [
     "MAX_OVERLAY_CHARS",
@@ -222,21 +221,98 @@ def _default_font() -> Path:
     return Path(resource_dir("fonts")) / "Charm-Regular.ttf"
 
 
+def _pending_job_for(task_id: str, video_index: int):
+    """返回该视频当前未结束的作业记录；没有则返回 ``None``。只读。"""
+    from app.services.thumbnail_jobs import TERMINAL_STATES, get_job_manager
+
+    try:
+        manager = get_job_manager(Path(_job_root_for(task_id)))
+    except Exception:  # noqa: BLE001 - 状态查询失败不应让面板崩掉
+        return None
+    candidates = [
+        job
+        for job in manager.list_jobs(task_id)
+        if job["video_index"] == video_index and job["state"] not in TERMINAL_STATES
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda job: job["created_at"])
+
+
+def _job_summary(tr: Callable[[str], str], job) -> None:
+    """把作业状态渲染成一行提示。只读，不触发任何工作。"""
+    import streamlit as st
+
+    if job["state"] == "queued":
+        st.info(tr("Thumbnail Queued"))
+    elif job["state"] == "running":
+        with st.spinner(tr("Thumbnail Generating")):
+            time.sleep(0.2)
+
+
+_JOB_ROOT_CACHE: dict[str, Path] = {}
+
+
+def _should_request_refresh(records) -> bool:
+    """
+    是否应当触发一次整页刷新。
+
+    只有当**确实有过作业**并且**现在全部结束**时才刷新。空列表返回 False
+    是关键：否则一个没有任何待办任务的结果页会不停地自我刷新，把 CPU 和
+    浏览器电量吃光。
+    """
+    from app.services.thumbnail_jobs import TERMINAL_STATES
+
+    if not records:
+        return False
+    return all(record["state"] in TERMINAL_STATES for record in records)
+
+
+def watch_for_completion(task_id: str, thumbnail_root: Path) -> bool:
+    """
+    检查该任务是否还有在途缩略图作业；有则返回 ``True``，交给调用方挂轮询。
+
+    只读：不触发任何渲染。
+    """
+    from app.services.thumbnail_jobs import get_job_manager
+
+    _JOB_ROOT_HOLDER[task_id] = str(thumbnail_root)
+    try:
+        manager = get_job_manager(Path(thumbnail_root))
+        return manager.has_pending(task_id)
+    except Exception:  # noqa: BLE001 - 状态查询失败不应让面板崩掉
+        return False
+
+
+def _job_root_for(task_id: str) -> str:
+    return _JOB_ROOT_HOLDER.get(task_id, "")
+
+
+_JOB_ROOT_HOLDER: dict[str, str] = {}
+
+
 def render_thumbnail_panel(
     descriptor: ResultDescriptor,
     manifest_path: Path,
     thumbnail_root: Path,
     source_root: Path,
-    tools: MediaTools,
     tr: Callable[[str], str],
     font_path: Path | None = None,
 ) -> None:
     """
-    渲染面板。仅在按钮回调里才会调用 :func:`render_thumbnail`。
+    渲染面板。
+
+    点击"生成"只登记一个后台作业就返回，FFmpeg 跑在
+    :mod:`app.services.thumbnail_jobs` 的工作线程上。这样请求线程不会被最长
+    30 秒的抽帧冻住，界面靠轮询作业状态更新。
 
     :param source_root: 成片所在目录（通常是 ``storage/tasks/<task_id>``）。
         描述符是纯数据，不持有文件系统句柄，因此源路径由调用方给出，
         相对名仍然只取自描述符。
+
+    这里刻意不接受工具链参数：渲染已经移到后台线程，工具链由
+    :mod:`app.services.thumbnail_jobs` 在进程内共享解析一次，调用方再传一份
+    只会造成"面板以为解析好了、后台其实没解析"的分歧。
     """
     import streamlit as st
 
@@ -276,23 +352,60 @@ def render_thumbnail_panel(
         if st.session_state.get(error_key):
             st.error(tr(st.session_state[error_key]))
 
-        button_label = tr("Thumbnail Regenerate" if row.selected_artifact_id else "Thumbnail Generate")
+        job = _pending_job_for(task_id, entry.video_index)
+        if job is not None:
+            _job_summary(tr, job)
+            st.divider()
+            continue
+
+        button_label = tr(
+            "Thumbnail Regenerate" if row.selected_artifact_id else "Thumbnail Generate"
+        )
         if st.button(
             button_label,
             key=f"thumbnail_generate_{task_id}_{entry.video_index}",
             disabled=not row.can_generate,
         ):
-            _generate_one(
+            _submit_one(
                 descriptor=descriptor,
                 entry=entry,
                 root=root,
                 source_root=Path(source_root),
-                manifest_path=Path(manifest_path),
-                tools=tools,
                 font=font,
                 overlay=overlay,
                 error_key=error_key,
             )
+            # 提交失败时要立刻显示。上面的检查发生在点击之前，只看它的话
+            # 消息要等到下一次重跑才出现——正好是用户最想看到它的时刻。
+            if st.session_state.get(error_key):
+                st.error(tr(st.session_state[error_key]))
+
+        # 选帧：一次生成多张，让用户挑最好看的那一个。
+        # YouTube 允许上传前指定缩略图，所以"哪张最好看"必须是人的决定，
+        # 而不是"最后生成的那张"自动胜出。
+        if row.selected_artifact_id and len(row.archivable_ids) + 1 > 1:
+            options = [row.selected_artifact_id, *row.archivable_ids]
+            labels = {
+                aid: tr("Thumbnail Candidate {index}").format(index=pos + 1)
+                for pos, aid in enumerate(options)
+            }
+            chosen = st.radio(
+                tr("Choose Thumbnail"),
+                options=options,
+                index=0,
+                format_func=lambda aid: labels.get(aid, aid[:8]),
+                key=f"thumbnail_pick_{task_id}_{entry.video_index}",
+                horizontal=True,
+            )
+            if chosen and chosen != row.selected_artifact_id:
+                _select_one(
+                    manifest_path=Path(manifest_path),
+                    task_id=task_id,
+                    video_index=entry.video_index,
+                    artifact_id=chosen,
+                    error_key=error_key,
+                )
+                st.rerun()
 
         if row.needs_archive and row.archivable_ids:
             st.caption(tr("Thumbnail Storage Full"))
@@ -312,19 +425,21 @@ def render_thumbnail_panel(
         st.divider()
 
 
-def _generate_one(
+def _submit_one(
     descriptor: ResultDescriptor,
     entry,
     root: Path,
     source_root: Path,
-    manifest_path: Path,
-    tools: MediaTools,
     font: Path,
     overlay: str,
     error_key: str,
 ) -> None:
-    """执行一次生成，并把结果追加进清单。失败时保留错误消息。"""
+    """登记一个后台生成作业。立刻返回，不做任何渲染。"""
+    import hashlib
+
     import streamlit as st
+
+    from app.services.thumbnail_jobs import get_job_manager
 
     try:
         text = normalize_overlay_text(overlay)
@@ -332,55 +447,25 @@ def _generate_one(
         st.session_state[error_key] = str(exc)
         return
 
+    request = {
+        "source": str(source_root / entry.relative_name),
+        "overlay_text": text or "",
+        "font_path": str(font),
+        "video_index": entry.video_index,
+        "source_sha256": entry.sha256,
+        "overlay_sha256": hashlib.sha256((text or "").encode("utf-8")).hexdigest(),
+        # 一次渲染多个时刻，让用户挑最好看的那张。只给一个时刻的话，
+        # "选帧"这个最关键的创作决定就被省掉了。
+        "frame_candidates": FRAME_CANDIDATE_COUNT,
+    }
 
-    artifact_id = next_artifact_id()
-    staged = root / f".pending-{artifact_id}.jpg"
+    _JOB_ROOT_HOLDER[descriptor.task_id] = str(root)
     try:
-        result = render_thumbnail(
-            ThumbnailSpec(
-                source=source_root / entry.relative_name,
-                output=staged,
-                overlay_text=text or "",
-                font_path=font,
-                duration_ms=entry.duration_ms,
-            ),
-            tools=tools,
-        )
-        final = root / f"thumbnail-{artifact_id}.jpg"
-        staged.replace(final)
-
-        manifest = load_manifest(manifest_path, expected_task_id=descriptor.task_id) \
-            if manifest_path.is_file() else _empty_manifest(descriptor.task_id)
-        append_artifact(
-            root,
-            descriptor.task_id,
-            {
-                "artifact_id": artifact_id,
-                "video_index": entry.video_index,
-                "parent_artifact_id": None,
-                "previous_artifact_id": None,
-                "relative_name": final.name,
-                "source_sha256": entry.sha256,
-                "output_sha256": result.output_sha256,
-                "overlay_sha256": _text_digest(text or ""),
-                "font_id": result.font_id,
-                "frame_at_seconds": result.frame_at_seconds,
-                "width": result.width,
-                "height": result.height,
-                "bytes": result.output_bytes,
-                "created_at": _now(),
-                "artifact_state": "live",
-                "purged_at": None,
-            },
-            expected_revision=manifest["manifest_revision"],
-        )
-        st.session_state.pop(error_key, None)
-    except ThumbnailError:
-        staged.unlink(missing_ok=True)
-        st.session_state[error_key] = "Thumbnail Generate Failed"
-    except (ThumbnailFilesError, OSError):
-        staged.unlink(missing_ok=True)
-        st.session_state[error_key] = "Thumbnail Record Failed"
+        get_job_manager(root).submit(descriptor.task_id, request)
+    except (RuntimeError, OSError):
+        st.session_state[error_key] = "Thumbnail Queue Unavailable"
+        return
+    st.session_state.pop(error_key, None)
 
 
 def _archive_one(
@@ -393,6 +478,18 @@ def _archive_one(
         st.session_state.pop(error_key, None)
     except (ThumbnailFilesError, OSError):
         st.session_state[error_key] = "Thumbnail Archive Failed"
+
+
+def _select_one(
+    manifest_path: Path, task_id: str, video_index: int, artifact_id: str, error_key: str
+) -> None:
+    import streamlit as st
+
+    try:
+        select_artifact(manifest_path, video_index, artifact_id)
+        st.session_state.pop(error_key, None)
+    except (ThumbnailFilesError, OSError):
+        st.session_state[error_key] = "Thumbnail Select Failed"
 
 
 def _empty_manifest(task_id: str) -> dict:

@@ -216,6 +216,11 @@ def test_completed_task_renders_subject_named_video_download(
         "st": fake_st,
         "tr": lambda key: key,
         "_render_generation_logs": lambda _task_id: None,
+        # 成片渲染统一走 _render_video_player（按真实宽高比决定播放器尺寸，
+        # 损坏文件改为提示而不是渲染坏掉的播放器）。本用例关注的是下载按钮，
+        # 播放器尺寸与完整性校验由 test_webui_task_history.py 覆盖，这里替换成
+        # 只记录路径的实现，保持用例边界不变。
+        "_render_video_player": lambda video_path: fake_st.videos.append(video_path),
         # 缩略图面板由 test_webui_thumbnail_integration.py 单独覆盖；
         # 这里只测下载按钮，因此按同样的约定把协作函数替换成空实现。
         "_render_thumbnail_section": lambda _task_id: None,

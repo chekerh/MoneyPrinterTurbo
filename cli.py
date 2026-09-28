@@ -126,6 +126,8 @@ _TRANSITION_MODE_VALUES = {
     "fade-out": "FadeOut",
     "slide-in": "SlideIn",
     "slide-out": "SlideOut",
+    "zoom-in": "ZoomIn",
+    "zoom-out": "ZoomOut",
 }
 
 
@@ -143,11 +145,29 @@ def _bgm_type(value: str) -> str:
     normalized = value.strip().lower()
     if normalized == "none":
         return ""
-    if normalized in {"", "random", "custom", "sonilo"}:
+    if normalized in {"", "random", "custom", "sonilo", "elevenlabs", "blastoff"}:
         return normalized
     raise argparse.ArgumentTypeError(
-        "bgm-type must be one of: none, random, custom, sonilo"
+        "bgm-type must be one of: none, random, custom, sonilo, elevenlabs, blastoff"
     )
+
+
+def _clip_speed(value: str) -> float:
+    speed = _non_negative_float(value)
+    if not 0.5 <= speed <= 2.0:
+        raise argparse.ArgumentTypeError(
+            "video-clip-speed must be a finite number between 0.5 and 2.0"
+        )
+    return speed
+
+
+def _music_prompt(value: str) -> str:
+    normalized = value.strip()
+    if len(normalized) > 2000:
+        raise argparse.ArgumentTypeError(
+            "video-music-prompt must be at most 2000 characters"
+        )
+    return normalized
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -304,8 +324,17 @@ Batch manifests:
         "--video-transition-mode",
         type=_transition_mode,
         default=None,
-        metavar="{none,shuffle,fade-in,fade-out,slide-in,slide-out}",
+        metavar="{none,shuffle,fade-in,fade-out,slide-in,slide-out,zoom-in,zoom-out}",
         help="transition applied between source clips (default: none)",
+    )
+    video_group.add_argument(
+        "--video-clip-speed",
+        type=_clip_speed,
+        default=None,
+        help=(
+            "playback speed multiplier applied to each source clip, a finite "
+            "number between 0.5 and 2.0 (default: 1.0)"
+        ),
     )
     video_group.add_argument(
         "--video-clip-duration",
@@ -376,10 +405,11 @@ Batch manifests:
         "--bgm-type",
         type=_bgm_type,
         default=None,
-        metavar="{none,random,custom,sonilo}",
+        metavar="{none,random,custom,sonilo,elevenlabs}",
         help=(
             "background music mode; Sonilo reads its API key from config.toml or "
-            "SONILO_API_KEY; --bgm-file implies custom when omitted "
+            "SONILO_API_KEY and ElevenLabs Music reads its API key from config.toml "
+            "or ELEVENLABS_API_KEY; --bgm-file implies custom when omitted "
             "(default: random)"
         ),
     )
@@ -387,6 +417,17 @@ Batch manifests:
         "--sonilo-bgm-prompt",
         default=None,
         help="optional music style prompt for Sonilo, up to 2000 characters",
+    )
+    audio_group.add_argument(
+        "--video-music-prompt",
+        type=_music_prompt,
+        default=None,
+        metavar="TEXT",
+        help=(
+            "optional music style prompt for the AI background music provider "
+            "selected by --bgm-type (Sonilo or ElevenLabs Music), up to 2000 "
+            "characters"
+        ),
     )
     audio_group.add_argument(
         "--bgm-file",
@@ -529,6 +570,24 @@ Batch manifests:
             "generates a UUID for every task"
         ),
     )
+
+    publish_group = parser.add_argument_group("YouTube publishing")
+    publish_mode = publish_group.add_mutually_exclusive_group()
+    publish_mode.add_argument(
+        "--youtube-authorize",
+        action="store_true",
+        help=(
+            "run the one-time Google OAuth flow and save the token to "
+            "storage/credentials/youtube_token.json; requires "
+            "youtube_upload_client_id and youtube_upload_client_secret "
+            "in config.toml"
+        ),
+    )
+    publish_mode.add_argument(
+        "--youtube-status",
+        action="store_true",
+        help="show which YouTube channel is linked by the saved OAuth token",
+    )
     args = parser.parse_args(argv)
 
     if (
@@ -536,7 +595,12 @@ Batch manifests:
         and not args.video_subject.strip()
         and not args.video_script.strip()
     ):
-        parser.error("one of --video-subject or --video-script is required")
+        if not (args.youtube_authorize or args.youtube_status):
+            parser.error("one of --video-subject or --video-script is required")
+    if (args.youtube_authorize or args.youtube_status) and args.batch_file:
+        parser.error(
+            "--youtube-authorize/--youtube-status cannot be combined with --batch-file"
+        )
 
     if not args.batch_file and args.video_source == "local" and args.stop_at == "terms":
         parser.error(
@@ -581,6 +645,15 @@ Batch manifests:
         elif not args.batch_file:
             parser.error(
                 "--sonilo-bgm-prompt can only be combined with --bgm-type sonilo"
+            )
+
+    if args.video_music_prompt:
+        if args.bgm_type in (None, "elevenlabs"):
+            args.bgm_type = "elevenlabs"
+        elif args.bgm_type not in {"sonilo", "elevenlabs"} and not args.batch_file:
+            parser.error(
+                "--video-music-prompt can only be combined with --bgm-type sonilo "
+                "or --bgm-type elevenlabs"
             )
 
     if (
@@ -722,6 +795,7 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
         "video_concat_mode",
         "video_transition_mode",
         "video_clip_duration",
+        "video_clip_speed",
         "match_materials_to_script",
         "n_threads",
         "voice_volume",
@@ -731,6 +805,7 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
         "bgm_file",
         "bgm_volume",
         "sonilo_bgm_prompt",
+        "video_music_prompt",
         "font_name",
         "subtitle_position",
         "custom_position",
@@ -1045,12 +1120,14 @@ def _validate_batch_task_params(
         if value is not None and value < 1:
             raise ValueError(f"{name} must be >= 1")
 
-    if params.bgm_type not in {"", "random", "custom", "sonilo"}:
-        raise ValueError("bgm_type must be one of: none, random, custom, sonilo")
+    if params.bgm_type not in {"", "random", "custom", "sonilo", "elevenlabs"}:
+        raise ValueError("bgm_type must be one of: none, random, custom, sonilo, elevenlabs")
     if params.bgm_file and params.bgm_type != "custom":
         raise ValueError("bgm_file requires bgm_type=custom")
     if params.sonilo_bgm_prompt and params.bgm_type != "sonilo":
         raise ValueError("sonilo_bgm_prompt requires bgm_type=sonilo")
+    if params.video_music_prompt and params.bgm_type not in {"sonilo", "elevenlabs"}:
+        raise ValueError("video_music_prompt requires bgm_type=sonilo or bgm_type=elevenlabs")
 
 
 def _build_batch_tasks(args: argparse.Namespace) -> list[VideoParams]:
@@ -1446,6 +1523,17 @@ def _run_batch_tasks(args: argparse.Namespace, tasks: list[VideoParams]) -> int:
 
 def run_cli(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+
+    if args.youtube_authorize or args.youtube_status:
+        from app.services import youtube_upload
+
+        if args.youtube_authorize:
+            result = youtube_upload.authorize()
+        else:
+            result = youtube_upload.channel_info()
+        print(json.dumps(result, ensure_ascii=False, default=str))
+        return 0 if result.get("success") else 1
+
     if args.batch_file:
         try:
             tasks = _build_batch_tasks(args)

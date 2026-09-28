@@ -67,7 +67,7 @@
     "Delete Task": "Aufgabe löschen",
     "Task Deleted": "Aufgabe gelöscht",
     "Task Delete Failed": "Aufgabe konnte nicht gelöscht werden",
-    "Open Task Folder": "Ordner öffnen",
+    "Open Task Folder": "Aufgabendateien öffnen",
     "Generating Video Script and Keywords": "KI generiert ein Drehbuch und Schlüsselwörter...",
     "Generating Video Keywords": "KI generiert Video-Schlüsselwörter...",
     "Video Keywords": "Video-Keywords (Englisch, optional)",
@@ -390,6 +390,23 @@
     "Thumbnail Overlay Invalid": "Der Overlay-Text enthält unzulässige Zeichen.",
     "Thumbnail Generate Failed": "Miniaturansicht konnte nicht erstellt werden. Die vorherige bleibt unverändert.",
     "Thumbnail Record Failed": "Der Miniaturansicht-Datensatz konnte nicht aktualisiert werden. Die vorherige bleibt unverändert.",
-    "Thumbnail Archive Failed": "Diese Miniaturansicht konnte nicht archiviert werden."
+    "Thumbnail Archive Failed": "Diese Miniaturansicht konnte nicht archiviert werden.",
+    "Thumbnail Queued": "Zur Erzeugung eingereiht.",
+    "Thumbnail Generating": "Miniaturansicht wird erstellt…",
+    "Thumbnail Queue Unavailable": "Die Erzeugung kann derzeit nicht eingereiht werden. Bitte erneut versuchen.",
+    "Open Archive Folder": "Archivordner öffnen",
+    "Task Not Archived Yet": "Diese Aufgabe wurde noch nicht archiviert",
+    "Video File Missing": "Videodatei fehlt: {name}",
+    "Video File Unreadable": "Videodatei ist leer oder beschädigt: {name}",
+    "Thumbnail unavailable": "Miniaturansicht nicht verfügbar",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "Setzen Sie portfolio_root im Abschnitt [app] der config.toml, um Miniaturansichten und Portfolio-Planung zu aktivieren.",
+    "Niche": "Nische",
+    "No Niche": "Keine Nische",
+    "Niche Preview": "{name}: {line} (etwa {words} Wörter)",
+    "Choose Thumbnail": "Miniaturansicht wählen",
+    "Thumbnail Candidate {index}": "Kandidat {index}",
+    "Thumbnail Select Failed": "Miniaturansicht konnte nicht gewechselt werden",
+    "Highlight Spoken Words": "Gesprochenes Wort hervorheben",
+    "Highlight Spoken Words Help": "Wortweise Untertitel: Das gesprochene Wort wird hervorgehoben. Erfordert Wortzeitstempel aus der Spracherkennung; fällt sonst auf ganze Zeilen zurück."
   }
 }

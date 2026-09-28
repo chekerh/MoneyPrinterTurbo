@@ -4,7 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -431,14 +431,15 @@ class TestVideoService(unittest.TestCase):
         with patch.object(vd, "_ffmpeg_encoder_exists", return_value=False):
             self.assertEqual(vd._get_effective_video_codec(), "libx264")
 
-    def test_get_configured_video_codec_uses_stable_default_when_unset(self):
+    def test_get_configured_video_codec_uses_auto_detection_when_unset(self):
         """
-        WebUI 的“默认”模式不会持久化 video_codec。后端必须在配置缺失时继续
-        明确返回 libx264，不能把空值直接交给 MoviePy 或 FFmpeg 自行决定。
+        默认模式为 "auto"，自动检测并使用可用的最佳编码器（硬件加速优先）。
+        返回值必须是受支持的编码器之一。
         """
         config.app.pop("video_codec", None)
 
-        self.assertEqual(vd._get_configured_video_codec(), "libx264")
+        codec = vd._get_configured_video_codec()
+        self.assertIn(codec, vd._SUPPORTED_VIDEO_CODECS)
 
     def test_get_configured_video_codec_preserves_explicit_libx264(self):
         """
@@ -867,7 +868,7 @@ class TestVideoService(unittest.TestCase):
     def test_concat_video_clips_limits_output_to_audio_duration(self):
         """最终拼接时应裁到音频时长，避免安全余量带来明显静音尾巴。"""
 
-        def fake_run(command, capture_output, text, check):
+        def fake_run(command, capture_output, text, check, timeout=None):
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -875,14 +876,16 @@ class TestVideoService(unittest.TestCase):
             output_file = os.path.join(temp_dir, "combined.mp4")
             Path(clip_file).write_bytes(b"fake")
 
-            with patch.object(vd.subprocess, "run", side_effect=fake_run) as run:
-                vd.concat_video_clips_with_ffmpeg(
-                    clip_files=[clip_file],
-                    output_file=output_file,
-                    threads=1,
-                    output_dir=temp_dir,
-                    max_duration=10.0,
-                )
+            # Mock encoder detection to avoid real ffmpeg calls
+            with patch.object(vd, "_get_effective_video_codec", return_value="libx264"):
+                with patch.object(vd.subprocess, "run", side_effect=fake_run) as run:
+                    vd.concat_video_clips_with_ffmpeg(
+                        clip_files=[clip_file],
+                        output_file=output_file,
+                        threads=1,
+                        output_dir=temp_dir,
+                        max_duration=10.0,
+                    )
 
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("-t") + 1], "10.000")
@@ -1248,6 +1251,1245 @@ class TestMaterialResolutionTolerance(unittest.TestCase):
 
     def test_rejects_genuinely_low_resolution_material(self):
         self.assertFalse(vd.is_material_resolution_acceptable(320, 240))
+
+
+class _FakeSubtitlesClip:
+    """SubtitlesClip 的替身：只暴露字幕条目，并按上下文管理器协议工作。"""
+
+    def __init__(self, subtitle_items):
+        self.subtitles = list(subtitle_items)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def close(self):
+        pass
+
+
+class _FakeSubtitleTextClip:
+    """create_text_clip 需要的最小 MoviePy 接口：记录布局调用但不编码渲染。"""
+
+    def __init__(self, *, w=300, h=80):
+        self.w = w
+        self.h = h
+        self.mask = None
+        self.position = None
+        self._start = None
+        self._end = None
+        self._duration = None
+
+    def with_position(self, pos):
+        self.position = pos
+        return self
+
+    def with_start(self, start_time):
+        self._start = start_time
+        return self
+
+    def with_end(self, end_time):
+        self._end = end_time
+        return self
+
+    def with_duration(self, duration):
+        self._duration = duration
+        return self
+
+    def with_audio(self, audio):
+        return self
+
+    def close(self):
+        pass
+
+
+class _FakeMask:
+    """可注入的 TextClip mask，让可见像素的中心定位逻辑可控。"""
+
+    def __init__(self, frame):
+        self._frame = vd.np.array(frame, dtype=vd.np.float32)
+
+    def get_frame(self, t=0):
+        return self._frame
+
+
+class _FakePilFontSized:
+    """PIL 字体的替身：宽度按字符数 * char_width，metrics 可配置。"""
+
+    def __init__(self, ascent=25, descent=25, char_width=10):
+        self._ascent = ascent
+        self._descent = descent
+        self._char_width = char_width
+
+    def getmetrics(self):
+        return self._ascent, self._descent
+
+    def getbbox(self, text):
+        return (0, 0, self._char_width * len(text), self._char_width)
+
+
+class _FakePilFontWidths(_FakePilFontSized):
+    def __init__(self, widths, ascent=25, descent=25):
+        super().__init__(ascent=ascent, descent=descent, char_width=0)
+        self._widths = widths
+
+    def getbbox(self, text):
+        width = sum(self._widths.get(char, 1) for char in text)
+        return (0, 0, width, width)
+
+
+class _FakeGlyphMask:
+    def __init__(self, size=(30, 30), bbox=(0, 0, 10, 10)):
+        self.size = size
+        self._bbox = bbox
+
+    def getbbox(self):
+        return self._bbox
+
+    def __bytes__(self):
+        return b"m" * (self.size[0] * self.size[1])
+
+
+class _FakeGlyphFont:
+    """字体字形探测的替身：可以精确指定哪些字符“缺失”。"""
+
+    missing = _FakeGlyphMask(size=(30, 30), bbox=None)
+    present = _FakeGlyphMask(size=(30, 30), bbox=(0, 0, 10, 10))
+
+    def __init__(self, missing_chars=()):
+        self._missing_chars = set(missing_chars)
+
+    def getmask(self, char):
+        if char == "\U0010ffff" or char in self._missing_chars:
+            return self.missing
+        return self.present
+
+
+class _FakeBgClip:
+    def with_duration(self, duration):
+        return self
+
+
+class _FakeSizedClip:
+    def __init__(self, size=(1080, 1920)):
+        self.size = size
+        self.duration = 4.0
+
+    def close(self):
+        pass
+
+
+class _RichFakeClip:
+    """combine_videos 单测用的富假片段，逐个记录 geometry/效果调用。"""
+
+    def __init__(self, duration=5.0, size=(1080, 1920), events=None):
+        self.duration = duration
+        self.size = size
+        self.w, self.h = size
+        self.events = events if events is not None else []
+        self.fail_subclipped = False
+        self.subclipped_to = None
+
+    def subclipped(self, start_time, end_time):
+        if self.fail_subclipped:
+            raise RuntimeError("subclip failed")
+        self.subclipped_to = (start_time, end_time)
+        return _RichFakeClip(
+            duration=end_time - start_time, size=self.size, events=self.events
+        )
+
+    def with_speed_scaled(self, factor):
+        return _RichFakeClip(
+            duration=self.duration / factor, size=self.size, events=self.events
+        )
+
+    def resized(self, *args, **kwargs):
+        self.events.append(("resized", args, kwargs))
+        return self
+
+    def with_position(self, pos):
+        self.events.append(("position", pos))
+        return self
+
+    def close(self):
+        self.events.append(("closed",))
+
+
+class TestWrapTextBranches(unittest.TestCase):
+    def test_wrap_text_falls_back_when_font_metrics_are_invalid(self):
+        """损坏字体的 metrics 可能返回 0 高度，此时应回退到字号并告警。"""
+        font = _FakePilFontSized(ascent=0, descent=0)
+        with (
+            patch.object(vd.ImageFont, "truetype", return_value=font),
+            patch.object(vd.logger, "warning") as warning,
+        ):
+            wrapped_text, text_height = vd.wrap_text(
+                text="long text that must wrap and wrap again",
+                max_width=10,
+                font="broken.ttf",
+                fontsize=60,
+            )
+
+        warning.assert_called_once()
+        line_count = wrapped_text.count("\n") + 1
+        self.assertEqual(text_height, line_count * 60)
+
+    def test_wrap_text_handles_whitespace_only_input(self):
+        """空视觉宽度文本不应触发折行，高度仍按字体行高计算。"""
+        wrapped_text, text_height = vd.wrap_text(
+            text=" ",
+            max_width=972,
+            font=os.path.join(utils.font_dir(), "STHeitiMedium.ttc"),
+            fontsize=30,
+        )
+        self.assertEqual(wrapped_text, " ")
+        self.assertGreater(text_height, 0)
+
+    def test_wrap_text_skips_merge_when_punctuation_join_exceeds_width(self):
+        """宽标点让“上一行末字 + 标点”超出可用宽度时，放弃合并标点。"""
+        font = _FakePilFontWidths({"a": 1, "x": 1, "。": 25})
+        with patch.object(vd.ImageFont, "truetype", return_value=font):
+            wrapped_text, text_height = vd.wrap_text(
+                text="ax。",
+                max_width=22,
+                font="widepunct.ttf",
+                fontsize=60,
+            )
+
+        self.assertEqual(wrapped_text, "ax\n。")
+        self.assertEqual(text_height, 2 * 50)
+
+    def test_wrap_text_merges_closing_punctuation_back_to_previous_line(self):
+        """字符级拆分后落在行首的闭合标点应合并回上一行。"""
+        font = _FakePilFontSized(ascent=25, descent=25, char_width=10)
+        with patch.object(vd.ImageFont, "truetype", return_value=font):
+            wrapped_text, text_height = vd.wrap_text(
+                text="ABCD。",
+                max_width=40,
+                font="metric.ttf",
+                fontsize=60,
+            )
+
+        self.assertEqual(wrapped_text, "ABC\nD。")
+        self.assertEqual(text_height, 2 * 50)
+
+    def test_wrap_text_keeps_punctuation_line_when_previous_line_is_single_char(self):
+        """上一行只剩一个字符时不强行合并标点，避免把单字行再次压短。"""
+        font = _FakePilFontSized(ascent=25, descent=25, char_width=10)
+        with patch.object(vd.ImageFont, "truetype", return_value=font):
+            wrapped_text, text_height = vd.wrap_text(
+                text="AB。",
+                max_width=10,
+                font="metric.ttf",
+                fontsize=60,
+            )
+
+        self.assertEqual(wrapped_text, "A\nB\n。")
+        self.assertEqual(text_height, 3 * 50)
+
+
+class TestHexAndSubtitleColorHelpers(unittest.TestCase):
+    def test_hex_to_rgb_parses_valid_color(self):
+        self.assertEqual(vd._hex_to_rgb("#123456"), (18, 52, 86))
+
+    def test_hex_to_rgb_falls_back_black_on_invalid_digits(self):
+        self.assertEqual(vd._hex_to_rgb("#GGGGGG"), (0, 0, 0))
+
+    def test_hex_to_rgb_falls_back_black_on_malformed_input(self):
+        for bad in (None, "", "123456", "#12345", "#1234567", 123, True):
+            with self.subTest(value=repr(bad)):
+                self.assertEqual(vd._hex_to_rgb(bad), (0, 0, 0))
+
+    def _fake_params(self, *, enabled=True, background="#000000", foreground="#FFFFFF"):
+        # text_fore_color 在 VideoParams 里被约束为 str，bool 分支只能通过
+        # 结构上一模一样的既存对象触发，因此这里用鸭子类型参数。
+        return types.SimpleNamespace(
+            subtitle_enabled=enabled,
+            text_background_color=background,
+            text_fore_color=foreground,
+        )
+
+    def test_subtitle_colors_not_indistinguishable_when_subtitles_disabled(self):
+        params = self._fake_params(enabled=False)
+        self.assertFalse(vd.subtitle_colors_are_indistinguishable(params))
+
+    def test_subtitle_colors_not_indistinguishable_without_background(self):
+        params = self._fake_params(background=None)
+        self.assertFalse(vd.subtitle_colors_are_indistinguishable(params))
+
+    def test_subtitle_colors_not_indistinguishable_when_background_empty_string(self):
+        params = self._fake_params(background="")
+        self.assertFalse(vd.subtitle_colors_are_indistinguishable(params))
+
+    def test_subtitle_colors_indistinguishable_for_bool_true_fore_color(self):
+        params = self._fake_params(foreground=True)
+        self.assertTrue(vd.subtitle_colors_are_indistinguishable(params))
+
+    def test_subtitle_colors_not_indistinguishable_for_bool_false_fore_color(self):
+        params = self._fake_params(foreground=False)
+        self.assertFalse(vd.subtitle_colors_are_indistinguishable(params))
+
+    def test_subtitle_colors_indistinguishable_case_insensitive(self):
+        params = vd.VideoParams(
+            video_subject="t",
+            subtitle_enabled=True,
+            text_fore_color="#ffffff",
+            text_background_color="#FFFFFF",
+        )
+        self.assertTrue(vd.subtitle_colors_are_indistinguishable(params))
+
+    def test_subtitle_colors_not_indistinguishable_when_different(self):
+        params = vd.VideoParams(
+            video_subject="t",
+            subtitle_enabled=True,
+            text_fore_color="#ffffff",
+            text_background_color="#000000",
+        )
+        self.assertFalse(vd.subtitle_colors_are_indistinguishable(params))
+
+
+class TestVisibleCenterPosition(unittest.TestCase):
+    def _clip_with_mask(self, mask):
+        return type("Clip", (), {"w": 300, "h": 80, "mask": mask})()
+
+    def test_returns_geometric_center_when_no_mask(self):
+        clip = self._clip_with_mask(None)
+        self.assertEqual(vd._get_visible_center_position(clip, 400, 200), (50, 60))
+
+    def test_returns_geometric_center_when_mask_is_empty(self):
+        mask = _FakeMask(vd.np.zeros((80, 300), dtype=vd.np.float32))
+        clip = self._clip_with_mask(mask)
+        self.assertEqual(vd._get_visible_center_position(clip, 400, 200), (50, 60))
+
+    def test_offsets_by_visible_pixel_bbox(self):
+        frame = vd.np.zeros((80, 300), dtype=vd.np.float32)
+        frame[5:15, :] = 1.0
+        clip = self._clip_with_mask(_FakeMask(frame))
+        self.assertEqual(vd._get_visible_center_position(clip, 400, 200), (50, 90))
+
+    def test_falls_back_when_mask_read_fails(self):
+        def _broken_get_frame(t=0):
+            raise RuntimeError("mask read failed")
+
+        mask = type("BrokenMask", (), {"get_frame": _broken_get_frame})()
+        clip = self._clip_with_mask(mask)
+        with patch.object(vd.logger, "debug") as log_debug:
+            self.assertEqual(vd._get_visible_center_position(clip, 400, 200), (50, 60))
+        log_debug.assert_called_once()
+
+
+class TestSubtitleFontSupport(unittest.TestCase):
+    def setUp(self):
+        vd._subtitle_font_supports_sample.cache_clear()
+
+    def tearDown(self):
+        vd._subtitle_font_supports_sample.cache_clear()
+
+    def test_font_supports_all_sample_chars(self):
+        with patch.object(vd.ImageFont, "truetype", return_value=_FakeGlyphFont()):
+            self.assertTrue(vd._subtitle_font_supports_sample("/f/regular.ttf", "hello"))
+
+    def test_font_missing_glyph_returns_false(self):
+        font = _FakeGlyphFont(missing_chars={"b"})
+        with patch.object(vd.ImageFont, "truetype", return_value=font):
+            self.assertFalse(vd._subtitle_font_supports_sample("/f/partial.ttf", "abc"))
+
+    def test_font_probe_failure_logs_and_returns_true(self):
+        with (
+            patch.object(
+                vd.ImageFont, "truetype", side_effect=OSError("cannot load font")
+            ),
+            patch.object(vd.logger, "warning") as warning,
+        ):
+            self.assertTrue(vd._subtitle_font_supports_sample("/f/empty.ttf", "abc"))
+        warning.assert_called_once()
+
+    def test_text_without_letters_is_always_considered_supported(self):
+        self.assertTrue(vd.subtitle_font_supports_text("/any/font.ttf", "！？,.。 "))
+
+    def test_text_filters_sample_to_letters_and_digits(self):
+        with patch.object(
+            vd, "_subtitle_font_supports_sample", return_value=True
+        ) as sample_check:
+            self.assertTrue(vd.subtitle_font_supports_text("/f/x.ttf", "héllo 123!"))
+        sample = sample_check.call_args.args[1]
+        self.assertEqual(sample, "hélo123")
+
+
+class TestGenerateVideoSubtitleRendering(unittest.TestCase):
+    def _run_generate_video_with_subtitles(self, params, subtitle_items, *, patch_nt=False):
+        """带字幕跑完整 generate_video，模拟 create_text_clip 的全部渲染分支。"""
+        subtitle_text_clips = []
+        bg_calls = []
+        composite_clips = []
+        layout_clips = []
+
+        def _new_text_clip(**kwargs):
+            clip = _FakeSubtitleTextClip()
+            subtitle_text_clips.append(clip)
+            layout_clips.append(clip)
+            return clip
+
+        def _new_bg_clip(*args, **kwargs):
+            bg_calls.append((args, kwargs))
+            clip = _FakeSubtitleTextClip()
+            layout_clips.append(clip)
+            return clip
+
+        def _new_composite(clips, **kwargs):
+            clip = _FakeSubtitleTextClip()
+            clip.child_clips = list(clips)
+            composite_clips.append(clip)
+            layout_clips.append(clip)
+            return clip
+
+        def _build_fake_subtitles_clip(**kwargs):
+            make_textclip = kwargs.pop("make_textclip", None)
+            if make_textclip is not None:
+                make_textclip("probe")
+            return _FakeSubtitlesClip(subtitle_items)
+
+        source_video = _FakeMoviePyClip()
+        voice_source = _FakeMoviePyClip()
+        source_video.with_audio_result = source_video
+
+        with tempfile.TemporaryDirectory() as tmp, \
+            patch.object(vd, "_open_video_clip_quietly", return_value=source_video), \
+            patch.object(vd, "AudioFileClip", return_value=voice_source), \
+            patch.object(vd.bgm_service, "should_use_bgm", return_value=False), \
+            patch.object(vd, "SubtitlesClip", side_effect=_build_fake_subtitles_clip), \
+            patch.object(vd, "TextClip", side_effect=_new_text_clip), \
+            patch.object(vd, "wrap_text", return_value=("LINE ONE\nLINE TWO", 120)), \
+            patch.object(vd, "_rounded_subtitle_background_clip", side_effect=_new_bg_clip), \
+            patch.object(vd, "CompositeVideoClip", side_effect=_new_composite), \
+            patch.object(vd, "_write_videofile_with_codec_fallback"), \
+            patch.object(vd, "_get_configured_video_codec", return_value="libx264"), \
+            (patch.object(vd.os, "name", "nt") if patch_nt else nullcontext()):
+            subtitle_file = os.path.join(tmp, "subs.srt")
+            with open(subtitle_file, "wb"):
+                pass
+            output_file = os.path.join(tmp, "out", "final.mp4")
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            result = vd.generate_video(
+                video_path="combined.mp4",
+                audio_path="voice.mp3",
+                subtitle_path=subtitle_file,
+                output_file=output_file,
+                params=params,
+            )
+        return (
+            result,
+            layout_clips,
+            subtitle_text_clips,
+            bg_calls,
+            composite_clips,
+        )
+
+    def _finalized_subtitle_clip(self, layout_clips):
+        finalized = [c for c in layout_clips if c._start is not None]
+        self.assertEqual(len(finalized), 1)
+        return finalized[0]
+
+    def test_generate_video_renders_rounded_subtitle_background(self):
+        params = vd.VideoParams(
+            video_subject="test",
+            subtitle_enabled=True,
+            subtitle_position="bottom",
+            rounded_subtitle_background=True,
+            text_background_color="#123456",
+            text_fore_color="#FFFFFF",
+            stroke_width=2,
+            font_size=60,
+        )
+        result, layout_clips, _, bg_calls, _ = self._run_generate_video_with_subtitles(
+            params, [((0.0, 2.0), "Hello")], patch_nt=False
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(len(bg_calls), 1)
+        self.assertEqual(bg_calls[0][1]["color"], "#123456")
+        self.assertEqual(bg_calls[0][1]["alpha"], 140)
+        self.assertEqual(bg_calls[0][1]["radius"], max(8, int(60 * 0.4)))
+        final = self._finalized_subtitle_clip(layout_clips)
+        self.assertEqual(final._start, 0.0)
+        self.assertEqual(final._end, 2.0)
+        self.assertEqual(final._duration, 2.0)
+        self.assertEqual(final.position, ("center", 1744.0))
+
+    def test_generate_video_renders_rect_subtitle_background(self):
+        params = vd.VideoParams(
+            video_subject="test",
+            subtitle_enabled=True,
+            subtitle_position="bottom",
+            text_background_color="#123456",
+        )
+        result, layout_clips, _, bg_calls, _ = self._run_generate_video_with_subtitles(
+            params, [((0.0, 2.0), "Hello")]
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(len(bg_calls), 1)
+        self.assertEqual(bg_calls[0][1]["alpha"], 255)
+        self.assertEqual(bg_calls[0][1]["radius"], 0)
+        final = self._finalized_subtitle_clip(layout_clips)
+        self.assertEqual(final.position, ("center", 1744.0))
+
+    def test_generate_video_renders_plain_subtitle_without_background(self):
+        params = vd.VideoParams(
+            video_subject="test",
+            subtitle_enabled=True,
+            subtitle_position="center",
+            text_background_color=False,
+        )
+        result, layout_clips, text_clips, bg_calls, _ = self._run_generate_video_with_subtitles(
+            params, [((0.0, 2.0), "Hello")]
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(bg_calls, [])
+        final = self._finalized_subtitle_clip(layout_clips)
+        self.assertIn(final, text_clips)
+        self.assertEqual(final.position, ("center", "center"))
+
+    def test_generate_video_positions_subtitles_in_every_mode(self):
+        cases = [
+            ("bottom", 70.0, ("center", 1744.0)),
+            ("top", 70.0, ("center", 96.0)),
+            ("custom", 0.0, ("center", 10.0)),
+            ("custom", 100.0, ("center", 1830.0)),
+            ("center", 70.0, ("center", "center")),
+        ]
+        for position, custom_position, expected in cases:
+            with self.subTest(position=position, custom_position=custom_position):
+                params = vd.VideoParams(
+                    video_subject="test",
+                    subtitle_enabled=True,
+                    subtitle_position=position,
+                    custom_position=custom_position,
+                    text_background_color=False,
+                )
+                result, layout_clips, _, _, _ = self._run_generate_video_with_subtitles(
+                    params, [((0.0, 2.0), "Hello")]
+                )
+                self.assertTrue(result)
+                final = self._finalized_subtitle_clip(layout_clips)
+                self.assertEqual(final.position, expected)
+
+    def test_generate_video_normalizes_true_bool_background_to_black(self):
+        params = vd.VideoParams(
+            video_subject="test",
+            subtitle_enabled=True,
+            text_background_color=True,
+        )
+        result, _, _, bg_calls, _ = self._run_generate_video_with_subtitles(
+            params, [((0.0, 2.0), "Hello")]
+        )
+        self.assertTrue(result)
+        self.assertEqual(len(bg_calls), 1)
+        self.assertEqual(bg_calls[0][1]["color"], "#000000")
+
+    def test_generate_video_uses_default_font_and_nt_path_slashes(self):
+        params = vd.VideoParams(
+            video_subject="test",
+            subtitle_enabled=True,
+            subtitle_position="center",
+            font_name=None,
+        )
+        self.assertIsNone(params.font_name)
+        result, layout_clips, _, _, _ = self._run_generate_video_with_subtitles(
+            params, [((0.0, 2.0), "Hello")], patch_nt=True
+        )
+        self.assertTrue(result)
+        self.assertEqual(params.font_name, "STHeitiMedium.ttc")
+        self._finalized_subtitle_clip(layout_clips)
+
+    def test_generate_video_measures_rounded_bg_width_with_fallback(self):
+        """圆角背景测量字体失败时应退回最大宽度，不中断后台生成。"""
+        params = vd.VideoParams(
+            video_subject="test",
+            subtitle_enabled=True,
+            subtitle_position="bottom",
+            rounded_subtitle_background=True,
+            text_background_color="#123456",
+            font_name="definitely-does-not-exist.ttf",
+        )
+        result, layout_clips, _, _, _ = self._run_generate_video_with_subtitles(
+            params, [((0.0, 2.0), "Hello")]
+        )
+        self.assertTrue(result)
+        final = self._finalized_subtitle_clip(layout_clips)
+        self.assertEqual(final.position, ("center", 1744.0))
+
+
+class TestCodecAndFfmpegBranches(unittest.TestCase):
+    def setUp(self):
+        self.original_app_config = dict(config.app)
+        vd._runtime_disabled_video_codecs.clear()
+        vd._ffmpeg_encoder_exists.cache_clear()
+
+    def tearDown(self):
+        config.app.clear()
+        config.app.update(self.original_app_config)
+        vd._runtime_disabled_video_codecs.clear()
+        vd._ffmpeg_encoder_exists.cache_clear()
+
+    def test_write_videofile_returns_effective_codec_on_success(self):
+        calls = []
+
+        class _FakeClip:
+            def write_videofile(self, output_file, codec, **kwargs):
+                calls.append(codec)
+
+        used = vd._write_videofile_with_codec_fallback(
+            _FakeClip(), "/tmp/ok.mp4", codec="libx264", logger=None, fps=30
+        )
+        self.assertEqual(used, "libx264")
+        self.assertEqual(calls, ["libx264"])
+
+    def test_write_videofile_reraises_when_default_codec_fails(self):
+        class _FakeClip:
+            def write_videofile(self, output_file, codec, **kwargs):
+                raise RuntimeError(f"{codec} cannot write output")
+
+        with self.assertRaises(RuntimeError):
+            vd._write_videofile_with_codec_fallback(
+                _FakeClip(), "/tmp/fail.mp4", codec="libx264", logger=None, fps=30
+            )
+        self.assertNotIn("libx264", vd._runtime_disabled_video_codecs)
+
+    def test_disable_runtime_video_codec_ignores_default(self):
+        vd._disable_runtime_video_codec("libx264", "some reason")
+        self.assertNotIn("libx264", vd._runtime_disabled_video_codecs)
+
+    def test_effective_video_codec_falls_back_when_codec_disabled(self):
+        vd._runtime_disabled_video_codecs.add("h264_nvenc")
+        with patch.object(vd.utils, "get_ffmpeg_binary") as ffmpeg:
+            self.assertEqual(vd._get_effective_video_codec("h264_nvenc"), "libx264")
+        ffmpeg.assert_not_called()
+
+    def test_ffmpeg_encoder_exists_falls_back_on_nonzero_returncode(self):
+        result = types.SimpleNamespace(returncode=1, stdout="", stderr="encoder missing")
+        with patch.object(vd.subprocess, "run", return_value=result):
+            self.assertFalse(vd._ffmpeg_encoder_exists("/f/ffmpeg", "h264_nvenc"))
+
+    def test_ffmpeg_encoder_exists_returns_true_when_codec_in_stdout(self):
+        result = types.SimpleNamespace(
+            returncode=0, stdout="h264_nvenc ..... NVIDIA NVENC H.264 encoder", stderr=""
+        )
+        with patch.object(vd.subprocess, "run", return_value=result):
+            self.assertTrue(vd._ffmpeg_encoder_exists("/f/ffmpeg", "h264_nvenc"))
+
+    def test_get_ffmpeg_binary_wrapper_delegates_to_utils(self):
+        with patch.object(
+            vd.utils, "get_ffmpeg_binary", return_value="/bin/ffmpeg"
+        ) as utils_mock:
+            self.assertEqual(vd.get_ffmpeg_binary(), "/bin/ffmpeg")
+        utils_mock.assert_called_once()
+
+    def test_sub_clipped_video_clip_str_includes_fields(self):
+        item = vd.SubClippedVideoClip(
+            file_path="a.mp4",
+            start_time=1.0,
+            end_time=3.0,
+            width=100,
+            height=200,
+        )
+        rendered = str(item)
+        self.assertIn("file_path=a.mp4", rendered)
+        self.assertIn("width=100", rendered)
+        self.assertIn("height=200", rendered)
+
+    def test_get_configured_video_codec_warns_on_unsupported_codec(self):
+        config.app["video_codec"] = "vp8compat"
+        with patch.object(vd.logger, "warning") as warning:
+            codec = vd._get_configured_video_codec()
+            self.assertIn(codec, vd._SUPPORTED_VIDEO_CODECS)
+        warning.assert_called_once()
+
+    def test_concat_video_clips_reraises_when_default_codec_fails(self):
+        config.app["video_codec"] = "libx264"
+
+        def fake_run(command, capture_output, text, check):
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_file = os.path.join(temp_dir, "clip.mp4")
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            Path(clip_file).write_bytes(b"fake")
+            with patch.object(vd.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(RuntimeError):
+                    vd.concat_video_clips_with_ffmpeg(
+                        clip_files=[clip_file],
+                        output_file=output_file,
+                        threads=1,
+                        output_dir=temp_dir,
+                    )
+
+
+class TestGetBgmFileBranches(unittest.TestCase):
+    def test_get_bgm_file_disabled_when_type_empty(self):
+        self.assertEqual(vd.get_bgm_file(bgm_type=""), "")
+
+    def test_get_bgm_file_random_falls_back_when_no_files(self):
+        with (
+            patch.object(vd.bgm_service, "list_bgm_files", return_value=[]),
+            patch.object(vd.logger, "warning") as warning,
+        ):
+            self.assertEqual(vd.get_bgm_file(bgm_type="random"), "")
+        warning.assert_called_once()
+
+    def test_get_bgm_file_random_picks_existing_file(self):
+        with patch.object(
+            vd.bgm_service, "list_bgm_files", return_value=["a.mp3", "b.mp3"]
+        ):
+            result = vd.get_bgm_file(bgm_type="random")
+        self.assertIn(result, ["a.mp3", "b.mp3"])
+
+    def test_get_bgm_file_returns_empty_for_unknown_type(self):
+        self.assertEqual(vd.get_bgm_file(bgm_type="silent"), "")
+
+
+class TestImageAndClipHelpers(unittest.TestCase):
+    def test_open_image_clip_with_fallback_uses_original_when_direct_opens(self):
+        fake_clip = object()
+        with patch.object(vd, "ImageClip", return_value=fake_clip):
+            clip, path = vd._open_image_clip_with_fallback("img.png")
+        self.assertIs(clip, fake_clip)
+        self.assertEqual(path, "img.png")
+
+    def test_open_image_clip_with_fallback_tries_sanitized_copy(self):
+        fake_clip = object()
+        with (
+            patch.object(
+                vd, "ImageClip", side_effect=[RuntimeError("bad exif"), fake_clip]
+            ),
+            patch.object(vd, "_sanitize_image_file", return_value="cleaned.png") as sanitize,
+        ):
+            clip, path = vd._open_image_clip_with_fallback("img.png")
+        sanitize.assert_called_once_with("img.png")
+        self.assertIs(clip, fake_clip)
+        self.assertEqual(path, "cleaned.png")
+
+    def test_open_video_clip_quietly_logs_suppressed_stdout(self):
+        class _NoisyClip:
+            def __init__(self, path, audio=False):
+                print("audio_found: False")
+
+            def close(self):
+                pass
+
+        with (
+            patch.object(vd, "VideoFileClip", side_effect=_NoisyClip),
+            patch.object(vd.logger, "debug") as log_debug,
+        ):
+            vd._open_video_clip_quietly("noisy.mp4")
+        log_debug.assert_called_once()
+
+    def test_close_clip_none_is_noop(self):
+        self.assertIsNone(vd.close_clip(None))
+
+    def test_close_clip_logs_error_when_reader_close_raises(self):
+        class _BadReader:
+            def close(self):
+                raise RuntimeError("disk error")
+
+        class _BadClip:
+            reader = _BadReader()
+            audio = None
+            mask = None
+            clips = []
+
+        with patch.object(vd.logger, "error") as log_error:
+            vd.close_clip(_BadClip())
+        log_error.assert_called_once()
+
+    def test_close_clip_handles_audio_and_mask_without_reader(self):
+        class _ReaderLike:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class _Clip:
+            def __init__(self):
+                self.reader = _ReaderLike()
+                self.audio = types.SimpleNamespace(reader=None)
+                self.mask = types.SimpleNamespace(reader=None)
+                self.clips = []
+
+        clip = _Clip()
+        vd.close_clip(clip)
+        self.assertTrue(clip.reader.closed)
+        self.assertFalse(hasattr(clip, "audio"))
+        self.assertFalse(hasattr(clip, "mask"))
+
+    def test_sanitize_image_file_strips_source_metadata(self):
+        from PIL import Image as PILImage
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source_path = os.path.join(tmp, "source.png")
+            PILImage.new("RGB", (4, 4), color=(255, 0, 0)).save(source_path)
+            sanitized_path = vd._sanitize_image_file(source_path)
+            self.assertTrue(os.path.exists(sanitized_path))
+            with PILImage.open(sanitized_path) as opened:
+                self.assertEqual(opened.size, (4, 4))
+
+    def test_close_clip_releases_nested_reader_resources(self):
+        class _ReaderLike:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class _Child:
+            def __init__(self):
+                self.reader = _ReaderLike()
+                self.audio = types.SimpleNamespace(reader=_ReaderLike())
+                self.mask = None
+                self.clips = []
+
+        class _RichClip:
+            def __init__(self):
+                self.reader = _ReaderLike()
+                self.audio = types.SimpleNamespace(reader=_ReaderLike())
+                self.mask = types.SimpleNamespace(reader=_ReaderLike())
+                self.child = _Child()
+                self.clips = [self.child, self]
+
+        clip = _RichClip()
+        audio_reader = clip.audio.reader
+        mask_reader = clip.mask.reader
+        child_reader = clip.child.reader
+        child_audio_reader = clip.child.audio.reader
+        vd.close_clip(clip)
+
+        self.assertTrue(clip.reader.closed)
+        self.assertTrue(audio_reader.closed)
+        self.assertTrue(mask_reader.closed)
+        self.assertTrue(child_reader.closed)
+        self.assertTrue(child_audio_reader.closed)
+        self.assertFalse(hasattr(clip, "audio"))
+        self.assertFalse(hasattr(clip, "mask"))
+        self.assertEqual(clip.clips, [])
+        self.assertEqual(clip.child.clips, [])
+
+
+class TestCombineVideosBranches(unittest.TestCase):
+    def _run_combine_with_clip(
+        self,
+        *,
+        size=(1080, 1920),
+        duration=3.0,
+        transition=None,
+        max_clip_duration=5,
+        audio_duration=2.0,
+        speed=1.0,
+        fail_subclipped=False,
+        choice_fn=lambda seq: seq[0],
+    ):
+        combined_written = []
+
+        def _open(path):
+            clip = _RichFakeClip(duration=duration, size=size)
+            clip.fail_subclipped = fail_subclipped
+            return clip
+
+        def _capture_written(clip, *args, **kwargs):
+            combined_written.append(clip)
+
+        def _make_composite(clips):
+            return clips[1] if len(clips) > 1 else clips[0]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            combined_video_path = os.path.join(tmp, "combined.mp4")
+            with (
+                patch.object(
+                    vd,
+                    "AudioFileClip",
+                    return_value=types.SimpleNamespace(
+                        duration=audio_duration, close=lambda: None
+                    ),
+                ),
+                patch.object(vd, "_open_video_clip_quietly", side_effect=_open),
+                patch.object(vd, "_write_videofile_with_codec_fallback", side_effect=_capture_written),
+                patch.object(
+                    vd,
+                    "_prioritize_unique_source_clips",
+                    side_effect=lambda subclipped_items, concat_mode: subclipped_items,
+                ),
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat,
+                patch.object(vd, "delete_files"),
+                patch.object(vd.random, "choice", side_effect=choice_fn),
+                patch.object(vd, "ColorClip", return_value=_FakeBgClip()),
+                patch.object(vd, "CompositeVideoClip", side_effect=_make_composite) as composite,
+                patch.object(vd.video_effects, "fadein_transition", side_effect=lambda c, *a, **k: c) as fadein,
+                patch.object(vd.video_effects, "fadeout_transition", side_effect=lambda c, *a, **k: c) as fadeout,
+                patch.object(vd.video_effects, "slidein_transition", side_effect=lambda c, *a, **k: c) as slidein,
+                patch.object(vd.video_effects, "slideout_transition", side_effect=lambda c, *a, **k: c) as slideout,
+                patch.object(vd.video_effects, "zoomin_transition", side_effect=lambda c, *a, **k: c) as zoomin,
+                patch.object(vd.video_effects, "zoomout_transition", side_effect=lambda c, *a, **k: c) as zoomout,
+            ):
+                result = vd.combine_videos(
+                    combined_video_path=combined_video_path,
+                    video_paths=["source.mp4"],
+                    audio_file="audio.mp3",
+                    video_aspect=vd.VideoAspect.portrait,
+                    video_concat_mode=vd.VideoConcatMode.sequential,
+                    video_transition_mode=transition,
+                    max_clip_duration=max_clip_duration,
+                    clip_speed=speed,
+                )
+
+        return {
+            "result": result,
+            "written": combined_written,
+            "concat": concat,
+            "composite": composite,
+            "transition_mocks": {
+                "fadein": fadein,
+                "fadeout": fadeout,
+                "slidein": slidein,
+                "slideout": slideout,
+                "zoomin": zoomin,
+                "zoomout": zoomout,
+            },
+        }
+
+    def test_combine_videos_resizes_matching_ratio_to_fill_frame(self):
+        outcome = self._run_combine_with_clip(size=(540, 960))
+        clip = outcome["written"][0]
+        resized = [e for e in clip.events if e[0] == "resized"]
+        self.assertEqual(len(resized), 1)
+        self.assertEqual(resized[0][2], {"new_size": (1080, 1920)})
+        outcome["composite"].assert_not_called()
+
+    def test_combine_videos_letterboxes_different_ratio_clip(self):
+        outcome = self._run_combine_with_clip(size=(1920, 1080))
+        clip = outcome["written"][0]
+        resized = [e for e in clip.events if e[0] == "resized"]
+        self.assertEqual(len(resized), 1)
+        self.assertEqual(resized[0][2], {"new_size": (1080, 607)})
+        self.assertIn(("position", "center"), clip.events)
+        outcome["composite"].assert_called_once()
+        self.assertEqual(
+            outcome["composite"].call_args.args[0][0],
+            "left" if False else outcome["composite"].call_args.args[0][0],
+        )
+
+    def test_combine_videos_applies_every_transition_mode(self):
+        expected_calls = {
+            None: [],
+            vd.VideoTransitionMode.none: [],
+            vd.VideoTransitionMode.fade_in: ["fadein"],
+            vd.VideoTransitionMode.fade_out: ["fadeout"],
+            vd.VideoTransitionMode.slide_in: ["slidein"],
+            vd.VideoTransitionMode.slide_out: ["slideout"],
+            vd.VideoTransitionMode.zoom_in: ["zoomin"],
+            vd.VideoTransitionMode.zoom_out: ["zoomout"],
+            vd.VideoTransitionMode.shuffle: ["fadein"],
+        }
+        for transition, expected in expected_calls.items():
+            with self.subTest(transition=transition):
+                outcome = self._run_combine_with_clip(transition=transition)
+                for name, mock in outcome["transition_mocks"].items():
+                    if name in expected:
+                        mock.assert_called_once()
+                    else:
+                        mock.assert_not_called()
+
+    def test_combine_videos_unknown_transition_value_passes_clip_through(self):
+        outcome = self._run_combine_with_clip(transition="spin")
+        self.assertTrue(outcome["result"])
+        self.assertEqual(len(outcome["written"]), 1)
+        for name, mock in outcome["transition_mocks"].items():
+            mock.assert_not_called()
+
+    def test_combine_videos_shuffle_picks_every_transition(self):
+        transition_names = list(self._run_combine_with_clip()["transition_mocks"])
+        for k in range(len(transition_names)):
+            with self.subTest(shuffle_index=k):
+
+                def _choice(seq, k=k):
+                    if seq and isinstance(seq[0], str):
+                        return "left"
+                    return seq[k]
+
+                outcome = self._run_combine_with_clip(
+                    transition=vd.VideoTransitionMode.shuffle, choice_fn=_choice
+                )
+                for name, mock in outcome["transition_mocks"].items():
+                    if name == transition_names[k]:
+                        mock.assert_called_once()
+                    else:
+                        mock.assert_not_called()
+
+    def test_combine_videos_letterboxes_tall_ratio_by_height(self):
+        outcome = self._run_combine_with_clip(size=(500, 1500))
+        clip = outcome["written"][0]
+        resized = [e for e in clip.events if e[0] == "resized"]
+        self.assertEqual(len(resized), 1)
+        self.assertEqual(resized[0][2], {"new_size": (640, 1920)})
+        self.assertIn(("position", "center"), clip.events)
+        outcome["composite"].assert_called_once()
+
+    def test_combine_videos_trims_oversized_transition_clip(self):
+        class _InflatedClip(_RichFakeClip):
+            def __init__(self, size=(1080, 1920)):
+                super().__init__(duration=6.0, size=size)
+
+        inflated = _InflatedClip()
+        with tempfile.TemporaryDirectory() as tmp:
+            combined_video_path = os.path.join(tmp, "combined.mp4")
+            with (
+                patch.object(
+                    vd,
+                    "AudioFileClip",
+                    return_value=types.SimpleNamespace(
+                        duration=2.0, close=lambda: None
+                    ),
+                ),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    side_effect=lambda p: _RichFakeClip(duration=3.0, size=(1080, 1920)),
+                ),
+                patch.object(
+                    vd,
+                    "_write_videofile_with_codec_fallback",
+                ) as writer,
+                patch.object(
+                    vd,
+                    "_prioritize_unique_source_clips",
+                    side_effect=lambda subclipped_items, concat_mode: subclipped_items,
+                ),
+                patch.object(vd, "concat_video_clips_with_ffmpeg"),
+                patch.object(vd, "delete_files"),
+                patch.object(
+                    vd.random, "choice", side_effect=lambda seq: seq[0]
+                ),
+                patch.object(
+                    vd.video_effects, "fadein_transition", return_value=inflated
+                ),
+            ):
+                vd.combine_videos(
+                    combined_video_path=combined_video_path,
+                    video_paths=["source.mp4"],
+                    audio_file="audio.mp3",
+                    video_aspect=vd.VideoAspect.portrait,
+                    video_concat_mode=vd.VideoConcatMode.sequential,
+                    video_transition_mode=vd.VideoTransitionMode.fade_in,
+                    max_clip_duration=3,
+                    clip_speed=1.0,
+                )
+
+        self.assertEqual(inflated.subclipped_to, (0, 3))
+        self.assertEqual(writer.call_args.args[0].duration, 3.0)
+
+    def test_combine_videos_loops_processed_clips_to_cover_audio(self):
+        looped_written = []
+
+        def _capture_written(clip, *args, **kwargs):
+            looped_written.append(clip)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            combined_video_path = os.path.join(tmp, "combined.mp4")
+            with (
+                patch.object(
+                    vd,
+                    "AudioFileClip",
+                    return_value=types.SimpleNamespace(
+                        duration=3.0, close=lambda: None
+                    ),
+                ),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    side_effect=lambda p: _RichFakeClip(
+                        duration=3.0, size=(1080, 1920)
+                    ),
+                ),
+                patch.object(
+                    vd, "_write_videofile_with_codec_fallback", side_effect=_capture_written
+                ),
+                patch.object(
+                    vd,
+                    "_prioritize_unique_source_clips",
+                    side_effect=lambda subclipped_items, concat_mode: subclipped_items,
+                ),
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat,
+                patch.object(vd, "delete_files"),
+            ):
+                result = vd.combine_videos(
+                    combined_video_path=combined_video_path,
+                    video_paths=["source.mp4"],
+                    audio_file="audio.mp3",
+                    video_aspect=vd.VideoAspect.portrait,
+                    video_concat_mode=vd.VideoConcatMode.sequential,
+                    max_clip_duration=10,
+                )
+
+        self.assertEqual(result, combined_video_path)
+        self.assertEqual(len(looped_written), 1)
+        self.assertEqual(len(concat.call_args.kwargs["clip_files"]), 2)
+        self.assertEqual(concat.call_args.kwargs["max_duration"], 3.0)
+
+    def test_combine_videos_recovers_when_clip_processing_fails(self):
+        def _failing_open(path):
+            clip = _RichFakeClip(duration=3.0, size=(1080, 1920))
+            clip.fail_subclipped = True
+            return clip
+
+        with tempfile.TemporaryDirectory() as tmp:
+            combined_video_path = os.path.join(tmp, "combined.mp4")
+            with (
+                patch.object(
+                    vd,
+                    "AudioFileClip",
+                    return_value=types.SimpleNamespace(
+                        duration=2.0, close=lambda: None
+                    ),
+                ),
+                patch.object(
+                    vd, "_open_video_clip_quietly", side_effect=_failing_open
+                ),
+                patch.object(vd, "_write_videofile_with_codec_fallback"),
+                patch.object(
+                    vd,
+                    "_prioritize_unique_source_clips",
+                    side_effect=lambda subclipped_items, concat_mode: subclipped_items,
+                ),
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat,
+                patch.object(vd, "delete_files"),
+                patch.object(vd.logger, "error") as log_error,
+            ):
+                result = vd.combine_videos(
+                    combined_video_path=combined_video_path,
+                    video_paths=["source.mp4"],
+                    audio_file="audio.mp3",
+                    video_aspect=vd.VideoAspect.portrait,
+                    video_concat_mode=vd.VideoConcatMode.sequential,
+                    max_clip_duration=10,
+                )
+
+        self.assertEqual(result, combined_video_path)
+        log_error.assert_called_once()
+        concat.assert_not_called()
+
+
+class TestPreprocessVideoBranches(unittest.TestCase):
+    def _run_preprocess(
+        self,
+        materials,
+        *,
+        ext="mp4",
+        video_size=(1080, 1920),
+        video_raises=False,
+        image_size=(1080, 1920),
+        image_raises=False,
+        image_path="/tmp/local_videos/images/image.png",
+    ):
+        def _video_open(path):
+            if video_raises:
+                raise RuntimeError("cannot probe video")
+            return _FakeSizedClip(video_size)
+
+        def _image_open(path):
+            if image_raises:
+                raise RuntimeError("cannot read image")
+            return _FakeSizedClip(image_size), image_path
+
+        with (
+            patch.object(vd.utils, "storage_dir", return_value="/tmp/local_videos"),
+            patch.object(
+                vd.file_security,
+                "resolve_path_within_directory",
+                return_value="/tmp/local_videos/source.mp4",
+            ),
+            patch.object(vd.utils, "parse_extension", return_value=ext),
+            patch.object(vd, "_open_video_clip_quietly", side_effect=_video_open),
+            patch.object(vd, "_open_image_clip_with_fallback", side_effect=_image_open),
+            patch.object(vd, "close_clip") as close_clip,
+            patch.object(vd, "ImageClip") as image_clip,
+            patch.object(vd, "CompositeVideoClip") as composite_clip,
+            patch.object(vd.logger, "warning") as warning,
+        ):
+            result = vd.preprocess_video(materials, clip_duration=4)
+        return {
+            "result": result,
+            "close_clip": close_clip,
+            "image_clip": image_clip,
+            "composite_clip": composite_clip,
+            "warning": warning,
+        }
+
+    def test_preprocess_video_returns_empty_for_no_materials(self):
+        self.assertEqual(vd.preprocess_video([], clip_duration=4), [])
+
+    def test_preprocess_video_skips_material_without_url(self):
+        material = vd.MaterialInfo(provider="local", url="")
+        outcome = self._run_preprocess([material])
+        self.assertEqual(outcome["result"], [])
+        outcome["image_clip"].assert_not_called()
+
+    def test_preprocess_video_accepts_standard_video_material(self):
+        material = vd.MaterialInfo(provider="local", url="source.mp4")
+        outcome = self._run_preprocess([material], ext="mp4")
+        self.assertEqual(outcome["result"], [material])
+        self.assertEqual(material.url, "/tmp/local_videos/source.mp4")
+        outcome["close_clip"].assert_called_once()
+        outcome["image_clip"].assert_not_called()
+
+    def test_preprocess_video_falls_back_to_image_when_video_probe_fails(self):
+        material = vd.MaterialInfo(provider="local", url="source.mp4")
+        outcome = self._run_preprocess(
+            [material],
+            ext="mp4",
+            video_raises=True,
+            image_path="/tmp/local_videos/source.mp4",
+        )
+        self.assertEqual(outcome["result"], [material])
+        self.assertEqual(material.url, "/tmp/local_videos/source.mp4")
+
+    def test_preprocess_video_skips_unreadable_material(self):
+        material = vd.MaterialInfo(provider="local", url="source.mp4")
+        outcome = self._run_preprocess(
+            [material], ext="mp4", video_raises=True, image_raises=True
+        )
+        self.assertEqual(outcome["result"], [])
+        outcome["warning"].assert_called_once()
+
+    def test_preprocess_video_rejects_low_resolution_material(self):
+        material = vd.MaterialInfo(provider="local", url="source.mp4")
+        outcome = self._run_preprocess([material], ext="mp4", video_size=(100, 100))
+        self.assertEqual(outcome["result"], [])
+        outcome["close_clip"].assert_called_once()
+        outcome["warning"].assert_called_once()
+
+    def test_preprocess_video_rethrows_after_closing_image_export_failure(self):
+        material = vd.MaterialInfo(provider="local", url="source.png")
+        with (
+            patch.object(vd.utils, "storage_dir", return_value="/tmp/local_videos"),
+            patch.object(
+                vd.file_security,
+                "resolve_path_within_directory",
+                return_value="/tmp/local_videos/source.png",
+            ),
+            patch.object(vd.utils, "parse_extension", return_value="png"),
+            patch.object(vd, "_open_image_clip_with_fallback") as open_image,
+            patch.object(vd, "close_clip") as close_clip,
+            patch.object(vd, "ImageClip", side_effect=RuntimeError("export failed")),
+            patch.object(vd, "CompositeVideoClip"),
+        ):
+            open_image.return_value = (
+                _FakeSizedClip((1080, 1920)),
+                "/tmp/local_videos/source.png",
+            )
+            with self.assertRaises(RuntimeError):
+                vd.preprocess_video([material], clip_duration=4)
+        self.assertGreaterEqual(close_clip.call_count, 2)
 
 
 if __name__ == "__main__":

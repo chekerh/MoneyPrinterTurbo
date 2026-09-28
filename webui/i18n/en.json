@@ -78,7 +78,7 @@
     "Delete Task": "Delete Task",
     "Task Deleted": "Task deleted",
     "Task Delete Failed": "Failed to delete task",
-    "Open Task Folder": "Open Folder",
+    "Open Task Folder": "Open task files",
     "Generating Video Script and Keywords": "AI is generating video script and keywords...",
     "Generating Video Keywords": "AI is generating video keywords...",
     "Video Keywords": "Video Keywords (English, Optional)",
@@ -516,6 +516,23 @@
     "Thumbnail Overlay Invalid": "Overlay text contains characters that are not allowed.",
     "Thumbnail Generate Failed": "Could not generate the thumbnail. The previous one is unchanged.",
     "Thumbnail Record Failed": "Could not update the thumbnail record. The previous one is unchanged.",
-    "Thumbnail Archive Failed": "Could not archive that thumbnail."
+    "Thumbnail Archive Failed": "Could not archive that thumbnail.",
+    "Thumbnail Queued": "Queued for generation.",
+    "Thumbnail Generating": "Generating thumbnail…",
+    "Thumbnail Queue Unavailable": "Cannot queue generation right now. Please try again.",
+    "Open Archive Folder": "Open archive folder",
+    "Task Not Archived Yet": "This task has not been archived yet",
+    "Video File Missing": "Video file is missing: {name}",
+    "Video File Unreadable": "Video file is empty or damaged: {name}",
+    "Thumbnail unavailable": "Thumbnail unavailable",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.",
+    "Niche": "Niche",
+    "No Niche": "No Niche",
+    "Niche Preview": "{name}: {line} (about {words} words)",
+    "Choose Thumbnail": "Choose Thumbnail",
+    "Thumbnail Candidate {index}": "Candidate {index}",
+    "Thumbnail Select Failed": "Could not switch thumbnail",
+    "Highlight Spoken Words": "Highlight Spoken Words",
+    "Highlight Spoken Words Help": "Word-by-word captions: the word being spoken lights up. Needs word-level timings from speech recognition; falls back to whole-line captions when unavailable."
   }
 }

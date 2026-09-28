@@ -88,7 +88,18 @@ class TestTaskService(unittest.TestCase):
             paragraph_number=2,
             video_script_prompt="语气轻松",
             custom_system_prompt="Only write short narration.",
+            # 赛道必须透传：品牌句与钩子写法全靠它，漏掉就退化成通用脚本。
+            channel="",
         )
+
+    def test_generate_script_forwards_the_niche_channel(self):
+        """选了赛道就必须传到脚本生成层，否则品牌句不会出现。"""
+        params = VideoParams(video_subject="咖啡", channel="money-finance")
+        with patch("app.services.task.llm.generate_script") as generate:
+            generate.return_value = "生成的文案"
+            tm.generate_script("task-niche", params)
+
+        self.assertEqual(generate.call_args.kwargs["channel"], "money-finance")
 
     def test_generate_final_videos_forwards_clip_speed(self):
         """任务编排层必须把用户选择的画面速度传给视频合成服务。"""
@@ -1367,6 +1378,7 @@ class TestTaskService(unittest.TestCase):
             patch.object(type(service), "auto_upload", new_callable=PropertyMock, return_value=True),
             patch.object(type(service), "platforms", new_callable=PropertyMock, return_value=["youtube"]),
             patch.object(type(service), "youtube_privacy_status", new_callable=PropertyMock, return_value="unlisted"),
+            patch.object(tm.youtube_upload, "is_configured", return_value=True),
             patch.object(
                 tm.llm,
                 "generate_social_metadata",
@@ -1694,6 +1706,15 @@ class TestTaskService(unittest.TestCase):
 
         with (
             patch.object(tm.sm, "state", state),
+            patch.object(
+                tm.llm,
+                "generate_social_metadata",
+                return_value={
+                    "title": "Coffee Hook",
+                    "caption": "A short coffee story.",
+                    "hashtags": ["coffee"],
+                },
+            ),
             patch.object(
                 tm.upload_post,
                 "cross_post_video",

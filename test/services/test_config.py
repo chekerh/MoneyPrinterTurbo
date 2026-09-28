@@ -34,8 +34,11 @@ class TestConfigPersistence:
         example_config = self._load_example_config()
         app_config = example_config["app"]
 
-        assert example_config["listen_host"] == "0.0.0.0"
         assert example_config["listen_port"] == 8080
+        # api_key 默认为空，因此示例配置必须保持回环监听；公开监听需要显式
+        # 打开 allow_non_loopback_bind 并自行配置 api_key。
+        assert example_config["listen_host"] == "127.0.0.1"
+        assert example_config["allow_non_loopback_bind"] is False
         assert example_config["log_level"] == "DEBUG"
         assert app_config["video_source"] in {
             "pexels",

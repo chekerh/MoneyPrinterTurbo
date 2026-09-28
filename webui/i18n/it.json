@@ -67,7 +67,7 @@
     "Delete Task": "Elimina attività",
     "Task Deleted": "Attività eliminata",
     "Task Delete Failed": "Impossibile eliminare l'attività",
-    "Open Task Folder": "Apri cartella",
+    "Open Task Folder": "Apri i file del task",
     "Generating Video Script and Keywords": "L'IA sta generando il testo e le parole chiave del video...",
     "Generating Video Keywords": "L'IA sta generando le parole chiave del video...",
     "Video Keywords": "Parole chiave del video (inglese, facoltativo)",
@@ -390,6 +390,23 @@
     "Thumbnail Overlay Invalid": "Il testo sovrapposto contiene caratteri non consentiti.",
     "Thumbnail Generate Failed": "Impossibile generare la miniatura. La precedente resta invariata.",
     "Thumbnail Record Failed": "Impossibile aggiornare il registro delle miniature. La precedente resta invariata.",
-    "Thumbnail Archive Failed": "Impossibile archiviare quella miniatura."
+    "Thumbnail Archive Failed": "Impossibile archiviare quella miniatura.",
+    "Thumbnail Queued": "In coda per la generazione.",
+    "Thumbnail Generating": "Generazione della miniatura…",
+    "Thumbnail Queue Unavailable": "Impossibile mettere in coda la generazione. Riprova.",
+    "Open Archive Folder": "Apri la cartella archivio",
+    "Task Not Archived Yet": "Questa attività non è ancora stata archiviata",
+    "Video File Missing": "File video mancante: {name}",
+    "Video File Unreadable": "Il file video è vuoto o danneggiato: {name}",
+    "Thumbnail unavailable": "Anteprima non disponibile",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "Imposta portfolio_root nella sezione [app] di config.toml per attivare le miniature e la pianificazione del portfolio.",
+    "Niche": "Nicchia",
+    "No Niche": "Nessun nicho",
+    "Niche Preview": "{name}: {line} (circa {words} parole)",
+    "Choose Thumbnail": "Scegli anteprima",
+    "Thumbnail Candidate {index}": "Candidato {index}",
+    "Thumbnail Select Failed": "Impossibile cambiare l'anteprima",
+    "Highlight Spoken Words": "Evidenzia la parola pronunciata",
+    "Highlight Spoken Words Help": "Sottotitoli parola per parola: la parola pronunciata viene evidenziata. Richiede i tempi per parola del riconoscimento vocale; in assenza torna ai sottotitoli a riga intera."
   }
 }

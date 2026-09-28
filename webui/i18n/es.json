@@ -67,7 +67,7 @@
     "Delete Task": "Eliminar tarea",
     "Task Deleted": "Tarea eliminada",
     "Task Delete Failed": "No se pudo eliminar la tarea",
-    "Open Task Folder": "Abrir carpeta",
+    "Open Task Folder": "Abrir archivos de la tarea",
     "Generating Video Script and Keywords": "La IA está generando el guion y las palabras clave del vídeo...",
     "Generating Video Keywords": "La IA está generando las palabras clave del vídeo...",
     "Video Keywords": "Palabras clave del vídeo (inglés, opcional)",
@@ -390,6 +390,23 @@
     "Thumbnail Overlay Invalid": "El texto superpuesto contiene caracteres no permitidos.",
     "Thumbnail Generate Failed": "No se pudo generar la miniatura. La anterior sigue igual.",
     "Thumbnail Record Failed": "No se pudo actualizar el registro de miniaturas. La anterior sigue igual.",
-    "Thumbnail Archive Failed": "No se pudo archivar esa miniatura."
+    "Thumbnail Archive Failed": "No se pudo archivar esa miniatura.",
+    "Thumbnail Queued": "En cola para generarse.",
+    "Thumbnail Generating": "Generando miniatura…",
+    "Thumbnail Queue Unavailable": "No se puede poner en cola la generación. Inténtalo de nuevo.",
+    "Open Archive Folder": "Abrir carpeta de archivo",
+    "Task Not Archived Yet": "Esta tarea aún no se ha archivado",
+    "Video File Missing": "Falta el archivo de vídeo: {name}",
+    "Video File Unreadable": "El archivo de vídeo está vacío o dañado: {name}",
+    "Thumbnail unavailable": "Miniatura no disponible",
+    "Set portfolio_root in the [app] section of config.toml to enable thumbnails and portfolio planning.": "Configure portfolio_root en la sección [app] de config.toml para activar las miniaturas y la planificación de cartera.",
+    "Niche": "Nicho",
+    "No Niche": "Sin nicho",
+    "Niche Preview": "{name}: {line} (unos {words} palabras)",
+    "Choose Thumbnail": "Elegir miniatura",
+    "Thumbnail Candidate {index}": "Candidato {index}",
+    "Thumbnail Select Failed": "No se pudo cambiar la miniatura",
+    "Highlight Spoken Words": "Resaltar la palabra pronunciada",
+    "Highlight Spoken Words Help": "Subtítulos palabra por palabra: la palabra pronunciada se resalta. Necesita marcas de tiempo por palabra del reconocimiento de voz; si no, vuelve a subtítulos de línea completa."
   }
 }
