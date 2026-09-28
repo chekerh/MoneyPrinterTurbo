@@ -16,7 +16,7 @@ TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
-import plans as repo_plans  # noqa: E402
+repo_plans = pytest.importorskip("plans", reason="requires the out-of-repo tools/ helpers (plans, archive_video), which live outside the git repository. They run in a local workspace that has that directory; everywhere else the module is skipped rather than failing collection.")  # noqa: E402
 
 from app.services import campaign as campaign_service  # noqa: E402
 

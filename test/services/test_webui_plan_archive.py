@@ -21,8 +21,8 @@ if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 # Main.py 用纯 `import plans`（tools 目录在 sys.path）；必须 patch 同一个模块对象。
-import archive_video  # noqa: E402
-import plans as repo_plans  # noqa: E402
+archive_video = pytest.importorskip("archive_video", reason="requires the out-of-repo tools/ helpers (plans, archive_video), which live outside the git repository. They run in a local workspace that has that directory; everywhere else the module is skipped rather than failing collection.")  # noqa: E402
+repo_plans = pytest.importorskip("plans", reason="requires the out-of-repo tools/ helpers (plans, archive_video), which live outside the git repository. They run in a local workspace that has that directory; everywhere else the module is skipped rather than failing collection.")  # noqa: E402
 
 ROOT_DIR = Path(__file__).parent.parent.parent
 WEBUI_MAIN = ROOT_DIR / "webui" / "Main.py"
