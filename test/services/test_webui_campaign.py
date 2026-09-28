@@ -26,6 +26,32 @@ import plans as repo_plans  # noqa: E402
 
 from app.services import campaign as campaign_service  # noqa: E402
 
+
+def _has_material_source_key() -> bool:
+    """素材源是否配了 key。campaign 的“抓取素材”一步真的会去请求外部接口。"""
+    try:
+        app_cfg = config.app
+    except Exception:  # noqa: BLE001
+        return False
+    for key in (
+        "pexels_api_keys",
+        "pixabay_api_keys",
+        "coverr_api_keys",
+        "wavespeed_api_keys",
+    ):
+        value = app_cfg.get(key)
+        if isinstance(value, str):
+            value = [value]
+        if value:
+            return True
+    return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _has_material_source_key(),
+    reason="campaign source fetching needs a configured material provider key (pexels/pixabay/coverr/wavespeed). config.example.toml ships empty key lists, so this test can only pass on a machine that has real keys in an untracked config.toml.",
+)
+
 ROOT_DIR = Path(__file__).parent.parent.parent
 WEBUI_MAIN = ROOT_DIR / "webui" / "Main.py"
 
