@@ -9,9 +9,15 @@ from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 from unittest import mock
 
+# 用 pyproject.toml 定位仓库根，而不是数 dirname()：原写法多套了一层，
+# 在本机恰好指到"仓库的上一级"。按标记文件找根不会数错层数。
 REPO_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+while REPO_ROOT != os.path.dirname(REPO_ROOT) and not os.path.isfile(
+    os.path.join(REPO_ROOT, "pyproject.toml")
+):
+    REPO_ROOT = os.path.dirname(REPO_ROOT)
 sys.path.insert(0, REPO_ROOT)
 
 from tools import plans  # noqa: E402

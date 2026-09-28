@@ -8,12 +8,17 @@ from datetime import date
 from pathlib import Path
 from unittest import mock
 
+# tools/ 现在随仓库一起提供。仓库根用 pyproject.toml 定位，而不是数 dirname()：
+# 原��写法多套了一层，在本机恰好指到"仓库的上一级"——那里也有个 tools/，
+# 于是本机全绿，干净克隆却 import 不到。按标记文件找根不会数错层数。
 REPO_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
+while REPO_ROOT != os.path.dirname(REPO_ROOT) and not os.path.isfile(
+    os.path.join(REPO_ROOT, "pyproject.toml")
+):
+    REPO_ROOT = os.path.dirname(REPO_ROOT)
 TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
-if not os.path.isdir(TOOLS_DIR):
-    TOOLS_DIR = os.path.join(os.path.dirname(REPO_ROOT), "tools")
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
