@@ -14,12 +14,14 @@ REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
+if not os.path.isdir(TOOLS_DIR):
+    TOOLS_DIR = os.path.join(os.path.dirname(REPO_ROOT), "tools")
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 # Main.py 用纯 `import plans`（tools 目录在 sys.path）；必须 patch 同一个模块对象，
 # 而不是 tools.plans（两者指向同一文件但可能作为两个模块加载）。
-repo_plans = pytest.importorskip("plans", reason="requires the out-of-repo tools/ helpers (plans, archive_video), which live outside the git repository. They run in a local workspace that has that directory; everywhere else the module is skipped rather than failing collection.")  # noqa: E402
+import plans as repo_plans  # noqa: E402
 
 ROOT_DIR = Path(__file__).parent.parent.parent
 WEBUI_MAIN = ROOT_DIR / "webui" / "Main.py"

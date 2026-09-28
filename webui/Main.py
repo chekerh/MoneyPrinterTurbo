@@ -29,7 +29,13 @@ sys.path.insert(0, root_dir)
 
 # 内容计划工具位于仓库 tools/ 目录。WebUI 复用同一份计划读取逻辑，保证
 # 页面展示的待生成/已发布状态与 daily_youtube_short.sh 命令行流水线一致。
-tools_dir = os.path.join(os.path.dirname(root_dir), "tools")
+# plans / archive_video 现在随仓库一起提供，放在 <repo>/tools 下。
+# 早先它们在**仓库之外**（上一级目录），于是本机能跑、干净克隆跑不了：
+# 干净环境里 `import plans` 直接 ModuleNotFoundError，整个 WebUI 起不来。
+# 仍然回退到上一级目录，是为了兼容还没迁移的本地工作区。
+tools_dir = os.path.join(root_dir, "tools")
+if not os.path.isdir(tools_dir):
+    tools_dir = os.path.join(os.path.dirname(root_dir), "tools")
 if tools_dir not in sys.path:
     sys.path.insert(0, tools_dir)
 

@@ -1,7 +1,6 @@
 import json
 import os
 
-import pytest
 import sys
 import tempfile
 import unittest
@@ -13,12 +12,14 @@ REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
+if not os.path.isdir(TOOLS_DIR):
+    TOOLS_DIR = os.path.join(os.path.dirname(REPO_ROOT), "tools")
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 # tools 目录本身已在 sys.path（与 Main.py 一致），直接导入 tools 内的模块。
-archive_video = pytest.importorskip("archive_video", reason="requires the out-of-repo tools/ helpers (plans, archive_video), which live outside the git repository. They run in a local workspace that has that directory; everywhere else the module is skipped rather than failing collection.")  # noqa: E402
-plans = pytest.importorskip("plans", reason="requires the out-of-repo tools/ helpers (plans, archive_video), which live outside the git repository. They run in a local workspace that has that directory; everywhere else the module is skipped rather than failing collection.")  # noqa: E402
+import archive_video  # noqa: E402
+import plans  # noqa: E402
 
 
 class TestArchiveChannelVideo(unittest.TestCase):
