@@ -8777,6 +8777,19 @@ def _page_login():
             # 但先说清现在点了不会有反应，免得被当成界面坏了。
             st.caption(tr("Login Sign In Blocked"))
 
+        # Google 把授权错误渲染在**浏览器里**，本地回调服务器看不到，异常只会
+        # 以超时形式回到应用。也就是说：应用里写的错误诊断，用户永远读不到。
+        # 于是把最常见的两个前置条件写在点击之前——否则用户只能对着 Google 的
+        # 错误页猜，而那两句话正是全部原因。
+        with st.expander(tr("Login Preflight"), expanded=True):
+            st.markdown(
+                f'<ul class="mpt-steps">'
+                f"<li>{html.escape(tr('Login Preflight TestUsers'))}</li>"
+                f"<li>{html.escape(tr('Login Preflight Production'))}</li>"
+                f"</ul>",
+                unsafe_allow_html=True,
+            )
+
         st.caption(tr("Login Remembered Note"))
         columns = st.columns(3)
         for index, channel in enumerate(channels):
@@ -8794,6 +8807,10 @@ def _page_login():
                         )
                         if info.get("channel_mismatch"):
                             st.warning(tr("Channel Mismatch Warning"))
+                    elif info.get("needs_reauth"):
+                        # 连过、但 token 过期了。这不是"还没连"，是"要重新连"，
+                        # 而且多半是同意屏幕停在 Testing 导致的。
+                        st.error(tr("Pipeline Publish Expired"))
                     else:
                         st.warning(tr("Pipeline Publish Missing"))
                     _render_youtube_connect_button(

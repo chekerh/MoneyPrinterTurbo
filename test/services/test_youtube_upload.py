@@ -361,3 +361,52 @@ class TestAccountSelectionIsNeverForced:
         assert "login_hint" not in query, "授权请求里出现了 login_hint"
         assert "hd" not in query, "授权请求里出现了 hd（会锁死账号域）"
         assert "select_account" in query["prompt"][0]
+
+
+class TestExpiredTokenIsNamedNotBuried:
+    """token 过期必须被命名，不能只留一句 invalid_grant。
+
+    同意屏幕停在 Testing 时，Google 会在 7 天后让 refresh token 失效。定时
+    任务在凌晨失败，日志里只有异常字符串；用户第二天早上看到的应该是
+    "这个频道要重新登录"，而不是让他自己去翻译 invalid_grant。
+    """
+
+    def test_marks_the_common_expiry_errors(self):
+        from app.services.youtube_upload import needs_reauthorization
+
+        for text in (
+            "invalid_grant: Token has been expired or revoked.",
+            "invalid_rapt",
+            "invalid_token",
+            "Token has been expired or revoked",
+        ):
+            assert needs_reauthorization(text), f"{text!r} 没有被识别为需要重新登录"
+
+    def test_does_not_flag_unrelated_failures(self):
+        from app.services.youtube_upload import needs_reauthorization
+
+        for text in ("quotaExceeded", "uploadLimitExceeded", "connection reset"):
+            assert not needs_reauthorization(text), f"{text!r} 被误判成 token 过期"
+
+    def test_channel_info_marks_reauth_instead_of_generic_failure(self):
+        from unittest.mock import patch
+
+        from app.services import youtube_upload
+
+        # is_configured 必须为真：否则 channel_info 会在"本机还没有 token"
+        # 那一层就返回，根本走不到真正调用 API、抛 invalid_grant 的分支。
+        with (
+            patch.object(youtube_upload, "is_configured", return_value=True),
+            patch.object(
+                youtube_upload,
+                "_service_for",
+                side_effect=Exception(
+                    "invalid_grant: Token has been expired or revoked."
+                ),
+            ),
+        ):
+            result = youtube_upload.channel_info("some-niche")
+
+        assert result["success"] is False
+        assert result.get("needs_reauth") is True, "过期 token 没有被标记"
+        assert "signed in again" in result["error"].lower()

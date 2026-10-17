@@ -165,6 +165,35 @@ def redirect_uri_hint() -> str:
     return _loopback_uri("localhost", LOCAL_SERVER_PORT_BASE)
 
 
+#: 出现这些字符串就说明 token 已经不能用了，必须重新授权。
+#:
+#: 最常见的来源是同意屏幕停在 **Testing**：Google 在这种模式下签发的 refresh
+#: token **7 天后就失效**。定时任务在凌晨失败，日志里只有一句 invalid_grant，
+#: 而用户要等到第二天早上才看到"发布失败"。这里把它标成"需要重新登录"，让
+#: 界面能直接说出来，而不是让人自己翻译异常字符串。
+_REAUTH_ERROR_MARKERS = (
+    "invalid_grant",
+    "invalid_rapt",
+    "Token has been expired or revoked",
+    "invalid_token",
+    "could not refresh access token",
+    "reauth related error",
+    "invalid_grant: Token has been expired",
+)
+
+REAUTH_MESSAGE = (
+    "This niche needs to be signed in again — the saved token is no longer valid. "
+    "If your OAuth consent screen is still in Testing, Google expires refresh "
+    "tokens after 7 days; switch it to In production so this stops recurring."
+)
+
+
+def needs_reauthorization(error: object) -> bool:
+    """判断一个异常是否意味着"token 没了，必须重新登录"。"""
+    text = str(error or "").lower()
+    return any(marker.lower() in text for marker in _REAUTH_ERROR_MARKERS)
+
+
 def explain_oauth_failure(error: object) -> tuple[str, str]:
     """把 OAuth 失败翻译成 ``(原因, 怎么做)``；认不出来的就原样返回。
 
@@ -381,7 +410,13 @@ def channel_info(channel: str) -> dict:
         ).execute()
     except Exception as exc:  # noqa: BLE001
         logger.exception(f"failed to load YouTube channel info for {channel!r}")
-        return {"success": False, "channel": channel, "error": str(exc)}
+        result = {"success": False, "channel": channel, "error": str(exc)}
+        # 登录屏用这个字段区分"还没连过"与"连过但 token 过期了"——两者的下一步
+        # 完全不同：前者点登录，后者先修同意屏幕状态再点登录。
+        if needs_reauthorization(exc):
+            result["needs_reauth"] = True
+            result["error"] = REAUTH_MESSAGE
+        return result
 
     items = response.get("items") or []
     if not items:
@@ -564,7 +599,19 @@ def publish_video(
     except Exception as exc:  # noqa: BLE001
         logger.exception(f"youtube upload failed for niche {channel!r}")
         # A network exception may occur after the remote upload completed.
-        return {"success": False, "error": str(exc), "channel": channel, "outcome_unknown": True}
+        result = {
+            "success": False,
+            "error": str(exc),
+            "channel": channel,
+            "outcome_unknown": True,
+        }
+        # 定时任务在凌晨跑，没人盯着日志。把"需要重新登录"标出来，界面才能
+        # 主动说清楚，而不是只留一句 invalid_grant 让用户自己翻译。
+        if needs_reauthorization(exc):
+            result["needs_reauth"] = True
+            result["error"] = REAUTH_MESSAGE
+            result["technical_error"] = str(exc)[:200]
+        return result
 
 
 class YouTubeUploadService:
