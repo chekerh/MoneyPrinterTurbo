@@ -43,7 +43,7 @@ def test_kimi_platform_selection_keeps_endpoint_configuration_consistent():
     ):
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
         app.session_state["ui_language"] = "en"
-        app.session_state["settings_dialog_open"] = True
+        app.session_state["nav_view"] = "settings"
         app.run()
 
         assert [str(item.value) for item in app.exception] == []

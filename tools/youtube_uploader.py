@@ -1,13 +1,13 @@
-"""Publish generated videos to YouTube via the user's real Chrome.
+"""DEPRECATED legacy path — publishing now goes through the YouTube Data API.
 
-Drives Studio.youtube.com in a persistent, per-channel Chrome profile
-using Playwright. No OAuth API key is required: the account logged in
-inside the profile is the channel that receives the upload.
+Nothing in this repo calls this script anymore. Scheduled and manual publishing
+run ``tools/publish_video.py`` (or the WebUI button), which is pure HTTPS and
+never launches a browser.
 
-Commands:
-  --check              report whether the profile is logged in to Studio
-  --login              open Studio in the profile for a manual one-time login
-  --publish <mp4>      upload a video with --title / --description
+It is kept only as a manual escape hatch for inspecting a Chrome profile. The
+launcher is **headless by default** so that running it by accident can never
+open a window over the user's work; set ``MPT_BROWSER_HEADLESS=0`` only when you
+deliberately want to watch it.
 """
 
 import argparse
@@ -17,8 +17,12 @@ import re
 import time
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-PROFILE_ROOT = os.path.join(BASE_DIR, "MoneyPrinterTurbo", "storage", "browser_profiles")
-DEBUG_DIR = os.path.join(BASE_DIR, "MoneyPrinterTurbo", "storage", "browser_debug")
+# BASE_DIR 已经是仓库根（tools/ 的上两级），不要再拼一层 "MoneyPrinterTurbo"：
+# 多出来的那一段会指向 <repo>/MoneyPrinterTurbo/MoneyPrinterTurbo/storage/... 这个
+# 无人认领的嵌套目录。后果不只是路径难看——Chrome 的 cookie 与会话状态因此落在
+# ``storage_policy.PERSISTENT_SUBDIRS`` 之外，而且整个目录没被 .gitignore 覆盖。
+PROFILE_ROOT = os.path.join(BASE_DIR, "storage", "browser_profiles")
+DEBUG_DIR = os.path.join(BASE_DIR, "storage", "browser_debug")
 STUDIO_URL = "https://studio.youtube.com"
 LOGIN_TIMEOUT_S = 180
 UPLOAD_TIMEOUT_S = 300
@@ -64,11 +68,20 @@ def _poll_until(predicate, timeout, interval=1.0):
     return False
 
 
+def _headless() -> bool:
+    """Headless unless someone explicitly opts into a visible window.
+
+    默认无头：这个脚本曾经让 launchd 的定时任务弹出真实 Chrome 窗口，抢占正在
+    使用的桌面。只有手动排查时才用 MPT_BROWSER_HEADLESS=0 打开窗口。
+    """
+    return os.environ.get("MPT_BROWSER_HEADLESS", "1").strip() not in ("0", "false", "False")
+
+
 def _launch(pw, channel):
     context = pw.chromium.launch_persistent_context(
         _profile_dir(channel),
         channel="chrome",
-        headless=False,
+        headless=_headless(),
         viewport={"width": 1440, "height": 900},
         args=["--disable-blink-features=AutomationControlled"],
     )

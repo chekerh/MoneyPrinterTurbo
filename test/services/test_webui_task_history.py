@@ -6,11 +6,18 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
+import streamlit as st
+
+from app.services.project_layout import resolve_project_layout
+
 
 ROOT_DIR = Path(__file__).parent.parent.parent
 WEBUI_MAIN = ROOT_DIR / "webui" / "Main.py"
 TASK_HISTORY_HELPERS = {
     "_find_final_task_video",
+    "_task_final_video_dir",
+    "_task_final_video_dirs",
+    "_cached_project_layout",
     "_is_settled_video_file",
     "_probe_video_dimensions",
     "_build_video_download_name",
@@ -23,6 +30,7 @@ TASK_HISTORY_CONSTANTS = {
     "_MEDIA_PROBE_TIMEOUT_SECONDS",
     "_VIDEO_SETTLE_SECONDS",
     "_VIDEO_DIMENSIONS_CACHE",
+    "_VIDEO_DIMENSIONS_CACHE_MAX_ENTRIES",
     "VOICE_MODE_TTS",
     "VOICE_MODE_UPLOAD",
     "VOICE_MODE_NONE",
@@ -31,6 +39,12 @@ TASK_HISTORY_CONSTANTS = {
 
 class _NullLogger:
     def debug(self, *args, **kwargs):
+        pass
+
+    def warning(self, *args, **kwargs):
+        # 布局解析失败是 _cached_project_layout 的正常分支：它会记一条 warning
+        # 然后返回 None，由调用方按"成片位置未知"处理。缺了这个方法，异常会被
+        # AttributeError 顶掉，用例失败的原因就变成日志替身本身而不是被测逻辑。
         pass
 
 
@@ -66,6 +80,10 @@ def _load_task_history_helpers():
         "subprocess": subprocess,
         "Mapping": Mapping,
         "logger": _NullLogger(),
+        # _cached_project_layout 带 @st.cache_resource 装饰器，exec 时需要 st 在场。
+        # 单元测试只关心"成片在哪个目录"，不关心布局解析。
+        "st": st,
+        "resolve_project_layout": resolve_project_layout,
     }
     module = ast.fix_missing_locations(ast.Module(body=selected_nodes, type_ignores=[]))
     exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)

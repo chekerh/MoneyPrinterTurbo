@@ -23,7 +23,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.services.thumbnail_jobs import (
-    STALE_RUNNING_SECONDS,
     JobState,
     ThumbnailJobManager,
     get_job_manager,
@@ -310,13 +309,21 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TestRestartResumesQueuedWork(unittest.TestCase):
+class TestRestartDoesNotResurrectOrphanedWork(unittest.TestCase):
     """
-    进程重启后，排队中的作业必须有人接手。
+    进程重启后，排队中的作业必须立刻有个明确的说法。
 
-    之前只把过期的 queued/running 标成 unknown，导致一个 5 分钟前提交、
-    但进程刚崩的作业会永远停在"排队中"——既没人执行，也没人告诉用户。
-    状态文件是本进程可以重建的缓存，所以重启时重新排队是正确的做法。
+    早先这里尝试"把过期的标 unknown、新鲜的重新排队"。重新排队是**做不到的**：
+    状态文件里只存了作业元数据（``JobRecord``），执行所需的 ``source`` /
+    ``font_path`` / ``overlay_text`` 都不在其中——``_store`` 里写进 JSON 的
+    ``request`` 字段会被 ``JobRecord.from_json`` 直接丢弃。于是重排队只把一个
+    ``job_id`` 字符串塞回队列，而 worker 按 ``(job_id, request, tools)`` 三元组
+    解包，解包异常发生在 try 之外：**整条 worker 线程当场退出**，之后所有缩略图
+    作业永远停在"生成中"，且除了一条线程异常告警之外没有任何症状。
+
+    在 ``scratch_mode = "ram"``（出厂默认）下，源文件本来就在内存盘上，进程一重启
+    就没了，重跑必然失败。因此现在的选择是如实标成 unknown 并让用户重新提交，
+    而不是假装能续跑。
     """
 
     def _store(self, root: Path, state: str, age_seconds: float) -> None:
@@ -344,7 +351,8 @@ class TestRestartResumesQueuedWork(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def test_fresh_queued_job_is_requeued_not_left_stuck(self):
+    def test_a_fresh_queued_job_is_reported_not_left_stuck_forever(self):
+        """新鲜的排队作业也必须落到终态，并说清为什么。"""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "thumbnails" / "task-restart"
             root.mkdir(parents=True)
@@ -353,26 +361,34 @@ class TestRestartResumesQueuedWork(unittest.TestCase):
 
             manager = ThumbnailJobManager(root)
             try:
-                records = manager.list_jobs("task-restart")
-                self.assertEqual(records[0]["state"], "queued")
-                # 关键：必须有执行者接手，而不是永远排队
-                self.assertTrue(manager.has_pending("task-restart"))
+                record = manager.list_jobs("task-restart")[0]
+                self.assertEqual(record["state"], "unknown")
+                self.assertIn("重新提交", record["error"])
+                # 没有执行者接手，就不能还挂着 pending，否则界面永远转圈
+                self.assertFalse(manager.has_pending("task-restart"))
             finally:
                 manager.shutdown(wait=True, timeout=2)
 
-    def test_expired_job_is_marked_unknown_not_requeued(self):
-        """超过过期阈值的作业已经无法判断结果，标 unknown 比盲目重跑安全。"""
+    def test_the_worker_thread_survives_a_restart_with_pending_records(self):
+        """
+        带着未完成记录重启之后，worker 线程必须还活着。
+
+        线程一旦被一条坏队列项掀翻，后续所有作业都只会堆在"生成中"，而唯一线索
+        是一条被测试框架吞掉的线程异常告警。这里显式检查线程存活，把那个"没人
+        看得见的死法"钉住。
+        """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "thumbnails" / "task-restart"
             root.mkdir(parents=True)
-            self._store(root, "queued", age_seconds=STALE_RUNNING_SECONDS + 120)
+            # 很久以前留下的：早先只有超过过期阈值的才会被标 unknown
+            self._store(root, "running", age_seconds=6 * 3600)
 
             manager = ThumbnailJobManager(root)
             try:
-                self.assertEqual(
-                    manager.list_jobs("task-restart")[0]["state"], "unknown"
+                alive = manager._worker.is_alive()
+                self.assertTrue(
+                    alive, "重启后 worker 线程死了；此后缩略图作业会永远停在生成中"
                 )
-                self.assertFalse(manager.has_pending("task-restart"))
             finally:
                 manager.shutdown(wait=True, timeout=2)
 

@@ -1,12 +1,27 @@
 """Read and update the per-channel content plans used by the WebUI scheduler.
 
-Plan layout (repo root):
+Plan layout (portfolio root, NOT the application root):
   plans/<channel>/topics_30day.txt       one topic per line
   plans/<channel>/automation.env          KEY=value generation overrides
   plans/<channel>/system_prompt.txt       script system prompt
   plans/<channel>/channel_description.md  upload description
   outputs/<channel>/<YYYY-MM>/monthly-plan.md   recorded status table
   .daily_topic_index.<channel>            last generated topic index
+
+The portfolio root is a *different tree* from the application root, and this
+module is imported both by the WebUI (which has config.toml available) and by
+the shell pipeline (which runs it as a bare script). So the root is resolved
+explicitly — MPT_PORTFOLIO_ROOT, then config.toml, then a directory that
+actually holds a plans/ folder — and never from where this file happens to sit.
+
+Deriving the root from ``__file__`` used to work by accident: this file lived at
+<portfolio>/tools/plans.py, so ``dirname(dirname(__file__))`` *was* the
+portfolio root. Vendoring tools/ into the application repository (commit 51ac3b4)
+silently repointed that guess at the application root, which has no plans/ — so
+``list_channels()`` returned [] and the WebUI's plan and media-library panels
+rendered as empty expanders with no error anywhere. A positional guess cannot
+distinguish "moved the file" from "moved the data"; explicit configuration can.
+See :func:`resolve_portfolio_root`.
 """
 
 import os
@@ -14,7 +29,108 @@ import re
 import sys
 from datetime import date, datetime, timedelta
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+#: Overrides the configured portfolio root for a single run, matching the
+#: variable ``app.services.project_layout`` already honours.
+PORTFOLIO_ROOT_ENV_VAR = "MPT_PORTFOLIO_ROOT"
+
+
+def _looks_like_portfolio_root(directory: str) -> bool:
+    """A portfolio root is a directory that actually holds a ``plans/`` folder.
+
+    Anchoring on real content rather than on a fixed number of ``dirname``
+    levels is what makes this survive the file being moved between trees.
+    """
+    return os.path.isdir(os.path.join(directory, "plans"))
+
+
+def _config_candidates(base_dir: str) -> list[str]:
+    """Where config.toml may live, nearest first.
+
+    ``base_dir`` is this file's own parent-of-parent. When tools/ is vendored
+    inside the application repository that is the application root and the
+    config sits right there; when tools/ still sits in the portfolio root the
+    application is the nested MoneyPrinterTurbo/ directory.
+    """
+    candidates = [
+        os.path.join(base_dir, "config.toml"),
+        os.path.join(base_dir, "MoneyPrinterTurbo", "config.toml"),
+    ]
+
+    def _depth(path: str) -> int:
+        return len(os.path.normpath(path).split(os.sep))
+
+    return sorted(dict.fromkeys(candidates), key=_depth)
+
+
+def _portfolio_root_from_config(base_dir: str) -> str:
+    """Read ``[app] portfolio_root`` from the first config.toml that has one.
+
+    Uses stdlib ``tomllib`` rather than the app's ``toml`` package so this keeps
+    working when invoked by the shell pipeline against a bare interpreter. Any
+    failure — missing module, missing file, unparseable TOML, absent key — means
+    "not configured here", and the caller keeps looking.
+    """
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        return ""
+
+    for config_path in _config_candidates(base_dir):
+        try:
+            with open(config_path, "rb") as handle:
+                data = tomllib.load(handle)
+        except (OSError, ValueError):
+            continue
+        app_section = data.get("app")
+        if not isinstance(app_section, dict):
+            continue
+        value = app_section.get("portfolio_root")
+        if isinstance(value, str) and value.strip():
+            return os.path.expanduser(value.strip())
+    return ""
+
+
+def resolve_portfolio_root() -> str:
+    """Resolve the directory that owns ``plans/`` and ``outputs/``.
+
+    Precedence, most explicit first:
+
+    1. ``MPT_PORTFOLIO_ROOT`` — a deliberate per-run override.
+    2. ``[app] portfolio_root`` in config.toml — the declared setting.
+    3. A directory that actually contains ``plans/``, searched outward from this
+       file. This keeps a bare ``python tools/plans.py`` working on a checkout
+       with no config, and is content-anchored rather than level-counted so
+       moving this file cannot silently repoint it at the wrong tree.
+
+    An explicitly configured root is returned even when it has no ``plans/``
+    folder: that is a real configuration the user must see take effect, not
+    something to paper over by guessing somewhere else. Only the search in (3)
+    can fall through.
+    """
+    base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+    configured = os.environ.get(PORTFOLIO_ROOT_ENV_VAR, "").strip()
+    if configured:
+        return os.path.expanduser(configured)
+
+    configured = _portfolio_root_from_config(base_dir)
+    if configured:
+        return configured
+
+    current = base_dir
+    while True:
+        if _looks_like_portfolio_root(current):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            # Nothing configured and nothing found. Return the positional guess
+            # so error messages still name a concrete path, and list_channels()
+            # returns [] exactly as it did before this change.
+            return base_dir
+        current = parent
+
+
+BASE_DIR = resolve_portfolio_root()
 PLANS_DIR = os.path.join(BASE_DIR, "plans")
 OUTPUTS_DIR = os.path.join(BASE_DIR, "outputs")
 
@@ -62,20 +178,39 @@ def load_topics(channel: str) -> list[str]:
     return topics
 
 
+def _current_period() -> str:
+    """
+    当前月份，``YYYY-MM``。
+
+    单独抽出来是为了可测：跨月行为是本模块最容易回归的地方（``current_plan_dir``
+    曾经返回"最新的已有月份"而不是当前月份），而 ``datetime`` 是 C 类型，直接
+    打桩 ``datetime.now`` 并不总是可行。
+    """
+    return datetime.now().strftime("%Y-%m")
+
+
 def current_plan_dir(channel: str) -> str:
+    """
+    本月计划目录：``outputs/<channel>/<YYYY-MM>``，按**当前日期**取值。
+
+    早先这里返回"磁盘上最新的一个已有月份"，于是每次跨月都会出错：上个月已经
+    建好 2026-09，而命令行流水线 ``archive_video.sh`` 用的是
+    ``$(date +%Y-%m)``，也就是 2026-10。WebUI 继续往 9 月写，命令行往 10 月写，
+    同一批视频被拆进两个月度计划里。
+
+    更糟的是配合"主题已录制就跳过"的归档逻辑：10 月的空计划里所有行都是
+    pending，``first_pending_topic`` 于是反复返回 #1；而 ``_plan_topic_recorded``
+    跨所有月份扫描，发现 #1 在 9 月已录制，就把新成片静默丢弃。按下
+    "生成今日视频"要花两个多小时，成片渲完就被扔掉，且没有任何提示。
+
+    所以这里必须跟命令行一样按"今天是哪个月"取，而不是按"磁盘上有什么月"。
+    需要读历史月份的地方走 :func:`_monthly_plan_dirs`，它本来就遍历全部月份。
+    """
     root = _outputs_channel_dir(channel)
-    if not os.path.isdir(root):
-        os.makedirs(root, exist_ok=True)
-        return os.path.join(root, datetime.now().strftime("%Y-%m"))
-    periods = [
-        name
-        for name in os.listdir(root)
-        if os.path.isdir(os.path.join(root, name)) and len(name) == 7 and name[4] == "-"
-    ]
-    if not periods:
-        return os.path.join(root, datetime.now().strftime("%Y-%m"))
-    periods.sort(reverse=True)
-    return os.path.join(root, periods[0])
+    target = os.path.join(root, _current_period())
+    if not os.path.isdir(target):
+        os.makedirs(target, exist_ok=True)
+    return target
 
 
 def load_monthly_plan(channel: str) -> list[dict]:
@@ -258,24 +393,58 @@ def find_recent_duplicates(channel: str, days: int = 60) -> list[dict]:
     return duplicates
 
 
+def recorded_topics(channel: str) -> set[str]:
+    """A channel's already-recorded topics, normalised, across **every** month.
+
+    Keyed on the topic **text**, not the row number. The monthly plan file resets
+    each month while ``topics_30day.txt`` is one rolling 30-topic list, so index 1
+    means the same thing in October as in September *for a channel whose topics did
+    not change*. A channel that rewrites its topic list breaks that assumption, and
+    then index 1 in the new month is a different topic entirely. Matching on text
+    is correct in both cases.
+
+    Text is also what :func:`iter_all_plan_rows` exposes and what the WebUI's
+    duplicate check compares, so offering and archiving finally look at the same
+    key. They did not before, and that mismatch is what made the daily button
+    render videos the archiver then threw away.
+    """
+    recorded: set[str] = set()
+    for _plan_dir, row in iter_all_plan_rows(channel):
+        if row["recorded"]:
+            topic = str(row["topic"] or "").strip().lower()
+            if topic:
+                recorded.add(topic)
+    return recorded
+
+
 def first_pending_topic(
     channel: str, skip_recent_days: int | None = None
 ) -> tuple[int, str] | None:
-    """Return the first unposted topic of the current month's plan.
+    """Return the first topic of this channel that has not been recorded yet.
+
+    The check spans every month on purpose. It used to read only the current
+    month's plan file, and that produced a dated money leak: on the first of each
+    month the plan resets to all-pending, so the daily button offered topic #1
+    again even though #1 had been made the month before. A full render then ran,
+    and the archiver discarded the result because *its* duplicate check already
+    scanned all months. The button never advanced, so this repeated every single
+    day of the month.
+
+    A topic recorded in any month is done, and is never offered again. When every
+    topic has been made this returns ``None`` so the caller can say so, rather
+    than quietly re-rendering one and calling it progress.
 
     With skip_recent_days set, topics whose slug was already produced in that
-    many days are skipped, returning the next pending non-duplicate topic. If
-    every pending topic is a recent duplicate, the first pending one is
-    returned as a fallback so the scheduler still makes progress. With
-    skip_recent_days None/0, behavior is unchanged.
+    many days are skipped, returning the next pending non-duplicate topic. That is
+    a separate "not too soon" heuristic and only ranks topics that are not already
+    recorded. With skip_recent_days None/0, behavior is unchanged.
     """
     topics = load_topics(channel)
-    rows = {row["index"]: row for row in load_monthly_plan(channel)}
+    recorded = recorded_topics(channel)
     recent = recent_topic_slugs(channel, skip_recent_days) if skip_recent_days else None
     first_pending = None
     for index, topic in enumerate(topics, start=1):
-        row = rows.get(index)
-        if row and row["recorded"]:
+        if str(topic or "").strip().lower() in recorded:
             continue
         if first_pending is None:
             first_pending = (index, topic)

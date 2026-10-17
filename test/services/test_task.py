@@ -26,6 +26,11 @@ RUN_INTEGRATION_TESTS = os.environ.get("MPT_RUN_INTEGRATION_TESTS", "").lower() 
 
 class TestTaskService(unittest.TestCase):
     def setUp(self):
+        # Pipeline unit tests fake their final media; copy generation and durable
+        # artifacts are covered using real temporary paths in test_posting_package.
+        copy_patcher = patch.object(tm, "_prepare_posting_copy", return_value=None)
+        copy_patcher.start()
+        self.addCleanup(copy_patcher.stop)
         # 发布 Future 注册表是进程级状态。测试间清理可以避免某个模拟 Future
         # 影响后续恢复测试，同时不会触碰真正线程池中的生产任务。
         with tm._cross_post_registry_lock:
@@ -1230,7 +1235,7 @@ class TestTaskService(unittest.TestCase):
                 "is_configured",
                 return_value=False,
             ),
-            patch.object(tm.upload_post, "cross_post_video") as cross_post,
+            patch.object(tm.publishing, "publish") as cross_post,
             patch.object(tm.sm.state, "update_task") as update_task,
         ):
             result = tm.start("complete-video", params)
@@ -1351,6 +1356,7 @@ class TestTaskService(unittest.TestCase):
             return future
 
         with (
+            patch.dict(tm.config.app, {"youtube_upload_privacy_status": "unlisted"}),
             patch.object(tm, "generate_script", return_value="generated script"),
             patch.object(tm, "generate_terms", return_value=["coffee"]),
             patch.object(tm, "save_script_data"),
@@ -1378,15 +1384,15 @@ class TestTaskService(unittest.TestCase):
             patch.object(type(service), "auto_upload", new_callable=PropertyMock, return_value=True),
             patch.object(type(service), "platforms", new_callable=PropertyMock, return_value=["youtube"]),
             patch.object(type(service), "youtube_privacy_status", new_callable=PropertyMock, return_value="unlisted"),
-            patch.object(tm.youtube_upload, "is_configured", return_value=True),
+            patch.object(tm.publishing, "connected_platforms", return_value=["youtube"]),
             patch.object(
                 tm.llm,
                 "generate_social_metadata",
                 return_value=metadata,
             ) as generate_metadata,
             patch.object(
-                tm.upload_post,
-                "cross_post_video",
+                tm.publishing,
+                "publish",
                 side_effect=[
                     {"success": True},
                     {"success": False, "error": "upload failed"},
@@ -1416,7 +1422,15 @@ class TestTaskService(unittest.TestCase):
         }
         self.assertEqual(cross_post.call_count, 2)
         for call in cross_post.call_args_list:
-            self.assertEqual(call.kwargs["youtube_extra"], expected_extra)
+            meta = call.kwargs["meta"]
+            self.assertEqual(meta.title, expected_extra["youtube_title"])
+            self.assertEqual(
+                meta.description, expected_extra["youtube_description"]
+            )
+            self.assertEqual(list(meta.tags), expected_extra["tags"])
+            self.assertEqual(
+                meta.privacy_status, expected_extra["privacyStatus"]
+            )
             self.assertEqual(call.kwargs["platforms"], ["youtube"])
 
         # start() 返回的是视频完成时的稳定快照；后台发布结果通过任务查询获取。
@@ -1467,7 +1481,7 @@ class TestTaskService(unittest.TestCase):
             patch.object(type(service), "auto_upload", new_callable=PropertyMock, return_value=True),
             patch.object(type(service), "platforms", new_callable=PropertyMock, return_value=["tiktok"]),
             patch.object(type(service), "youtube_privacy_status", new_callable=PropertyMock, return_value="private"),
-            patch.object(tm.upload_post, "cross_post_video") as cross_post,
+            patch.object(tm.publishing, "publish") as cross_post,
             patch.object(tm.sm, "state", state),
             patch.object(
                 tm._cross_post_executor,
@@ -1489,8 +1503,8 @@ class TestTaskService(unittest.TestCase):
         with (
             patch.object(tm.sm, "state", state),
             patch.object(
-                tm.upload_post,
-                "cross_post_video",
+                tm.publishing,
+                "publish",
                 return_value={"success": True, "request_id": "upload-1"},
             ),
         ):
@@ -1520,7 +1534,7 @@ class TestTaskService(unittest.TestCase):
                 "generate_social_metadata",
                 side_effect=RuntimeError("metadata provider unavailable"),
             ),
-            patch.object(tm.upload_post, "cross_post_video") as cross_post,
+            patch.object(tm.publishing, "publish") as cross_post,
         ):
             tm._run_cross_post(
                 "cross-post-worker-failure",
@@ -1530,6 +1544,7 @@ class TestTaskService(unittest.TestCase):
                 "en",
                 ("youtube",),
                 "private",
+                        "history-mysteries",
             )
 
         cross_post.assert_not_called()
@@ -1612,6 +1627,7 @@ class TestTaskService(unittest.TestCase):
                 video_script="A short coffee story.",
                 platforms=["tiktok"],
                 youtube_privacy_status="private",
+                channel="history-mysteries",
             )
 
         slots.release.assert_called_once_with()
@@ -1656,7 +1672,7 @@ class TestTaskService(unittest.TestCase):
 
         with (
             patch.object(tm.sm, "state", state),
-            patch.object(tm.upload_post, "cross_post_video") as cross_post,
+            patch.object(tm.publishing, "publish") as cross_post,
             patch.object(tm.logger, "exception") as log_exception,
             patch.object(tm.time, "sleep") as sleep,
         ):
@@ -1668,6 +1684,7 @@ class TestTaskService(unittest.TestCase):
                 "en",
                 ("tiktok",),
                 "private",
+                        "history-mysteries",
             )
 
         cross_post.assert_not_called()
@@ -1716,8 +1733,8 @@ class TestTaskService(unittest.TestCase):
                 },
             ),
             patch.object(
-                tm.upload_post,
-                "cross_post_video",
+                tm.publishing,
+                "publish",
                 return_value={"success": True, "request_id": "upload-1"},
             ) as cross_post,
             patch.object(tm.time, "sleep") as sleep,
@@ -1730,6 +1747,7 @@ class TestTaskService(unittest.TestCase):
                 "en",
                 ("tiktok",),
                 "private",
+                        "history-mysteries",
             )
 
         sleep.assert_called_once_with(tm._CROSS_POST_STATE_RETRY_DELAY_SECONDS)
@@ -1772,8 +1790,8 @@ class TestTaskService(unittest.TestCase):
                         return_value=metadata,
                     ) as generate_metadata,
                     patch.object(
-                        tm.upload_post,
-                        "cross_post_video",
+                        tm.publishing,
+                        "publish",
                         return_value={"success": True},
                     ) as cross_post,
                 ):
@@ -1785,6 +1803,7 @@ class TestTaskService(unittest.TestCase):
                         "en",
                         platforms,
                         "private",
+                "history-mysteries",
                     )
 
                 generate_metadata.assert_called_once_with(
@@ -1795,9 +1814,10 @@ class TestTaskService(unittest.TestCase):
                 )
                 cross_post.assert_called_once()
                 call = cross_post.call_args
-                self.assertEqual(call.kwargs["title"], "Watch this coffee ritual.")
+                self.assertEqual(
+                    call.kwargs["meta"].title, "Watch this coffee ritual."
+                )
                 self.assertEqual(call.kwargs["platforms"], list(platforms))
-                self.assertIsNone(call.kwargs["youtube_extra"])
                 task = state.get_task(task_id)
                 self.assertEqual(
                     task["cross_post_state"], tm.const.CROSS_POST_STATE_COMPLETE
@@ -1827,8 +1847,8 @@ class TestTaskService(unittest.TestCase):
                 return_value=metadata,
             ) as generate_metadata,
             patch.object(
-                tm.upload_post,
-                "cross_post_video",
+                tm.publishing,
+                "publish",
                 return_value={"success": True},
             ) as cross_post,
         ):
@@ -1840,6 +1860,7 @@ class TestTaskService(unittest.TestCase):
                 "en",
                 ("youtube",),
                 "unlisted",
+                        "history-mysteries",
             )
 
         generate_metadata.assert_called_once_with(
@@ -1857,8 +1878,14 @@ class TestTaskService(unittest.TestCase):
         }
         self.assertEqual(cross_post.call_count, 2)
         for call in cross_post.call_args_list:
-            self.assertEqual(call.kwargs["title"], "A better morning.")
-            self.assertEqual(call.kwargs["youtube_extra"], expected_extra)
+            meta = call.kwargs["meta"]
+            # YouTube 用独立长标题，社交平台用共享文案，两者不能混。
+            self.assertEqual(meta.title, expected_extra["youtube_title"])
+            self.assertEqual(meta.caption, "A better morning.")
+            self.assertEqual(list(meta.tags), expected_extra["tags"])
+            self.assertEqual(
+                meta.description, expected_extra["youtube_description"]
+            )
 
     def test_cross_post_empty_metadata_degrades_to_fallback_title(self):
         """元数据缺失或为空时逐级退回，最终保留旧的通用兜底标题。"""
@@ -1890,8 +1917,8 @@ class TestTaskService(unittest.TestCase):
                         return_value=metadata,
                     ) as generate_metadata,
                     patch.object(
-                        tm.upload_post,
-                        "cross_post_video",
+                        tm.publishing,
+                        "publish",
                         return_value={"success": True},
                     ) as cross_post,
                 ):
@@ -1903,11 +1930,14 @@ class TestTaskService(unittest.TestCase):
                         "",
                         ("tiktok",),
                         "private",
+                "history-mysteries",
                     )
 
                 generate_metadata.assert_called_once()
                 cross_post.assert_called_once()
-                self.assertEqual(cross_post.call_args.kwargs["title"], expected_title)
+                self.assertEqual(
+                    cross_post.call_args.kwargs["meta"].title, expected_title
+                )
 
     def test_recover_interrupted_cross_posts_preserves_active_future(self):
         """启动恢复只处理遗留状态，当前进程仍持有的发布任务不能被误伤。"""
@@ -2154,6 +2184,7 @@ class TestTaskService(unittest.TestCase):
                 video_script="A short coffee story.",
                 platforms=["tiktok"],
                 youtube_privacy_status="private",
+                channel="history-mysteries",
             )
 
         submit.assert_not_called()

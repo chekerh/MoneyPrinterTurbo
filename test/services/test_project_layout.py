@@ -205,16 +205,57 @@ class TestResolveProjectLayout(unittest.TestCase):
                 portfolio_root=nested,
             )
 
-    def test_application_root_nested_inside_portfolio_root_is_rejected(self):
-        """反向嵌套同样会造成清理范围重叠。"""
+    def test_application_root_nested_inside_portfolio_root_is_allowed(self):
+        """
+        应用仓库嵌在作品集根之下是常见布局：两棵树共用一个父目录，plans/ 与
+        outputs/ 和应用自己的 storage 各占一块，互不覆盖。旧实现用"两个根不得
+        互相嵌套"一刀切，把这种合法布局也挡在门外，只能逼调用方去猜路径。
+        """
         inner = self.portfolio / "app"
         inner.mkdir()
 
-        with self.assertRaises(ProjectLayoutError):
+        layout = resolve_project_layout(
+            application_root=inner,
+            portfolio_root=self.portfolio,
+        )
+
+        self.assertEqual(layout.storage_root, inner / "storage")
+        self.assertEqual(layout.plans_root, self.portfolio / "plans")
+        self.assertEqual(layout.outputs_root, self.portfolio / "outputs")
+
+    def test_application_root_inside_plans_root_is_rejected(self):
+        """
+        反向嵌套本身不算错，但应用根若落在 plans/ 之内，storage_root 就压住了
+        plans_root —— 归档成片会被当成中间产物清掉。必须失败关闭。
+        """
+        inner = self.portfolio / "plans" / "app"
+        inner.mkdir(parents=True)
+
+        with self.assertRaises(ProjectLayoutError) as ctx:
             resolve_project_layout(
                 application_root=inner,
                 portfolio_root=self.portfolio,
             )
+
+        self.assertIn("storage_root", str(ctx.exception))
+        self.assertIn("plans_root", str(ctx.exception))
+
+    def test_application_root_inside_outputs_root_is_rejected(self):
+        """
+        应用根落在 outputs/ 之内同样会重叠：storage_root 压住 outputs_root 时，
+        SSD 清理逻辑会把唯一长期留存的成片一起删掉。
+        """
+        inner = self.portfolio / "outputs" / "app"
+        inner.mkdir(parents=True)
+
+        with self.assertRaises(ProjectLayoutError) as ctx:
+            resolve_project_layout(
+                application_root=inner,
+                portfolio_root=self.portfolio,
+            )
+
+        self.assertIn("storage_root", str(ctx.exception))
+        self.assertIn("outputs_root", str(ctx.exception))
 
     def test_symlinked_root_is_rejected(self):
         """
@@ -284,8 +325,10 @@ class TestResolveProjectLayout(unittest.TestCase):
 
     def test_dotdot_in_application_root_cannot_defeat_containment(self):
         """
-        反向同理：应用根带 ".." 时它实际落在作品集树内，
-        但按成分比较的前缀判断会漏掉这层包含关系。
+        ".." 让 Path.relative_to 的成分比较失去意义：下面这个 application_root
+        实际就等于 <portfolio>/app，可按字符串看前缀对不上，包含关系会被漏掉，
+        于是"数据根是否互相覆盖"的判断就能被绕过。归一化会把这个 bug 藏起来，
+        所以未归一化的路径一律拒绝。
         """
         (self.base / "hop").mkdir()
         inner_app = self.portfolio / "app"

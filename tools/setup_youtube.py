@@ -7,13 +7,16 @@ masked in output, then optionally runs the OAuth authorize flow.
 import argparse
 import os
 import re
+import sys
 
-CONFIG_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "MoneyPrinterTurbo", "config.toml"
-)
+# app 根下的这一份与仓库根的那份指向同一个 config.toml，但路径基准不同：
+# 这里 __file__ 是 <app>/tools/setup_youtube.py，所以 ".." 已经是 app 根，
+# 再拼一层 "MoneyPrinterTurbo" 会指向 <app>/MoneyPrinterTurbo/config.toml
+# 这个不存在的嵌套目录。之前两份副本的这段代码完全相同，于是 vendored 副本
+# 从一开始就是坏的。
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config.toml")
 CHANNEL = "youtube_upload"
 KEYS = (
-    "youtube_upload_enabled",
     "youtube_upload_client_id",
     "youtube_upload_client_secret",
     "youtube_upload_channel_id",
@@ -78,17 +81,45 @@ def main() -> int:
         action="store_true",
         help="print the current youtube_upload_* settings (secrets masked)",
     )
+    parser.add_argument(
+        "--niche",
+        default="history-mysteries",
+        help=(
+            "which niche this authorization belongs to, e.g. money-finance. "
+            "A YouTube OAuth token is permanently bound to one channel, so run "
+            "this once per niche and pick that niche's channel on Google's "
+            "consent screen."
+        ),
+    )
+    parser.add_argument(
+        "--list-channels",
+        action="store_true",
+        help="list every YouTube channel this Google account can publish to",
+    )
     args = parser.parse_args()
+
+    # app 包在 MoneyPrinterTurbo/ 下，而不是仓库根目录。
+    app_path = os.path.dirname(CONFIG_PATH)
+    if app_path not in sys.path:
+        sys.path.insert(0, app_path)
+
+    if args.list_channels:
+        from app.services import youtube_upload  # noqa: PLC0415
+
+        result = youtube_upload.list_my_channels()
+        if not result.get("success"):
+            print(result.get("error"))
+            return 1
+        for item in result.get("channels", []):
+            print(f"  {item['channel_id']}  {item['channel_name']}")
+        return 0
 
     content = load_config()
 
     if args.disable:
         cleaned = load_config()
         for key in KEYS:
-            if key in ("youtube_upload_client_id", "youtube_upload_client_secret"):
-                cleaned = set_value(cleaned, key, '""')
-            elif key == "youtube_upload_enabled":
-                cleaned = set_value(cleaned, key, "false")
+            cleaned = set_value(cleaned, key, '""')
         save_config(cleaned)
         print("YouTube publishing disabled; credentials cleared.")
         return 0
@@ -110,33 +141,36 @@ def main() -> int:
     escaped_secret = client_secret.replace("\\", "\\\\").replace('"', '\\"')
     content = load_config()
     for key, value in (
-        ("youtube_upload_enabled", "true"),
         ("youtube_upload_client_id", f'"{escaped_id}"'),
         ("youtube_upload_client_secret", f'"{escaped_secret}"'),
     ):
         content = set_value(content, key, value)
     save_config(content)
-    print("Saved credentials: enabled=true")
+    print("Saved OAuth client credentials")
     print(f"client_id:     {mask(client_id)}")
     print(f"client_secret: {mask(client_secret)}")
 
     if args.authorize:
-        import sys
-
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         from app.services import youtube_upload  # noqa: PLC0415
 
-        print("Opening the Google authorization page in your browser…")
-        result = youtube_upload.authorize()
+        print(f"Opening the Google authorization page for niche {args.niche!r}…")
+        print("On the consent screen pick the channel that matches this niche.")
+        result = youtube_upload.authorize(args.niche)
         if not result.get("success"):
             print(f"Authorization failed: {result.get('error', 'unknown error')}")
             return 1
-        info = youtube_upload.channel_info()
+        info = youtube_upload.channel_info(args.niche)
         if info.get("success"):
             print(
-                f"Linked channel: {info.get('channel_name')} "
+                f"Niche {args.niche!r} -> channel {info.get('channel_name')} "
                 f"({info.get('channel_id')})"
             )
+            if info.get("channel_mismatch"):
+                print(
+                    "WARNING: this token is not bound to the channel configured "
+                    "in youtube_upload_channel_id. Publishing will be blocked "
+                    "until it matches."
+                )
         else:
             print(f"Token saved, but channel lookup failed: {info.get('error')}")
     return 0

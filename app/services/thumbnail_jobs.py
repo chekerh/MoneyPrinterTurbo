@@ -53,7 +53,6 @@ JOB_STORE_FILENAME = "jobs.json"
 MAX_QUEUE_DEPTH = 4
 
 #: 超过这个时长的任务在重启后视为未知：进程已经不在了，状态无从确认。
-STALE_RUNNING_SECONDS = 15 * 60
 
 _PERSIST_INTERVAL_SECONDS = 0.2
 
@@ -206,25 +205,15 @@ class ThumbnailJobManager:
         except (OSError, ValueError, KeyError, TypeError):
             self._jobs = {}
 
-        # 进程重启后，running 的任务其实已经没人执行了。能重新排队的就重新
-        # 排队，让它真正跑完；只有超过阈值、已经无法判断结果时才标成
-        # unknown，否则它会永远卡在"生成中"。
-        cutoff = time.time() - STALE_RUNNING_SECONDS
-        to_requeue = []
+        # 进程重启后，running/queued 的作业其实已经没人执行了。而 ``_persist`` 只
+        # 存作业元数据（不含 source / overlay / font 这类执行参数），所以**没有
+        # 任何办法把它们重新排队**——早先这里把 job_id 塞回队列，worker 端按三元组
+        # 解包时直接抛 ValueError，整条 worker 线程就此永久退出，之后所有缩略图
+        # 作业都永远停在"生成中"。与其假装能续跑，不如如实标成 unknown 并说明原因。
         for record in self._jobs.values():
             if record.state in (JobState.RUNNING.value, JobState.QUEUED.value):
-                if record.updated_at < cutoff:
-                    record.state = JobState.UNKNOWN.value
-                    record.error = "任务在进程重启后失去执行者"
-                else:
-                    to_requeue.append(record)
-
-        for record in to_requeue:
-            try:
-                self._queue.put_nowait(record.job_id)
-            except queue.Full:
-                # 队列已满：不能静默丢弃，先落地状态让用户看到排队中。
-                self._persist(force=True)
+                record.state = JobState.UNKNOWN.value
+                record.error = "任务在进程重启后失去执行者，请重新提交"
 
     def _persist(self, force: bool = False) -> None:
         now = time.time()
@@ -331,7 +320,16 @@ class ThumbnailJobManager:
                         return
                 continue
 
-            job_id, request, tools = item
+            # 队列里的每一项都在自己的 try 里处理。裸的解包一旦抛错就会掀翻整个
+            # 线程，而线程死了不会有任何日志外的地方告诉你——所有缩略图作业从此
+            # 永远停在"生成中"。这种失败必须只影响一个作业。
+            try:
+                job_id, request, tools = item
+            except (TypeError, ValueError):
+                logger.warning("discarding malformed thumbnail queue item", exc_info=True)
+                self._queue.task_done()
+                continue
+
             with self._lock:
                 if job_id in self._cancelled:
                     continue

@@ -12,20 +12,26 @@ WEBUI_MAIN = ROOT_DIR / "webui" / "Main.py"
 
 
 def _widget_by_key(elements, key):
-    return next(
-        item
-        for item in elements
-        if str(getattr(item, "key", "")) == key
-        or str(getattr(item, "key", "")).startswith(f"{key}_")
+    for item in elements:
+        if str(getattr(item, "key", "")) == key or str(getattr(item, "key", "")).startswith(f"{key}_"):
+            return item
+    # 明确报出缺的是哪个 key，并列出实际存在的那些。StopIteration 只会说
+    # "迭代器耗尽"，在动过控件类型（selectbox → pills）之后完全无法定位。
+    raise AssertionError(
+        f"找不到 key={key!r}；当前可用：{[getattr(i, 'key', '') for i in elements]}"
     )
 
 
-def _new_app():
+def _new_app(view="generate"):
     # A cold Python 3.11 environment can spend over 30 seconds importing the
     # full Streamlit entrypoint and optional media stack. Keep the assertion
     # timeout above that one-time startup cost so targeted runs do not flake.
     app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
     app.session_state["ui_language"] = "en"
+    app.run()
+    # WebUI 现在按左侧导航分屏。生成表单的控件在 generate 视图上，
+    # 设置项在 settings 视图上，按 key 取控件的用例必须先切到对应那一屏。
+    app.session_state["nav_view"] = view
     app.run()
     assert [str(item.value) for item in app.exception] == []
     return app
@@ -82,7 +88,9 @@ def test_reusable_generation_settings_survive_a_new_webui_session():
         _widget_by_key(
             first_session.selectbox, "video_transition_mode_select"
         ).set_value("FadeIn")
-        _widget_by_key(first_session.selectbox, "video_aspect_for_pexels").set_value(
+        # 画幅现在是筹码（st.pills），不再是下拉框——三个以下的离散选项用下拉框
+        # 等于把选择藏起来，筹码一次点完且选中态始终可见。
+        _widget_by_key(first_session.pills, "video_aspect_for_pexels").set_value(
             "16:9"
         )
         _widget_by_key(first_session.selectbox, "video_clip_duration_select").set_value(
@@ -107,7 +115,7 @@ def test_reusable_generation_settings_survive_a_new_webui_session():
         _widget_by_key(first_session.selectbox, "video_source_select").set_value(
             "coverr"
         ).run()
-        _widget_by_key(first_session.selectbox, "video_aspect_for_coverr").set_value(
+        _widget_by_key(first_session.pills, "video_aspect_for_coverr").set_value(
             "9:16"
         ).run()
         _widget_by_key(first_session.selectbox, "video_source_select").set_value(
@@ -189,13 +197,13 @@ def test_reusable_generation_settings_survive_a_new_webui_session():
             second_session.selectbox, "video_transition_mode_select"
         ).value == "FadeIn"
         assert _widget_by_key(
-            second_session.selectbox, "video_aspect_for_pexels"
+            second_session.pills, "video_aspect_for_pexels"
         ).value == "16:9"
         _widget_by_key(second_session.selectbox, "video_source_select").set_value(
             "coverr"
         ).run()
         assert _widget_by_key(
-            second_session.selectbox, "video_aspect_for_coverr"
+            second_session.pills, "video_aspect_for_coverr"
         ).value == "9:16"
         _widget_by_key(second_session.selectbox, "video_source_select").set_value(
             "pexels"
@@ -316,7 +324,7 @@ def test_invalid_saved_generation_settings_fall_back_without_breaking_webui():
     assert _widget_by_key(app.selectbox, "video_transition_mode_select").value == (
         "None"
     )
-    assert _widget_by_key(app.selectbox, "video_aspect_for_pexels").value == "9:16"
+    assert _widget_by_key(app.pills, "video_aspect_for_pexels").value == "9:16"
     assert _widget_by_key(app.selectbox, "video_clip_duration_select").value == 3
     assert _widget_by_key(app.slider, "video_clip_speed_slider").value == 1.0
     assert _widget_by_key(app.selectbox, "video_count_select").value == 1

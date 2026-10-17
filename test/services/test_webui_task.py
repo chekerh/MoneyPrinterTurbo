@@ -2,6 +2,7 @@ import ast
 import os
 import re
 import threading
+from urllib.parse import quote
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -12,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from loguru import logger
 
+from app.config import config
 from app.models import const
 from app.models.schema import VideoParams
 from app.services import webui_task
@@ -156,7 +158,9 @@ def test_completed_task_renders_subject_named_video_download(
     selected_nodes = []
     target_names = {
         "_DOWNLOAD_FILENAME_INVALID_PATTERN",
+        "_artifact_base_url",
         "_build_video_download_name",
+        "_generated_video_download_url",
         "_normalize_task_state",
         "_render_generation_task_snapshot",
     }
@@ -185,11 +189,42 @@ def test_completed_task_renders_subject_named_video_download(
         def columns(self, count):
             return [FakeColumn() for _ in range(count)]
 
+        @staticmethod
+        def fragment(*_args, **_kwargs):
+            # 定时 fragment 的装饰器在这里是透明的：本用例直接调用抽出来的函数，
+            # 不需要真正的定时重跑行为。
+            return lambda fn: fn
+
         def video(self, video_path):
             self.videos.append(video_path)
 
-        def download_button(self, label, data, **kwargs):
-            self.downloads.append((label, data.read(), kwargs))
+        def link_button(
+            self,
+            label,
+            url,
+            *,
+            key=None,
+            on_click="ignore",
+            args=None,
+            kwargs=None,
+            help=None,
+            type="secondary",
+            icon=None,
+            icon_position="left",
+            disabled=False,
+            use_container_width=None,
+            width="content",
+            shortcut=None,
+        ):
+            # 签名与 Streamlit 1.59 的 st.link_button 逐字对齐，**不能**用
+            # ``**kwargs`` 一概收下。早先这里写的是 ``def link_button(self, label,
+            # url, **kwargs)``，于是生产代码传 ``file_name=`` / ``mime=``（真实
+            # Streamlit 会抛 TypeError）在测试里毫无反应，成片与下载按钮整段消失
+            # 这个缺陷在 1607 条全绿的测试下一路溜了过去。假件比真件宽松，测试就
+            # 不再验证任何契约。
+            self.downloads.append(
+                (label, url, {"key": key, "icon": icon, "width": width})
+            )
 
         def success(self, _message):
             pass
@@ -204,11 +239,23 @@ def test_completed_task_renders_subject_named_video_download(
     video_path.write_bytes(b"video-content")
     fake_st = FakeStreamlit()
     open_task_folder = MagicMock()
+    logged_exceptions = []
+    logger = MagicMock()
+    logger.exception.side_effect = lambda *a, **k: logged_exceptions.append(
+        " ".join(str(x) for x in a)
+    )
+
     namespace = {
         "Mapping": Mapping,
-        "config": SimpleNamespace(ui=ui_config),
+        # 端口与主机取真实配置：断言里要比对 "下载链接指向 uvicorn 那一侧"，
+        # 用一个编出来的端口等于什么都没验证。
+        "config": SimpleNamespace(
+            ui=ui_config,
+            listen_port=config.listen_port,
+            listen_host=config.listen_host,
+        ),
         "const": const,
-        "logger": MagicMock(),
+        "logger": logger,
         "mimetypes": __import__("mimetypes"),
         "open_task_folder": open_task_folder,
         "os": os,
@@ -224,6 +271,7 @@ def test_completed_task_renders_subject_named_video_download(
         # 缩略图面板由 test_webui_thumbnail_integration.py 单独覆盖；
         # 这里只测下载按钮，因此按同样的约定把协作函数替换成空实现。
         "_render_thumbnail_section": lambda _task_id: None,
+        "_render_posting_copy": lambda *_args: None,
     }
     module = ast.fix_missing_locations(ast.Module(body=selected_nodes, type_ignores=[]))
     exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)
@@ -240,20 +288,33 @@ def test_completed_task_renders_subject_named_video_download(
     )
 
     assert fake_st.videos == [str(video_path)]
-    assert fake_st.downloads == [
-        (
-            "Download Video",
-            b"video-content",
-            {
-                "file_name": "A day in Shanghai.mp4",
-                "mime": "video/mp4",
-                "key": "download_generated_video_download-test_0",
-                "icon": ":material/download:",
-                "on_click": "ignore",
-                "width": "stretch",
-            },
-        )
-    ]
+    # 下载必须走流式链接，而不是把成片读进内存。
+    #
+    # 旧实现是 ``open(path, "rb")`` 之后交给 st.download_button，Streamlit 会把整个
+    # 文件读进内存。结果页一屏 3 条、每条 50 MB 上下，用户只是**看一眼**结果页，
+    # 进程就先多吃进 150 MB，而这 150 MB 在按钮被点之前一次都没用到。
+    # 渲染函数外面裹着 try/except，异常会被吞成一条日志。少了什么元素时，症状是
+    # "界面安静地少了一块"，而不是一条报错——所以这里先确认渲染过程本身没抛过。
+    assert not logged_exceptions, f"结果区渲染时抛了异常并被吞掉：{logged_exceptions}"
+    assert len(fake_st.downloads) == 1
+    label, url, kwargs = fake_st.downloads[0]
+    assert label == "Download Video"
+    assert quote(str(video_path)) in url
+    # 下载链接必须指向 **uvicorn 那台服务器**，而不是 WebUI 自己。
+    # app/asgi.py 没有把 Streamlit 挂进去，两者是两个进程、两个端口；相对链接
+    # /download 打在 WebUI 端口上只会命中 Streamlit 的 HTML 兜底页——状态码 200、
+    # 内容是整份 index.html，于是"下载成片"存下来的是一个网页，而且看起来是成功的。
+    assert url.startswith("http://"), f"下载链接仍是相对路径，会打到 WebUI 端口：{url}"
+    assert f":{config.listen_port}/download?" in url, url
+    assert kwargs == {
+        "key": "download_generated_video_download-test_0",
+        "icon": ":material/download:",
+        "width": "stretch",
+    }
+    # 建议文件名必须走 URL 交给端点：st.link_button 不接受 file_name，而按主题
+    # 命名的逻辑一旦传不过去，用户存下来的就是 final-1.mp4。
+    assert "file_name=" in url
+    assert quote("A day in Shanghai.mp4") in url
     assert open_task_folder.call_count == expected_open_count
     if expected_open_count:
         open_task_folder.assert_called_once_with("download-test")
@@ -451,18 +512,21 @@ def test_generation_submit_skips_duplicate_config_save():
         if isinstance(node, ast.FunctionDef)
         and node.name == "_render_generation_controls"
     )
+    # 生成流程现在住在 _page_generate 里（左侧导航把它拆成了独立的一屏），
+    # _render_application 只负责选屏与页面级的前置处理。
     application = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_render_application"
+        if isinstance(node, ast.FunctionDef) and node.name == "_page_generate"
     )
 
     assert isinstance(controls.body[-1], ast.Return)
     assert ast.unparse(controls.body[-1].value) == "start_button"
 
+    # 赋值现在嵌在 with 容器里，用 walk 走整棵子树而不是只看函数体顶层。
     submitted_assignment = next(
         node
-        for node in application.body
+        for node in ast.walk(application)
         if isinstance(node, ast.Assign)
         and any(
             isinstance(target, ast.Name) and target.id == "generation_submitted"
@@ -476,7 +540,7 @@ def test_generation_submit_skips_duplicate_config_save():
 
     guarded_save = next(
         node
-        for node in application.body
+        for node in ast.walk(application)
         if isinstance(node, ast.If)
         and ast.unparse(node.test) == "not generation_submitted"
     )

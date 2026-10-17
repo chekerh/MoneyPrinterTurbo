@@ -116,10 +116,46 @@ def _existing_plan_state(out_dir: Path):
     return recorded_status, posted_url
 
 
+def _recorded_in_other_months(channel: str, out_dir: Path) -> dict[str, str]:
+    """
+    本月之外的已录制主题：``{序号: 状态串}``。
+
+    状态串沿用本月的写法，但视频链接是跨目录的相对路径（``../2026-09/videos/...``），
+    这样从本月的 monthly-plan.md 点过去仍然打得开。跨月找片是 ``find_video_path``
+    与媒体库已经在做的事，这里只是让计划表别把做完的事重新标成 pending。
+    """
+    out_dir = Path(out_dir)
+    carried: dict[str, str] = {}
+    for plan_dir, row in plans.iter_all_plan_rows(channel):
+        if not row["recorded"]:
+            continue
+        try:
+            if Path(plan_dir) == out_dir:
+                continue
+        except OSError:
+            continue
+        topic = str(row["topic"] or "").strip().lower()
+        if not topic or topic in carried:
+            # iter_all_plan_rows 是新月优先，同一主题取第一次出现的即可。
+            continue
+        video = row.get("video") or ""
+        if not video:
+            continue
+        month = os.path.basename(os.path.normpath(plan_dir))
+        name = video.split("videos/")[-1]
+        display = f"✓ {month} - [{name}](../{month}/videos/{name})"
+        if row.get("posted"):
+            display += f" - posted: {row['posted']}"
+        carried[topic] = display
+    return carried
+
+
 def render_plan(channel: str, topics: list, out_dir: Path) -> str:
     vid_dir = out_dir / "videos"
     archived = {}
     for txt in sorted(vid_dir.glob("*.txt")):
+        if txt.name.endswith(".posting.txt"):
+            continue
         meta = {}
         for line in txt.read_text(encoding="utf-8").splitlines():
             if ":" in line:
@@ -130,10 +166,25 @@ def render_plan(channel: str, topics: list, out_dir: Path) -> str:
 
     previously_recorded, previously_posted = _existing_plan_state(out_dir)
 
-    month = date.today().strftime("%Y-%m")
+    # 本月之外已经录过的主题也要带过来。topics_30day.txt 是一份 30 条的滚动列表，
+    # 不是每月一份，所以 10 月的 #1 和 9 月的 #1 指的是同一条主题。若只读本月的
+    # 计划文件，新月会把九月做完的十条重新标成 pending，进度退回 0/30，界面上的
+    # 计划表也跟着空掉——用户会以为十月从头开始，成片却好好地躺在上个月。
+    carried = _recorded_in_other_months(channel, out_dir)
+
+    # 月份取自实际写入的目录，而不是 date.today()。补录往期成片时会写进上一个
+    # 月的目录，此时表头写上今天就会让文件自相矛盾：目录说 9 月、标题说 10 月。
+    month = os.path.basename(os.path.normpath(str(out_dir)))
+    if not (len(month) == 7 and month[4] == "-"):
+        month = date.today().strftime("%Y-%m")
+
     recorded_slugs = set(previously_recorded)
     done = sum(
-        1 for t in topics if t in archived or t.strip().lower() in recorded_slugs
+        1
+        for t in topics
+        if t in archived
+        or t.strip().lower() in recorded_slugs
+        or t.strip().lower() in carried
     )
     lines = [
         f"# {channel} - monthly plan ({month})",
@@ -153,6 +204,8 @@ def render_plan(channel: str, topics: list, out_dir: Path) -> str:
                 display += f" - posted: {previously_posted[slug]}"
         elif previously_recorded.get(slug):
             display = previously_recorded[slug]
+        elif slug in carried:
+            display = carried[slug]
         else:
             display = "pending"
         lines.append(f"| {i} | {topic} | {display} |")
@@ -279,11 +332,14 @@ def archive_channel_video(
     plans_root: str,
     duration: str = "",
     copy_media: bool = False,
+    final_video_dir: str | None = None,
 ) -> str:
     """将一次生成任务归档到频道输出目录并重写月度计划，返回基础文件名。
 
-    ``task_dir`` 内必须存在 ``script.json`` 与可解析的 ``final-1.mp4``。归档时
-    写入 ``videos/<base>.txt`` 并重新生成 ``<out_dir>/monthly-plan.md``。当
+    ``task_dir`` 内必须存在 ``script.json``。最终成片的位置由 ``final_video_dir``
+    指定（``<outputs_root>/<task_id>/``）；为 ``None`` 时回退到
+    ``<task_dir>/final-1.mp4``，供历史任务与命令行调用方使用。归档时写入
+    ``videos/<base>.txt`` 并重新生成 ``<out_dir>/monthly-plan.md``。当
     ``copy_media`` 为真时，把成片与可选字幕一并复制进 ``videos`` 目录；
     命令行调用方(archive_video.sh)自行复制文件，因此保持默认不复制。
 
@@ -307,7 +363,19 @@ def archive_channel_video(
     except (OSError, ValueError) as exc:
         raise ArchiveError(f"task script.json is unreadable: {task_dir}: {exc}") from exc
 
-    src_video = task_dir / "final-1.mp4"
+    # 成片的权威位置由调用方给出：最终成片是唯一长期留存的视频，从 b2b52cc 起
+    # 写在作品集的 outputs/<task_id>/ 下，任务目录只留中间产物（可能还在内存盘
+    # 上）。这里若仍旧只认 task_dir/final-1.mp4，copy_media 会永远因为"成片缺失"
+    # 抛 ArchiveError，而 WebUI 那边只是 continue，于是归档静默失效：任务面板照常
+    # 显示"已完成"，成片却永远进不了媒体库和月度计划。
+    # 留 task_dir 作为兜底，是为了让 b2b52cc 之前的历史任务仍可归档。
+    if final_video_dir is not None:
+        src_video = Path(final_video_dir) / "final-1.mp4"
+    else:
+        src_video = task_dir / "final-1.mp4"
+
+    if src_video.with_suffix(".publish.lock").exists():
+        raise ArchiveError("video is being published; defer archiving")
 
     # 计划文件里的主题可能与实际生成主题不同（用户中途改过输入），以成片
     # 脚本里记录的主题为准，保证归档命名和月度计划指向同一条内容。
@@ -344,6 +412,39 @@ def archive_channel_video(
                 # 字幕缺失不影响成片可用性，只记录不阻断。
                 print(f"warning: failed to copy subtitle for {base}: {exc}")
 
+    # Carry posting copy and successful upload receipts into the durable library.
+    from publish_video import _app_root
+
+    app_root = _app_root()
+    if app_root not in sys.path:
+        sys.path.insert(0, app_root)
+    from app.services import posting_package
+
+    if src_video.with_suffix(".publish.lock").exists():
+        raise ArchiveError("video is being published; defer archiving")
+    receipt = src_video.with_suffix(".publish.json")
+    if receipt.exists():
+        try:
+            receipt_data = json.loads(receipt.read_text(encoding="utf-8"))
+            if receipt_data.get("pending"):
+                raise ArchiveError("upload outcome is unknown; check before archiving")
+        except (ValueError, AttributeError) as exc:
+            raise ArchiveError("invalid publishing receipt; check before archiving") from exc
+        shutil.copy2(receipt, vid_dir / f"{base}.publish.json")
+    try:
+        if src_video.with_suffix(".posting.json").exists():
+            package = posting_package.load_for_video(src_video, channel, topic)
+        elif (vid_dir / f"{base}.posting.json").exists():
+            # Repairing the archive must preserve its saved copy.
+            package = posting_package.load_for_video(vid_dir / f"{base}.mp4", channel, topic)
+        else:
+            package = data.get("posting_package") or posting_package.fallback(
+                topic, data.get("script", ""), channel, task_dir.name
+            )
+        posting_package.save_for_video(vid_dir / f"{base}.mp4", package)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ArchiveError(f"cannot archive posting package: {exc}") from exc
+
     # 媒体落盘之后才写记录，保证 monthly-plan.md 里出现的每一行都对应一个
     # 真实可播放的文件。
     (vid_dir / f"{base}.txt").write_text(
@@ -355,7 +456,33 @@ def archive_channel_video(
         encoding="utf-8",
     )
 
+    # 只在真的复制了媒体之后才删工作副本。``copy_media=False`` 走的是
+    # "只补 .txt / 计划表" 的修复路径（repair_archives），成片根本没被复制，
+    # 这时删源等于直接毁掉唯一的成片。
+    if copy_media:
+        _drop_working_copy(src_video)
     return base
+
+
+def _drop_working_copy(src_video: Path) -> None:
+    """归档成功后删掉成片的工作副本。
+
+    成片先落在 ``outputs/<task_id>/final-1.mp4``，再被归档进
+    ``outputs/<channel>/<YYYY-MM>/videos/``。以前只复制不删除，而
+    ``outputs/<task_id>/`` 在 ``PERSISTENT_SUBDIRS`` 里也不会被自动清理，
+    于是每出一条视频就永久多出一个 UUID 目录——``outputs/`` 顶层那 9 个无名的
+    ``final-1.mp4`` 就是这么攒出来的（1.1 GB，全是已归档内容的逐字节副本）。
+
+    只在 ``copy_media=True``、且成片已确认落盘之后调用。任何一步落盘失败都会
+    在调用之前抛出，因此走不到这里。目录本身留空壳——任务状态还要按 task_id
+    索引它。
+    """
+    try:
+        if src_video.is_file():
+            src_video.unlink()
+    except OSError as exc:
+        # 删不掉只是留一份重复文件，绝不该让已经成功的归档变成失败。
+        print(f"warning: failed to remove working copy {src_video}: {exc}")
 
 
 def main() -> None:

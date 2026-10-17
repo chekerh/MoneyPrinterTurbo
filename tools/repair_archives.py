@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
 import archive_video  # noqa: E402
 
 OUTPUTS = os.path.join(REPO, "outputs")
-TASKS = os.path.join(REPO, "MoneyPrinterTurbo", "storage", "tasks")
+TASKS = os.path.join(REPO, "storage", "tasks")
 
 
 def task_source(task_id):

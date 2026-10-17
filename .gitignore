@@ -1,7 +1,16 @@
 .DS_Store
 /config.toml
 /config.toml.bak
+# 带时间戳与随机后缀的配置备份。里面是完整的凭据明文（含 api_key / client_secret
+# / redis 密码），一次 `git add -A` 就会把它们全部发布出去，而 `/config.toml`
+# 这条规则匹配不到它。
+/config.toml.backup-*
+/config.toml.tmp
 /storage/
+# Chrome 的登录 profile（含 cookie 与会话状态）。放在仓库内的那一份是路径拼错
+# 造成的残留：多了一层 "MoneyPrinterTurbo"，于是它既不在 storage_policy 的保护
+# 范围内，也没被上面的 /storage/ 覆盖。
+/MoneyPrinterTurbo/
 /.idea/
 /app/services/__pycache__
 /app/__pycache__/

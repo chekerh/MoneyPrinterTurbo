@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import unittest
+
 from pathlib import Path
 from unittest.mock import patch
 
@@ -156,13 +157,40 @@ class TestMainThumbnailRendering(_MainThumbnailFixture):
 
     def test_panel_receives_server_owned_identity_only(self):
         """
-        面板拿到的必须是描述符与任务目录，不允许出现调用方提供的路径参数。
+        面板拿到的必须是描述符与成片目录，不允许出现调用方提供的路径参数。
+
+        成片目录是 ``layout.outputs_root/<task_id>``，不是
+        ``layout.storage_root / "tasks" / <task_id>``。最终成片是唯一长期留存的
+        视频，b2b52cc 起写在作品集 outputs 下；任务目录只剩中间产物。此前这里
+        断言的是 ``storage_root``，等于把"每个缩略图作业都找不到源文件而失败"
+        这个 bug 钉死在测试里。
         """
         source = WEBUI_MAIN.read_text(encoding="utf-8")
-        call = source[source.index("render_thumbnail_panel("):][:600]
+        call = source[source.index("render_thumbnail_panel("):][:900]
         self.assertIn("descriptor=descriptor", call)
-        self.assertIn("source_root=layout.storage_root", call)
+        self.assertIn("source_root=layout.outputs_root", call)
+        self.assertNotIn("source_root=layout.storage_root", call)
         self.assertNotIn("st.file_uploader", call)
+
+    def test_thumbnail_source_root_is_where_the_final_video_actually_lives(self):
+        """
+        面板拿到的 source_root 必须与结果描述符枚举成片的目录一致。
+
+        描述符来自 ``build_result_descriptor``，它枚举的是
+        ``layout.outputs_root / <task_id>``。两处一旦不一致，作业就会对着一个
+        不存在的源文件渲染，然后静默失败。这里直接比较两个常量。
+        """
+        from app.services import result_descriptor
+
+        source = WEBUI_MAIN.read_text(encoding="utf-8")
+        call = source[source.index("render_thumbnail_panel("):][:900]
+        self.assertIn("source_root=layout.outputs_root", call)
+
+        # 描述符侧的成片目录必须同样是 outputs_root，而不是 storage_root。
+        descriptor_source = (
+            Path(result_descriptor.__file__).read_text(encoding="utf-8")
+        )
+        self.assertIn("layout.outputs_root", descriptor_source)
 
     def test_does_not_invoke_ffmpeg_during_a_plain_render(self):
         """

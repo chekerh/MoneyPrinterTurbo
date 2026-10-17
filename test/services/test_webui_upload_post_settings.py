@@ -16,6 +16,23 @@ def _widget_by_key(elements, key):
     )
 
 
+def test_native_youtube_settings_keep_other_provider_preferences_separate():
+    test_config = dict(config.app, youtube_upload_client_id="fake-id", youtube_upload_client_secret="fake-secret", youtube_upload_privacy_status="private", youtube_upload_auto_publish=True, upload_post_auto_upload=False)
+    with patch.object(config, "app", test_config), patch.object(config, "try_save_config", return_value=True):
+        app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
+        app.run()
+        app.session_state["nav_view"] = "settings"
+        app.run()
+        assert not app.exception
+        assert _widget_by_key(app.text_input, "youtube_upload_client_id_input").value == "fake-id"
+        assert _widget_by_key(app.text_input, "youtube_upload_client_secret_input").value == "fake-secret"
+        assert _widget_by_key(app.selectbox, "youtube_api_privacy").value == "private"
+        _widget_by_key(app.checkbox, "youtube_api_auto_publish").set_value(False)
+        app.run()
+        assert not config.app["youtube_upload_auto_publish"]
+        assert not config.app["upload_post_auto_upload"]
+
+
 def test_webui_upload_post_setup_guide_links_to_required_pages():
     # 首次使用自动发布时，API Key 和发布用户需要在 Upload-Post 的不同页面
     # 分别配置。这里锁定两个精确入口，避免后续文案调整后再次退化成无法点击的
@@ -23,7 +40,7 @@ def test_webui_upload_post_setup_guide_links_to_required_pages():
     with patch.object(config, "try_save_config", return_value=True):
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
         app.run()
-        app.session_state["settings_dialog_open"] = True
+        app.session_state["nav_view"] = "settings"
         app.run()
 
         setup_guide = next(
@@ -51,7 +68,7 @@ def test_webui_upload_post_checkboxes_stay_decoupled():
     ):
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
         app.run()
-        app.session_state["settings_dialog_open"] = True
+        app.session_state["nav_view"] = "settings"
         app.run()
 
         enabled_box = _widget_by_key(app.checkbox, "upload_post_enabled_checkbox")
@@ -84,7 +101,7 @@ def test_webui_upload_post_youtube_privacy_fallback_to_public():
     ):
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
         app.run()
-        app.session_state["settings_dialog_open"] = True
+        app.session_state["nav_view"] = "settings"
         app.run()
 
         # The selectbox should be rendered and its value should fallback to "public"

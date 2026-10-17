@@ -377,16 +377,40 @@ max_concurrent_tasks = 5
 max_queued_tasks = 100
 
 # -----------------------------------------------------------------------------
-# Cross-platform Publishing / 跨平台发布
+# YouTube publishing (primary, runs headlessly in the background)
 # -----------------------------------------------------------------------------
 
-# Upload-Post can publish generated videos to TikTok, Instagram, and YouTube.
+# Publishes through the YouTube Data API v3. No browser is launched, so
+# scheduled uploads work while the machine is locked and never open a window
+# over your desktop.
+# Create a "Desktop app" OAuth client at https://console.cloud.google.com/,
+# then run `./setup_youtube.sh --authorize --niche <channel>` once per niche.
+youtube_upload_client_id = ""
+youtube_upload_client_secret = ""
+# The channel this token is expected to be bound to. Publishing is refused when
+# a token points somewhere else, so a niche can never post to another niche's
+# channel by accident. Leave empty to skip that check.
+youtube_upload_channel_id = ""
+# Default visibility: "public", "unlisted", or "private".
+youtube_upload_privacy_status = "unlisted"
+# Publish finished videos automatically after this niche is connected.
+youtube_upload_auto_publish = true
+# YouTube video category id. 27 = Science & Technology.
+youtube_upload_category_id = "27"
+
+# -----------------------------------------------------------------------------
+# Cross-platform Publishing / 跨平台发布 (TikTok, Instagram, Facebook)
+# -----------------------------------------------------------------------------
+
+# Upload-Post can publish generated videos to TikTok, Instagram, and Facebook.
+# These platforms have no public publishing API for personal accounts, so a
+# third party holds the credentials for you.
 # Create an account and API key at https://upload-post.com/
 # API documentation: https://docs.upload-post.com/
 upload_post_enabled = false
 upload_post_api_key = ""
 upload_post_username = ""
-# Available values: "tiktok", "instagram", "youtube".
+# Available values: "tiktok", "instagram".
 upload_post_platforms = ["tiktok", "instagram"]
 # Automatically publish successful video outputs after generation.
 upload_post_auto_upload = false

@@ -7,7 +7,10 @@
 
 * 应用根默认取既有的 :func:`app.utils.utils.root_dir`，它已经基于 ``realpath``；
 * 作品集根必须显式传入或来自 ``MPT_PORTFOLIO_ROOT``，**不**从应用根推导；
-* 任何根都必须是绝对路径、不得包含符号链接成分，且两棵树不得互相嵌套。
+* 任何根都必须是绝对路径、不得包含符号链接成分；
+* 作品集根不能落在应用根之内，且 ``storage_root`` / ``plans_root`` /
+  ``outputs_root`` 三个数据根不得互相覆盖。应用根**可以**落在作品集根之内
+  ——两棵树共用一个父目录是常见布局，真正要防的是数据根互相覆盖。
 
 解析过程不创建任何目录。写入方按需创建，避免仅仅导入模块就改变磁盘状态。
 """
@@ -111,6 +114,45 @@ def _is_within(child: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    """两个路径是否相同，或其中一个是另一个的祖先。
+
+    逐成分比较而不是字符串前缀：``/a/plans-archive`` 不是 ``/a/plans`` 的子目录，
+    但 ``str.startswith`` 会说是。
+    """
+    if first == second:
+        return True
+    return _is_within(first, second) or _is_within(second, first)
+
+
+#: 推导出来的数据根，按"谁覆盖谁会出事"分组。同一组内任意两个不可重叠；
+#: thumbnail_root / descriptor_root 都在 storage_root 之内，因此只查 storage_root
+#: 就把它们一并覆盖了，不必重复枚举。
+_CONFLICTING_ROOT_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("storage_root", "plans_root", "outputs_root"),
+)
+
+
+def _reject_overlapping_derived_roots(layout: ProjectLayout) -> None:
+    """数据根互相覆盖时失败关闭，并点名是哪一对。
+
+    只在"确实会出事"时拒绝：``plans`` 压住 ``storage`` 会让归档成片被当作中间
+    产物清掉，``storage`` 压住 ``outputs`` 会让唯一长期留存的视频被清掉。这两种
+    顺序都要挡住，两个方向都算重叠。
+    """
+    for group in _CONFLICTING_ROOT_GROUPS:
+        members = [(field, getattr(layout, field)) for field in group]
+        for index, (first_field, first_path) in enumerate(members):
+            for second_field, second_path in members[index + 1 :]:
+                if _paths_overlap(first_path, second_path):
+                    raise ProjectLayoutError(
+                        f"{first_field} 与 {second_field} 重叠，不能是同一个目录"
+                        f"或彼此的子目录：{first_path} / {second_path}。"
+                        "请把作品集根与应用根分开配置，"
+                        "否则归档成片或成片目录会被当成中间产物清理掉。"
+                    )
 
 
 def _nearest_existing(path: Path) -> Path | None:
@@ -236,10 +278,6 @@ def resolve_project_layout(
         raise ProjectLayoutError(
             f"portfolio_root 不能位于 application_root 之内：{portfolio_path}"
         )
-    if _is_within(app_path, portfolio_path):
-        raise ProjectLayoutError(
-            f"application_root 不能位于 portfolio_root 之内：{app_path}"
-        )
 
     storage_root = app_path / "storage"
     layout = ProjectLayout(
@@ -251,6 +289,15 @@ def resolve_project_layout(
         plans_root=portfolio_path / "plans",
         outputs_root=portfolio_path / "outputs",
     )
+
+    # 允许 application_root 位于 portfolio_root 之内：应用仓库嵌在作品集根下是
+    # 常见且安全的布局（两棵树共用一个父目录），而过去这条禁令把整种布局挡在
+    # 门外，只能靠"猜根"绕过去。真正要防的不是两个根互相嵌套，而是**推导出来的
+    # 数据根互相覆盖**——那一来才是真出事：plans_root 落进 storage_root 时，归档
+    # 成片会被当成中间产物清掉；storage_root 落进 outputs_root 时，SSD 清理会把
+    # 唯一长期留存的视频删掉。所以下面按成对重叠来查，而不是按"根是否嵌套"来查：
+    # 前者精确地覆盖了后者想防的危害，又不会误伤合法布局。
+    _reject_overlapping_derived_roots(layout)
 
     # 五个推导出来的根同样要查。它们由"已验证的父根 + 固定名字"拼成，结构上
     # 不会逃出父根；但父根下的那一层本身可能是指向别处的软链（历史遗留正是

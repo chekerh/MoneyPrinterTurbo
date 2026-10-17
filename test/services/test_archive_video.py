@@ -131,6 +131,139 @@ class TestArchiveChannelVideo(unittest.TestCase):
         self.assertEqual((videos / f"{base}.mp4").read_bytes(), b"payload")
         self.assertTrue((videos / f"{base}.srt").exists())
 
+    def test_archive_keeps_posting_text_and_success_receipt(self):
+        from app.services import posting_package
+
+        self._write_script()
+        self._write_final_video(content=b"payload", subtitle=True)
+        source = self.task_dir / "final-1.mp4"
+        package = posting_package.fallback("Specific title", "Specific description", self.channel, self.task_dir.name)
+        posting_package.save_for_video(source, package)
+        receipt = {"version": 1, "channel": self.channel, "result": {"youtube": {"success": True, "url": "url"}}, "pending": []}
+        source.with_suffix(".publish.json").write_text(json.dumps(receipt))
+        base = archive_video.archive_channel_video(
+            self.channel, str(self.task_dir), "Topic One", str(self.out_dir), str(self.plans_root),
+            duration="5", copy_media=True,
+        )
+        archived = self.out_dir / "videos" / f"{base}.mp4"
+        self.assertEqual(posting_package.load_for_video(archived), package)
+        self.assertEqual(json.loads(archived.with_suffix(".publish.json").read_text()), receipt)
+        self.assertIn("Specific description", archived.with_suffix(".posting.txt").read_text())
+
+    def test_archive_does_not_remove_video_during_upload(self):
+        self._write_script()
+        self._write_final_video(content=b"payload")
+        source = self.task_dir / "final-1.mp4"
+        source.with_suffix(".publish.lock").write_text("uploading")
+        with self.assertRaisesRegex(archive_video.ArchiveError, "being published"):
+            archive_video.archive_channel_video(
+                self.channel, str(self.task_dir), "Topic One", str(self.out_dir), str(self.plans_root),
+                duration="5", copy_media=True,
+            )
+        self.assertTrue(source.is_file())
+        self.assertFalse((self.out_dir / "monthly-plan.md").exists())
+
+    def test_copy_media_removes_the_working_copy(self):
+        """归档成功后必须删掉 outputs/<task_id>/ 里的工作副本。
+
+        成片先落在 outputs/<task_id>/final-1.mp4 再被归档。以前只复制不删除，
+        而 outputs/<task_id>/ 又属于 PERSISTENT_SUBDIRS、不会被自动清理，于是
+        outputs/ 顶层永久多出一个无名的 UUID 目录——那里攒了 9 个。
+        """
+        self._write_script()
+        self._write_final_video(content=b"payload")
+
+        archive_video.archive_channel_video(
+            channel=self.channel,
+            task_dir=str(self.task_dir),
+            topic="Topic One",
+            out_dir=str(self.out_dir),
+            plans_root=str(self.plans_root),
+            copy_media=True,
+        )
+
+        self.assertFalse(
+            (self.task_dir / "final-1.mp4").exists(),
+            "归档成功后工作副本仍在，outputs/ 会重新开始堆积 UUID 目录",
+        )
+
+    def test_without_copy_media_the_working_copy_survives(self):
+        """copy_media=False（补 .txt / 计划表的修复路径）不能删源。
+
+        那条路径根本没有复制成片，删掉就是毁掉唯一的成片。
+        """
+        self._write_script()
+        self._write_final_video(content=b"payload")
+
+        archive_video.archive_channel_video(
+            channel=self.channel,
+            task_dir=str(self.task_dir),
+            topic="Topic One",
+            out_dir=str(self.out_dir),
+            plans_root=str(self.plans_root),
+            copy_media=False,
+        )
+
+        self.assertTrue(
+            (self.task_dir / "final-1.mp4").exists(),
+            "未复制媒体时删掉了源文件——那是唯一一份成片",
+        )
+
+    def test_working_copy_survives_a_failed_copy(self):
+        """复制失败必须留下源文件。"""
+        self._write_script()
+        self._write_final_video(content=b"payload")
+
+        with mock.patch.object(
+            archive_video, "_copy_verified", side_effect=archive_video.ArchiveError("boom")
+        ):
+            with self.assertRaises(archive_video.ArchiveError):
+                archive_video.archive_channel_video(
+                    channel=self.channel,
+                    task_dir=str(self.task_dir),
+                    topic="Topic One",
+                    out_dir=str(self.out_dir),
+                    plans_root=str(self.plans_root),
+                    copy_media=True,
+                )
+
+        self.assertTrue(
+            (self.task_dir / "final-1.mp4").exists(),
+            "复制失败却删掉了源文件",
+        )
+
+    def test_final_video_dir_is_the_source_when_given(self):
+        """成片在 outputs/<task_id>/ 时，成片来自那里而不是 task_dir。
+
+        流水线（task._final_video_output_path）写的是 outputs/<task_id>/，
+        早先命令行调用方却去 task_dir 找，于是每天的归档步骤必然失败。
+        """
+        self._write_script()
+        self._write_final_video(content=b"wrong-place")
+        working = self.out_dir.parent / "some-task-id"
+        working.mkdir(parents=True, exist_ok=True)
+        (working / "final-1.mp4").write_bytes(b"payload")
+
+        base = archive_video.archive_channel_video(
+            channel=self.channel,
+            task_dir=str(self.task_dir),
+            topic="Topic One",
+            out_dir=str(self.out_dir),
+            plans_root=str(self.plans_root),
+            copy_media=True,
+            final_video_dir=str(working),
+        )
+
+        self.assertEqual(
+            (self.out_dir / "videos" / f"{base}.mp4").read_bytes(),
+            b"payload",
+            "归档的不是 final_video_dir 里的成片",
+        )
+        self.assertFalse(
+            (working / "final-1.mp4").exists(),
+            "final_video_dir 里的工作副本没有被清理",
+        )
+
     def test_archive_with_copy_media_tolerates_missing_subtitle(self):
         self._write_script()
         self._write_final_video(subtitle=False)

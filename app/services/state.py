@@ -42,9 +42,48 @@ class BaseState(ABC):
 
 # Memory state management
 class MemoryState(BaseState):
-    def __init__(self):
+    """内存状态，并镜像到磁盘。
+
+    落盘只为了一件事：进程重启后**任务历史和错误信息还在**。此前它们只活在内存里，
+    于是重启之后 ``failed_stage`` 与 ``error`` 一起消失，用户看到的是一条状态含糊
+    的旧任务，异步 API 调用方则彻底查不到自己提交的任务。
+
+    内存仍然是主副本：读永远走内存。落盘在写之后补一次，**但不是整份覆写**——本应用
+    同时跑 WebUI 与 API 两个进程，各自持有一份 ``MemoryState``，而状态文件只有一份。
+    拿本进程的内存快照直接覆盖，会让 API 的一次进度更新把 WebUI 的历史整体抹掉，
+    正是本模块要防的那种故障。合并语义见 ``task_store.save_tasks``。
+
+    写失败只记日志，不影响任务本身。
+    """
+
+    def __init__(self, persist: bool = True):
         self._tasks = {}
         self._lock = threading.RLock()
+        self._persist = persist
+        if self._persist:
+            self._tasks = self._load_persisted()
+
+    def _load_persisted(self) -> dict:
+        from app.services import task_store
+
+        return task_store.load_tasks()
+
+    def _flush(self, removed: set | None = None) -> None:
+        if not self._persist:
+            return
+        from app.services import task_store
+
+        task_store.save_tasks(dict(self._tasks), removed=removed)
+
+    def _touch(self, task_id: str, task: dict) -> None:
+        """写入并把该任务挪到 dict 末尾，让顺序等于"最近更新"。
+
+        dict 对已有键重新赋值**不会**改变插入位置。不挪一下的话，"保留最近 500 条"
+        实际保留的是"最近创建的 500 条"：一条跑了几分钟、进度一直在变的任务，会随着
+        新任务涌入而被优先淘汰——它恰恰是最不该丢的那条。
+        """
+        self._tasks.pop(task_id, None)
+        self._tasks[task_id] = task
 
     def get_all_tasks(self, page: int, page_size: int):
         start = (page - 1) * page_size
@@ -66,12 +105,16 @@ class MemoryState(BaseState):
             progress = 100
 
         with self._lock:
-            self._tasks[task_id] = {
-                "task_id": task_id,
-                "state": state,
-                "progress": progress,
-                **kwargs,
-            }
+            self._touch(
+                task_id,
+                {
+                    "task_id": task_id,
+                    "state": state,
+                    "progress": progress,
+                    **kwargs,
+                },
+            )
+            self._flush()
 
     def get_task(self, task_id: str):
         with self._lock:
@@ -87,11 +130,17 @@ class MemoryState(BaseState):
             if task is None:
                 return False
             task.update(copy.deepcopy(kwargs))
+            self._touch(task_id, task)
+            self._flush()
             return True
 
     def delete_task(self, task_id: str):
         with self._lock:
             self._tasks.pop(task_id, None)
+            # 删除必须显式告诉落盘层。合并写入意味着磁盘上还存在本进程没见过的
+            # 任务（属于另一个进程），若只把自己那份内存快照写回去，它们会因为
+            # "不在快照里"而被静默删掉。
+            self._flush(removed={task_id})
 
 
 # Redis state management

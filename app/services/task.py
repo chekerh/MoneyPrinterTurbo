@@ -1,7 +1,7 @@
 import math
+import json
 import os
 import re
-import shutil
 import socket
 import threading
 import time
@@ -22,6 +22,7 @@ from app.services import (
     llm,
     loomloom,
     material,
+    posting_package,
     sonilo,
     subtitle,
     task_artifacts,
@@ -30,8 +31,8 @@ from app.services import (
     volcengine_seedance,
     voice,
 )
+from app.services import publishing
 from app.services import upload_post
-from app.services import youtube_upload
 from app.services import state as sm
 from app.utils import file_security, utils
 
@@ -111,12 +112,44 @@ def resolve_task_channel(task_id: str, params) -> str:
     return ""
 
 
+#: 任务结束后**必须保留**的文件。它们体积都是 KB 级，不构成 SSD 负担，但删掉会
+#: 直接切断后面整条链路：
+#:
+#: * ``plan_meta.json`` —— ``_auto_archive_plan_tasks`` 据此知道这个成片属于哪个
+#:   频道、哪个主题；没有它成片永远进不了媒体库和月度计划。
+#: * ``script.json`` —— ``archive_channel_video`` 读它取权威主题；WebUI 的
+#:   "重新生成"也从它恢复全部参数。
+#: * ``subtitle.srt`` —— 归档时与成片一同进媒体库，也是无障碍字幕的唯一来源。
+#: * ``.plan_archived`` / ``.plan_skipped`` —— 归档幂等标记。删掉等于让 2 秒轮询
+#:   的 fragment 重新处理同一个任务。
+#:
+#: 早先的清理是整个目录 ``rmtree``，于是 ``scratch_mode = "ram"``（出厂默认）
+#: 之下归档、恢复、打开归档目录三条功能同时失效，而任务面板仍显示"已完成"。
+_TASK_METADATA_FILENAMES = frozenset(
+    {
+        "plan_meta.json",
+        "script.json",
+        "subtitle.srt",
+        ".plan_archived",
+        ".plan_skipped",
+    }
+)
+
+
 def _purge_task_scratch(task_id: str, space=None) -> None:
     """
-    任务结束后立刻删掉它的中间产物目录。
+    任务结束后删掉它的**媒体类**中间产物，保留元数据。
 
     正常结束、失败、异常都会走到这里。成片已经落在 ``outputs_root``，
     缩略图与结果描述符在应用 storage 里，都不受影响。
+
+    这里**不**再删除整个任务目录。SSD 卫生要解决的是"别把几十上百 MB 的视频和
+    音频留在盘上"，而 ``script.json`` / ``plan_meta.json`` / ``subtitle.srt``
+    是 KB 级的小文件，保留它们不花空间，却是归档、重生成、字幕三条功能的唯一
+    输入。整个目录删掉会连带切断这三条链路，而界面只显示"已完成"，故障完全静默。
+
+    未知文件一律删除：这份白名单之外的任何东西都无法证明是必要的，按"宁可多删"
+    处理，才符合本模块存在的目的。
 
     ``space`` 只为测试可注入而存在；生产路径一律用进程内那个全局内存盘。
     """
@@ -127,8 +160,37 @@ def _purge_task_scratch(task_id: str, space=None) -> None:
         if space.root is None:
             return
         target = Path(space.root) / "tasks" / str(task_id)
-        if target.is_dir():
-            shutil.rmtree(target, ignore_errors=True)
+        if not target.is_dir():
+            return
+
+        for entry in target.rglob("*"):
+            if entry.is_dir():
+                continue
+            if entry.name in _TASK_METADATA_FILENAMES:
+                continue
+            try:
+                entry.unlink()
+            except OSError as exc:
+                logger.debug(
+                    f"failed to remove task scratch file: {entry}, error={exc}"
+                )
+        # 媒体清空后把空壳目录收掉，不留一堆空目录给人看。保留了元数据的任务目录
+        # 会被跳过：``rmdir`` 只在真的空了的时候才成功，所以这里不需要额外的判断。
+        for directory in sorted(
+            (p for p in target.rglob("*") if p.is_dir()),
+            key=lambda p: len(p.parts),
+            reverse=True,
+        ):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        try:
+            target.rmdir()
+        except OSError:
+            # 还有元数据（script.json / subtitle.srt / .plan_archived）就留着，
+            # 归档、重生成、字幕三条链路都还要从这里读。
+            pass
     except Exception as exc:  # noqa: BLE001 - 清理失败不该影响任务结果
         logger.warning(
             f"failed to purge task scratch: task_id={task_id}, error={exc}"
@@ -1090,6 +1152,7 @@ def _run_cross_post(
     video_language: str,
     platforms: tuple[str, ...],
     youtube_privacy_status: str,
+    channel: str,
 ) -> None:
     """后台执行跨平台发布，并只补充发布相关的任务字段。"""
     results = []
@@ -1124,12 +1187,17 @@ def _run_cross_post(
                 first = (platforms[0] or "").strip().lower()
                 # llm.py resolves unknown ids to its default platform.
                 social_platform = _CROSS_POST_SOCIAL_PLATFORMS.get(first, first)
-            metadata = llm.generate_social_metadata(
-                video_subject=video_subject,
-                video_script=video_script,
-                language=video_language or "",
-                platform=social_platform,
-            )
+            saved_copy = bool(video_paths and Path(video_paths[0]).with_suffix(".posting.json").is_file())
+            if saved_copy:
+                package = posting_package.load_for_video(video_paths[0], channel, video_subject)
+                metadata = {key: package[key] for key in ("title", "caption", "hashtags")}
+            else:
+                metadata = llm.generate_social_metadata(
+                    video_subject=video_subject,
+                    video_script=video_script,
+                    language=video_language or "",
+                    platform=social_platform,
+                )
             if has_youtube:
                 youtube_extra = {
                     "youtube_title": metadata.get("title", video_subject),
@@ -1146,11 +1214,20 @@ def _run_cross_post(
             )
 
         for video_path in video_paths:
-            result = upload_post.cross_post_video(
+            meta = publishing.PublishMeta(
+                title=(youtube_extra or {}).get("youtube_title") or post_title,
+                description=(youtube_extra or {}).get("youtube_description") or "",
+                tags=(youtube_extra or {}).get("tags") or [],
+                privacy_status=youtube_privacy_status,
+                caption=post_title,
+                extra={"platforms": list(platforms)},
+            )
+            publish = publishing.publish_once if saved_copy else publishing.publish
+            result = publish(
+                channel=channel,
                 video_path=video_path,
-                title=post_title,
+                meta=meta,
                 platforms=list(platforms),
-                youtube_extra=youtube_extra,
             )
             if not isinstance(result, dict):
                 result = {
@@ -1260,6 +1337,7 @@ def _schedule_cross_post(
     video_script: str,
     platforms: list[str],
     youtube_privacy_status: str,
+    channel: str,
 ) -> str | None:
     """提交后台发布任务；成功返回 None，调度失败返回可查询的错误原因。"""
     if not _cross_post_slots.acquire(blocking=False):
@@ -1286,6 +1364,7 @@ def _schedule_cross_post(
             params.video_language or "",
             tuple(platforms),
             youtube_privacy_status,
+            channel,
         )
         _register_cross_post_future(task_id, future)
         future.add_done_callback(partial(_finalize_cross_post_future, task_id))
@@ -1304,6 +1383,27 @@ def _schedule_cross_post(
         return f"failed to schedule cross-post: {exc}"
 
     return None
+
+
+def _prepare_posting_copy(task_id: str, params: VideoParams, script: str, video_paths: list[str]) -> dict | None:
+    """Keep copy beside durable final videos before publishing or archiving starts."""
+    existing = [video_path for video_path in video_paths if Path(video_path).is_file()]
+    if not existing:
+        return None
+    sources = []
+    try:
+        manifest = json.loads((Path(utils.task_dir(task_id)) / "script.json").read_text(encoding="utf-8"))
+        sources = manifest.get("material_sources", [])
+    except (OSError, ValueError, AttributeError):
+        pass
+    package = posting_package.build(
+        params.video_subject or "", script, params.video_language or "",
+        resolve_task_channel(task_id, params), task_id, sources=sources,
+    )
+    for video_path in existing:
+        posting_package.save_for_video(video_path, package)
+    task_artifacts.patch_script_data(task_id, posting_package=package)
+    return package
 
 
 def _run_pipeline(
@@ -1510,6 +1610,13 @@ def _run_pipeline(
             "failed to generate final video",
         )
 
+    package = None
+    try:
+        package = _prepare_posting_copy(task_id, params, video_script, final_video_paths)
+    except (OSError, ValueError) as exc:
+        generation_warnings.append(f"Posting text could not be saved: {exc}")
+        logger.warning(f"failed to save posting package for {task_id}: {exc}")
+
     logger.success(
         f"task {task_id} finished, generated {len(final_video_paths)} videos."
     )
@@ -1530,27 +1637,27 @@ def _run_pipeline(
 
     # 7. 先完成视频生成任务，再按需提交跨平台发布。第三方上传可能耗时
     # 数分钟，不应阻塞视频结果返回，也不能反向影响已经生成的成片。
-    upload_post_ready = (
-        upload_post.upload_post_service.is_configured()
-        and upload_post.upload_post_service.auto_upload
-    )
-    youtube_native_ready = youtube_upload.is_configured()
-    cross_post_enabled = upload_post_ready or youtube_native_ready
-    platforms = (
-        list(upload_post.upload_post_service.platforms)
-        if cross_post_enabled
-        else []
-    )
-    if upload_post_ready and not youtube_native_ready:
-        platforms = [
-            p
-            for p in upload_post.upload_post_service.platforms
-            if not (isinstance(p, str) and p.startswith("youtube"))
-        ]
-    should_cross_post = cross_post_enabled and bool(platforms)
-    if cross_post_enabled and not platforms:
+    # 发布能力由适配器注册表决定：某个 niche 上哪些平台已完成一次性授权，
+    # 就发到哪里。不再依赖全局的 upload_post 开关。
+    channel = resolve_task_channel(task_id, params)
+    connected = publishing.connected_platforms(channel)
+    platforms = [
+        platform for platform in connected
+        if (bool(config.app.get("youtube_upload_auto_publish", True)) if platform == "youtube"
+            else upload_post.upload_post_service.auto_upload)
+    ]
+    # The scheduler owns archiving and publishing when this flag is set.
+    should_cross_post = bool(platforms) and os.environ.get("MPT_SKIP_AUTO_PUBLISH") != "1"
+    skip_reason = None
+    if not should_cross_post:
+        skip_reason = (
+            "Scheduled uploader owns publishing after archiving."
+            if os.environ.get("MPT_SKIP_AUTO_PUBLISH") == "1"
+            else "Auto-publishing is disabled." if connected
+            else "No publishing account is connected for this channel."
+        )
         logger.warning(
-            f"skip cross-post because no platforms are configured, task_id: {task_id}"
+            f"skip cross-post for niche {channel!r}, task_id: {task_id}: {skip_reason}"
         )
     cross_post_state = const.CROSS_POST_STATE_PENDING if should_cross_post else None
 
@@ -1566,9 +1673,11 @@ def _run_pipeline(
         "audio_duration": audio_duration,
         "subtitle_path": subtitle_path,
         "materials": downloaded_videos,
+        "posting_package": package,
         "cross_post_state": cross_post_state,
         "cross_post_results": None,
         "cross_post_error": None,
+        "cross_post_skip_reason": skip_reason,
         "cross_post_owner": _cross_post_process_owner if should_cross_post else None,
         "warnings": generation_warnings or None,
         "thumbnail_eligibility": (
@@ -1589,8 +1698,10 @@ def _run_pipeline(
             video_script=video_script,
             platforms=platforms,
             youtube_privacy_status=(
-                upload_post.upload_post_service.youtube_privacy_status
+                config.app.get("youtube_upload_privacy_status")
+                or upload_post.upload_post_service.youtube_privacy_status
             ),
+            channel=channel,
         )
         # 队列满或线程池关闭属于同步可知的调度失败。任务状态已经由调度函数
         # 更新，这里同步修正返回快照，避免调用方收到与后续查询不一致的 pending。

@@ -66,8 +66,9 @@ def _button_by_key_prefix(app, key_prefix):
     return next(button for button in app.button if str(button.key).startswith(key_prefix))
 
 
-def test_headless_play_renders_and_closes_browser_preview(headless_task_app):
+def test_headless_play_renders_and_closes_browser_preview(headless_task_app, open_task_manager):
     app, video_file = headless_task_app
+    open_task_manager(app)
 
     _button_by_key_prefix(app, "play_task_all_headless-test").click()
     app.run()
@@ -83,8 +84,9 @@ def test_headless_play_renders_and_closes_browser_preview(headless_task_app):
     assert len(app.get("video")) == 0
 
 
-def test_headless_open_folder_shows_host_mapped_path(headless_task_app):
+def test_headless_open_folder_shows_host_mapped_path(headless_task_app, open_task_manager):
     app, _ = headless_task_app
+    open_task_manager(app)
 
     _button_by_key_prefix(app, "open_task_all_headless-test").click()
     app.run()

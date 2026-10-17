@@ -39,6 +39,11 @@ dependencies = [
     # 一导入就 ModuleNotFoundError，测试在收集阶段就崩。依赖必须写出来。
     "google-auth-oauthlib==1.4.1",
     "google-api-python-client==2.200.0",
+    # Directly imported by app.services.campaign (Notion page rendering) and by
+    # the deprecated tools/youtube_uploader.py escape hatch. It was only present
+    # transitively in some environments, so `uv sync --frozen` produced an env
+    # where campaign imports crashed at collection time.
+    "playwright==1.63.0",
     # Used directly by app.services.thumbnail for text compositing.
     # Previously only present transitively via moviepy, which is not a
     # guarantee that will survive a dependency change.

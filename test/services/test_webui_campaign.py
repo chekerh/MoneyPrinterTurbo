@@ -57,7 +57,7 @@ WEBUI_MAIN = ROOT_DIR / "webui" / "Main.py"
 
 
 @pytest.fixture
-def campaign_app(monkeypatch, tmp_path):
+def campaign_app(monkeypatch, tmp_path, switch_view):
     applications_dir = ROOT_DIR / "test" / "test_data" / "media_library_app"
     plans_root = applications_dir / "plans"
     outputs_root = applications_dir / "outputs"
@@ -73,6 +73,8 @@ def campaign_app(monkeypatch, tmp_path):
     with patch.object(config, "try_save_config", return_value=True):
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
         app.run()
+        # 活动面板现在是左侧导航里的 campaign 视图
+        switch_view(app, "campaign")
         assert not app.exception
         return app
 
@@ -121,7 +123,7 @@ def _campaign_posts_list():
     ]
 
 
-def test_campaign_use_title_starts_generation(campaign_app):
+def test_campaign_use_title_starts_generation(campaign_app, switch_view):
     """The "Use Title As Video Subject" button must actually start generation."""
     from app.services import webui_task
 
@@ -159,19 +161,21 @@ def test_campaign_use_title_starts_generation(campaign_app):
         app.run()
         assert not app.exception
 
-        # 活动面板先于设置表单渲染；但视频源选择框会从既有会话状态取回上次
-        # 的 “local”。这里显式切到 pexels，确保点击“用作视频主题”后会进入可
-        # 正常提交的生成路径，而不是被本地素材校验拦截。
+        # 视频源选择框在生成视图上，活动视图里没有。这里切过去把它设成 pexels，
+        # 确保点击“用作视频主题”后会进入可正常提交的生成路径，而不是被本地
+        # 素材校验拦截；设完再切回活动视图点那个按钮。
+        switch_view(app, "generate")
         source_select = next(s for s in app.selectbox if s.label == "Video Source")
         source_select.set_value("pexels")
         app.run()
+        switch_view(app, "campaign")
 
         use_title_button = next(
             b for b in app.button if b.label == "Use as video subject"
         )
         use_title_button.click()
         app.run()
-        assert not app.exception
+        assert not app.exception, app.exception
 
         assert submit_mock.call_count == 1, "campaign button must submit generation"
         called_params = submit_mock.call_args.kwargs["params"]
@@ -181,8 +185,8 @@ def test_campaign_use_title_starts_generation(campaign_app):
 
 def test_campaign_panel_renders_empty_state(campaign_app):
     app = campaign_app
-    expander_labels = [e.label for e in app.expander]
-    assert "Campaign Content Studio" in expander_labels
+    # 活动面板不再是折叠面板，而是左侧导航里的 campaign 视图，
+    # 因此这里直接断言它渲染出了自己的输入框，而不是去找外层容器。
     text_inputs = [t.label for t in app.text_input]
     assert "Campaign link or text" in text_inputs
     markdown_text = " ".join(str(m.value) for m in app.markdown)
@@ -230,6 +234,7 @@ def test_campaign_fetch_build_and_generate(campaign_app):
         generate_button.click()
         app.run()
         assert not app.exception
+        # 每条生成结果各自是一个折叠面板（视图本身不再包一层）
         expander_labels = [e.label for e in app.expander]
         assert any("Anton explains the flow" in label for label in expander_labels)
         markdown_text = " ".join(str(m.value) for m in app.markdown)

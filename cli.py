@@ -577,16 +577,31 @@ Batch manifests:
         "--youtube-authorize",
         action="store_true",
         help=(
-            "run the one-time Google OAuth flow and save the token to "
-            "storage/credentials/youtube_token.json; requires "
+            "run the one-time Google OAuth flow for --channel and save the token "
+            "to storage/credentials/youtube/<channel>.json; requires "
             "youtube_upload_client_id and youtube_upload_client_secret "
-            "in config.toml"
+            "in config.toml. Pick the matching channel on Google's consent "
+            "screen — a token can only ever publish to one channel."
         ),
     )
     publish_mode.add_argument(
         "--youtube-status",
         action="store_true",
-        help="show which YouTube channel is linked by the saved OAuth token",
+        help=(
+            "show which YouTube channel the saved OAuth token is bound to for "
+            "--channel (or every connected niche if --channel is omitted)"
+        ),
+    )
+    publish_mode.add_argument(
+        "--youtube-channels",
+        action="store_true",
+        help="list every YouTube channel this Google account can publish to",
+    )
+    publish_group.add_argument(
+        "--channel",
+        dest="channel",
+        default=None,
+        help="niche to act on, e.g. history-mysteries (default: all niches)",
     )
     args = parser.parse_args(argv)
 
@@ -595,12 +610,19 @@ Batch manifests:
         and not args.video_subject.strip()
         and not args.video_script.strip()
     ):
-        if not (args.youtube_authorize or args.youtube_status):
+        if not (
+            args.youtube_authorize or args.youtube_status or args.youtube_channels
+        ):
             parser.error("one of --video-subject or --video-script is required")
-    if (args.youtube_authorize or args.youtube_status) and args.batch_file:
+    if (
+        args.youtube_authorize or args.youtube_status or args.youtube_channels
+    ) and args.batch_file:
         parser.error(
-            "--youtube-authorize/--youtube-status cannot be combined with --batch-file"
+            "--youtube-authorize/--youtube-status/--youtube-channels cannot be "
+            "combined with --batch-file"
         )
+    if (args.youtube_authorize or args.youtube_status) and not args.channel:
+        parser.error("--youtube-authorize and --youtube-status need --channel")
 
     if not args.batch_file and args.video_source == "local" and args.stop_at == "terms":
         parser.error(
@@ -1524,13 +1546,15 @@ def _run_batch_tasks(args: argparse.Namespace, tasks: list[VideoParams]) -> int:
 def run_cli(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
 
-    if args.youtube_authorize or args.youtube_status:
+    if args.youtube_authorize or args.youtube_status or args.youtube_channels:
         from app.services import youtube_upload
 
         if args.youtube_authorize:
-            result = youtube_upload.authorize()
+            result = youtube_upload.authorize(args.channel)
+        elif args.youtube_channels:
+            result = youtube_upload.list_my_channels()
         else:
-            result = youtube_upload.channel_info()
+            result = youtube_upload.channel_info(args.channel)
         print(json.dumps(result, ensure_ascii=False, default=str))
         return 0 if result.get("success") else 1
 

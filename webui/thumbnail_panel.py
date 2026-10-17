@@ -248,6 +248,13 @@ def _job_summary(tr: Callable[[str], str], job) -> None:
     elif job["state"] == "running":
         with st.spinner(tr("Thumbnail Generating")):
             time.sleep(0.2)
+    elif job["state"] == "failed":
+        # 失败态此前什么都不渲染，于是"点生成 → 什么都没发生"是唯一症状：
+        # 作业可能因为源路径不对、ffmpeg 不可用或磁盘满而失败，用户无从判断
+        # 是没点上还是坏了。作业记录里带着 error，这里必须显示出来。
+        st.error(tr("Thumbnail Generation Failed").format(reason=job.get("error") or ""))
+    elif job["state"] == "cancelled":
+        st.warning(tr("Thumbnail Generation Cancelled"))
 
 
 _JOB_ROOT_CACHE: dict[str, Path] = {}
@@ -298,6 +305,7 @@ def render_thumbnail_panel(
     source_root: Path,
     tr: Callable[[str], str],
     font_path: Path | None = None,
+    key_prefix: str = "",
 ) -> None:
     """
     渲染面板。
@@ -306,13 +314,18 @@ def render_thumbnail_panel(
     :mod:`app.services.thumbnail_jobs` 的工作线程上。这样请求线程不会被最长
     30 秒的抽帧冻住，界面靠轮询作业状态更新。
 
-    :param source_root: 成片所在目录（通常是 ``storage/tasks/<task_id>``）。
+    :param source_root: 成片所在目录，即 ``<portfolio_root>/outputs/<task_id>/``。
+        注意**不是** ``storage/tasks/<task_id>``：最终成片是唯一长期留存的视频，
+        写在作品集的 outputs 下，任务目录只剩中间产物。
         描述符是纯数据，不持有文件系统句柄，因此源路径由调用方给出，
         相对名仍然只取自描述符。
 
     这里刻意不接受工具链参数：渲染已经移到后台线程，工具链由
     :mod:`app.services.thumbnail_jobs` 在进程内共享解析一次，调用方再传一份
     只会造成"面板以为解析好了、后台其实没解析"的分歧。
+
+    :param key_prefix: 同一任务在同一页渲染多次时的控件名前缀（例如结果快照与
+        任务预览同时打开）。默认为空，保持原有键名不变。
     """
     import streamlit as st
 
@@ -341,14 +354,14 @@ def render_thumbnail_panel(
         else:
             st.caption(tr("Thumbnail No Preview Yet"))
 
-        text_key = f"thumbnail_overlay_{task_id}_{entry.video_index}"
+        text_key = f"{key_prefix}thumbnail_overlay_{task_id}_{entry.video_index}"
         overlay = st.text_input(
             tr("Thumbnail Overlay"),
             key=text_key,
             max_chars=MAX_OVERLAY_CHARS,
         )
 
-        error_key = f"thumbnail_error_{task_id}_{entry.video_index}"
+        error_key = f"{key_prefix}thumbnail_error_{task_id}_{entry.video_index}"
         if st.session_state.get(error_key):
             st.error(tr(st.session_state[error_key]))
 
@@ -363,7 +376,7 @@ def render_thumbnail_panel(
         )
         if st.button(
             button_label,
-            key=f"thumbnail_generate_{task_id}_{entry.video_index}",
+            key=f"{key_prefix}thumbnail_generate_{task_id}_{entry.video_index}",
             disabled=not row.can_generate,
         ):
             _submit_one(
@@ -394,7 +407,7 @@ def render_thumbnail_panel(
                 options=options,
                 index=0,
                 format_func=lambda aid: labels.get(aid, aid[:8]),
-                key=f"thumbnail_pick_{task_id}_{entry.video_index}",
+                key=f"{key_prefix}thumbnail_pick_{task_id}_{entry.video_index}",
                 horizontal=True,
             )
             if chosen and chosen != row.selected_artifact_id:
@@ -412,7 +425,7 @@ def render_thumbnail_panel(
             for candidate in row.archivable_ids:
                 if st.button(
                     tr("Thumbnail Archive {index}").format(index=candidate[:8]),
-                    key=f"thumbnail_archive_{task_id}_{entry.video_index}_{candidate[:8]}",
+                    key=f"{key_prefix}thumbnail_archive_{task_id}_{entry.video_index}_{candidate[:8]}",
                 ):
                     _archive_one(
                         manifest_path=Path(manifest_path),

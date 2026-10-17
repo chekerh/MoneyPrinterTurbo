@@ -646,6 +646,11 @@ div[data-testid="stVideo"] {
     background: color-mix(in srgb, #2f9e44 13%, transparent);
 }
 
+.mpt-badge--warn {
+    color: #8a5200;
+    background: color-mix(in srgb, #f09e0f 20%, transparent);
+}
+
 .mpt-badge--draft {
     color: #868e96;
     background: color-mix(in srgb, currentColor 9%, transparent);
@@ -659,6 +664,7 @@ div[data-testid="stVideo"] {
 }
 
 .mpt-badge--posted::before,
+.mpt-badge--warn::before,
 .mpt-badge--draft::before,
 .mpt-badge--broken::before {
     content: "";
@@ -671,6 +677,10 @@ div[data-testid="stVideo"] {
 @media (prefers-color-scheme: dark) {
     .mpt-badge--posted {
         color: #51cf66;
+    }
+
+    .mpt-badge--warn {
+        color: #ffd9a0;
     }
 
     .mpt-badge--broken {
@@ -719,5 +729,993 @@ div[class*="st-key-task_row_"] button[kind="secondary"] {
 @media (hover: hover) and (pointer: fine) {
     div[class*="st-key-task_row_"] button[kind="secondary"]:hover {
         border-color: color-mix(in srgb, currentColor 35%, transparent);
+    }
+}
+
+/* ── 新手引导层：必须是非模态的 ────────────────────────────────────────────
+   streamlit-tour 内部用 Driver.js，它的默认行为是"模态遮罩"：遮罩吃掉整页点击，
+   页面里除高亮元素外的所有东西都不可交互。对一个只想告诉你"设置在这里"的引导来说，
+   这既没必要也很烦人——用户想跳过、想直接开始干活，都做不到。
+
+   组件自带的 CSS 其实已经写了 `.driver-overlay{pointer-events:none}`，但遮罩内部
+   是一个用 SVG path 挖洞的 <svg>。Chrome 对 SVG 子元素的 pointer-events 走各自的
+   UA 规则，算出来是 auto，于是那一条 path 把整页点击又吃回来了——这就是"引导挡住
+   整个页面"的真正原因。上面那条规则看着没问题却不起作用，原因也在这里。
+
+   这些覆盖必须带 !important：组件的 CSS 是在渲染时注入的，注入顺序不受我们控制，
+   谁的优先级高只能靠 !important 钉死。 */
+.driver-active * {
+    pointer-events: auto !important;
+}
+
+/* 遮罩连同它内部那个 SVG path 一起对点击透明。
+   放在上一条之后：同优先级时后写的赢。 */
+.driver-overlay,
+.driver-overlay * {
+    pointer-events: none !important;
+}
+
+/* 气泡本身必须仍然可点，否则"上一步/下一步/完成"就没了。 */
+.driver-popover,
+.driver-popover * {
+    pointer-events: auto !important;
+}
+
+/* 气泡跟随被指向的元素，而不是钉在视口上。
+
+   组件打包的 CSS 把气泡写成 `position:fixed; top:0; right:0`，而 Driver.js 定位时
+   算的是**文档坐标**。两者一混，页面一滚动气泡就停在原地、被指向的元素却走了，
+   于是引导框悬在半空、盖住不相干的内容。改回 absolute 后两者坐标系一致。 */
+.driver-popover {
+    position: absolute !important;
+}
+
+/* ── Streamlit 的浮层层宿主：空壳不能吃掉整页点击 ─────────────────────────
+   React Aria / baseweb 会挂一个 data-st-baseweb-layer-host 容器来放弹层
+   （popover、tooltip、菜单、对话框）。它的样式是 position:fixed、铺满视口、
+   z-index 1000060，而且 pointer-events:auto —— 即使里面一个子元素都没有。
+
+   结果是：任何一个浮层曾经打开过，页面上就永久多出一块看不见的"玻璃"，点哪里
+   都没反应。之前"引导挡住整个页面"就是这个：Driver.js 的遮罩本身其实是
+   pointer-events:none，真正吃点击的是这块空宿主。
+
+   这里让宿主本身对点击透明，同时把它的子元素恢复成可点——这样真实的弹层仍然
+   正常，只是不再由一个空壳替它挡住整页。 */
+div[data-st-overlay-root][data-baseweb-layer-host],
+div[data-st-overlay-root][data-react-aria-top-layer] {
+    pointer-events: none !important;
+}
+
+div[data-st-overlay-root][data-baseweb-layer-host] *,
+div[data-st-overlay-root][data-react-aria-top-layer] * {
+    pointer-events: auto !important;
+}
+
+/* ── 计划表：状态徽章 + 行内封面 ───────────────────────────────────────────
+   状态列原本只有一个"🔗 / —"。符号既说不出"已发布"还是"没发布"，也点不开去看
+   到底发到了哪里，于是这里换成带文字、可点击的徽章。 */
+.mpt-status {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.08rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 650;
+    line-height: 1.4;
+    white-space: nowrap;
+    text-decoration: none;
+}
+
+.mpt-status--posted {
+    color: #2f9e44;
+    background: color-mix(in srgb, #2f9e44 13%, transparent);
+}
+
+.mpt-status--draft {
+    color: #868e96;
+    background: color-mix(in srgb, currentColor 9%, transparent);
+}
+
+/* 封面：固定 9:16、固定高度，缺图时给一块明确是"没有"的占位。
+   高度写死是必要的——否则有图没图的行高不一致，整张表会像波浪一样抖动。
+
+   注意这条挂在 plan_thumb 容器上而不是直接挂在 img 上：st.image 自己会撑满容器
+   宽度，而 9:16 的竖图一旦按宽度放开就能长到 300px 以上，整张表会被撑成一堵墙。 */
+div[class*="st-key-plan_thumb_"] img {
+    width: 100%;
+    /* 16:9 而不是 9:16：这一列有 180px 宽，竖图按比例只有 58px，旁边会空一大块。
+       横向裁切后它读起来就是一条胶片格——一眼扫过去比较的也是画面主体，不是构图。 */
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    border-radius: 6px;
+    display: block;
+}
+
+.mpt-thumb {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    object-fit: cover;
+    border-radius: 6px;
+    background: color-mix(in srgb, currentColor 8%, transparent);
+    display: block;
+}
+
+/* 缺图占位：用斜纹而不是纯灰，斜纹是"内容缺失"的通用符号，
+   纯灰很容易被当成一张真的深色封面。 */
+.mpt-thumb--empty {
+    background:
+        repeating-linear-gradient(
+            45deg,
+            color-mix(in srgb, currentColor 6%, transparent) 0 6px,
+            transparent 6px 12px
+        );
+    border: 1px dashed color-mix(in srgb, currentColor 22%, transparent);
+    box-sizing: border-box;
+}
+
+/* ── 筹码（chips）：少量离散选项 ─────────────────────────────────────────
+   筹码比下拉框好在"当前选择始终可见"。画幅、字幕位置这类每天都要调的项，
+   用下拉框的话每次都要点开才能确认自己选了什么，而选中态往往就是最需要
+   一眼看到的那条信息。 */
+div[data-testid="stPills"] button {
+    border-radius: 999px;
+    transition:
+        background-color var(--mpt-state-duration) var(--mpt-ease),
+        border-color var(--mpt-state-duration) var(--mpt-ease),
+        color var(--mpt-state-duration) var(--mpt-ease);
+}
+
+div[data-testid="stPills"] button[kind="primary"] {
+    font-weight: 650;
+}
+
+/* ── 左侧导航：分组小标题 + 免费工具状态卡 ─────────────────────────────── */
+.mpt-nav-group {
+    font-size: 0.66rem;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    /* 颜色用 currentColor 混色而不是写死灰：深浅色主题下都保持同一套层级关系，
+       写死色值在深色模式下会突然变成"比正文还亮"的反色标签。 */
+    color: color-mix(in srgb, currentColor 52%, transparent);
+    margin: 0.9rem 0 0.35rem;
+}
+
+/* 侧栏条目：当前项用左侧竖条标出，比背景色更明确——背景色在 Streamlit 主题下
+   很容易和 hover 态撞色。 */
+div[class*="st-key-nav_item_"] {
+    border-left: 2px solid transparent;
+}
+
+div[class*="st-key-nav_item_"] button {
+    justify-content: flex-start;
+}
+
+/* 免费工具卡：常驻侧栏底部，回答"这些功能到底要不要花钱"。
+   卡片本体是带边框的 Streamlit 容器（主题自适应），这里只收紧行距。 */
+.mpt-free-item {
+    margin: 0.1rem 0;
+    color: color-mix(in srgb, currentColor 78%, transparent);
+}
+
+/* ── 路线图占位卡（尚未实现的能力）──────────────────────────────────────
+   刻意做成"看得见但点不动"：已实现的入口和没实现的入口在视觉上必须一眼可分，
+   否则用户点不动会以为是界面坏了。 */
+.mpt-bench-card {
+    border: 1px dashed color-mix(in srgb, currentColor 26%, transparent);
+    border-radius: 10px;
+    padding: 0.7rem 0.8rem;
+    min-height: 132px;
+}
+
+.mpt-bench-title {
+    font-weight: 650;
+    margin: 0 0 0.25rem;
+}
+
+.mpt-bench-desc {
+    font-size: 0.78rem;
+    line-height: 1.45;
+    color: color-mix(in srgb, currentColor 68%, transparent);
+    margin: 0 0 0.5rem;
+}
+
+.mpt-bench-badge {
+    display: inline-block;
+    font-size: 0.66rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    color: color-mix(in srgb, currentColor 62%, transparent);
+    background: color-mix(in srgb, currentColor 8%, transparent);
+    margin: 0;
+}
+
+/* 思考动效的宿主容器。高度由调用方给定，这里只负责垂直居中与不撑开布局。 */
+.mpt-orb {
+    display: flex;
+    align-items: center;
+    line-height: 0;
+}
+
+/* ── 工具台 ─────────────────────────────────────────────────────────────
+   形制取自参考设计：三列网格，每张卡一个能力 + 一句说明 + 一个入口。
+
+   有三处刻意不照抄，都是因为照抄之后在**本应用**里是错的：
+
+   1) 每张卡顶部那块 16:9 的图。参考设计给它放的是定制的 3D 渲染图；我们没有
+      那种素材，而一张通用图库插画对九种差异极大的能力都没有信息量。更糟的是，
+      一个只放了个字母的 16:9 空盒子看起来就像**图片加载失败**——第一版正是这样，
+      截图上一排九个灰框。改成"字标 + 标题"同一行：更紧凑，也没有假象。
+   2) CTA 的权重。参考设计是七张浅色小片；我们若用九个实心主按钮，整屏会变成
+      一片红。"一屏一个主操作"是参考设计让密集界面显得安静的唯一原因，卡片按钮
+      是入口提示而不是这一屏要你做的事。
+   3) 字号。参考设计正文 9px、标题 10px——那是它把内容压进 768px 网格的代价。
+      本应用的卡片更宽，9px 在桌面上是负担而不是质感。密度靠紧凑行距维持。
+
+   颜色一律用 currentColor 混色，深浅色主题下层级关系不变。 */
+.mpt-bench-eyebrow {
+    font-size: 0.66rem;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: color-mix(in srgb, currentColor 52%, transparent);
+    margin: 0 0 0.2rem;
+}
+
+.mpt-bench-subtitle {
+    font-size: 0.85rem;
+    line-height: 1.5;
+    color: color-mix(in srgb, currentColor 66%, transparent);
+    margin: 0.2rem 0 0.9rem;
+}
+
+/* 状态行：字标 + 标题 + 旗标。字标与标题同一行，卡片因此只有三行内容，
+   网格高度由说明文字决定而不是由一个空盒子决定。 */
+div[class*="st-key-bench_card_"] .mpt-bench-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.3rem;
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-mark {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 1.75rem;
+    height: 1.75rem;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    font-weight: 700;
+    line-height: 1;
+    color: color-mix(in srgb, currentColor 55%, transparent);
+    background: color-mix(in srgb, currentColor 9%, transparent);
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-title {
+    font-weight: 650;
+    font-size: 0.95rem;
+    letter-spacing: -0.01em;
+    margin: 0;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+/* 旗标跟在标题后面而不是压在图上——图没了之后，角标就失去了它依附的表面。 */
+div[class*="st-key-bench_card_"] .mpt-bench-flag {
+    flex: 0 0 auto;
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, currentColor 10%, transparent);
+    color: color-mix(in srgb, currentColor 58%, transparent);
+}
+
+/* 琥珀色只留给"差一个 key"：它是唯一需要用户去做点什么的状态。 */
+div[class*="st-key-bench_card_"] .mpt-bench-head[data-state="needs_setup"] .mpt-bench-mark {
+    background: color-mix(in srgb, #F09E0F 22%, transparent);
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-head[data-state="needs_setup"] .mpt-bench-flag {
+    background: color-mix(in srgb, #F09E0F 26%, transparent);
+    color: color-mix(in srgb, #8A5200 90%, currentColor);
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-head[data-state="waiting"] .mpt-bench-mark {
+    background: color-mix(in srgb, currentColor 6%, transparent);
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-desc {
+    font-size: 0.8rem;
+    line-height: 1.45;
+    color: color-mix(in srgb, currentColor 64%, transparent);
+    /* 说明压到两行：卡片高度一旦被文案撑开，网格就不再是网格。 */
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    margin: 0 0 0.55rem;
+    min-height: 2.3em;
+}
+
+div[class*="st-key-bench_card_"] {
+    /* 卡片本身不画边框：分隔靠底色。描边在密集网格里会变成一片横线，比留白更吵。 */
+    border-radius: 12px;
+    padding: 0.7rem 0.75rem 0.75rem;
+    margin-bottom: 0.5rem;
+    background: color-mix(in srgb, currentColor 4%, transparent);
+    transition: background 140ms ease;
+}
+
+div[class*="st-key-bench_card_"]:hover {
+    background: color-mix(in srgb, currentColor 7%, transparent);
+}
+
+/* 缺什么说明紧贴在说明文字下面，别让它把卡片撑成另一种高度。 */
+div[class*="st-key-bench_card_"] p[data-testid="stCaptionContainer"] {
+    font-size: 0.72rem;
+    line-height: 1.35;
+    margin: -0.35rem 0 0.5rem;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   VIXAL STUDIO THEME — light "workshop" look
+   Reference: vixal.app/studio (Tools / Script / Video / Library screens).
+   Tokens pulled from the screenshots + live studio pages:
+     bg        #e9ebef → #f2f3f6   dotted grid + diagonal light beams
+     surface   #ffffff            floating sidebar / topbar / cards
+     ink       #101013            headlines, 800 weight, -0.02em tracking
+     muted     #6b7280            subtitles, hints
+     line      rgba(16,16,19,.08) hairlines, card borders
+     primary   near-black gradient (#3b3b40 → #101013), pill, white text
+     secondary white pill with hairline border + soft shadow
+   Everything below is scoped so the task rows, plan table and thumbnail
+   panel above keep working untouched. Dark mode gets a matching variant
+   at the bottom instead of a forced light canvas.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+:root {
+    --vix-bg-0: #e7e9ed;
+    --vix-bg-1: #f1f2f5;
+    --vix-surface: #ffffff;
+    --vix-field: #ffffff;
+    --vix-ink: #101013;
+    --vix-muted: #6d727b;
+    --vix-line: rgba(16, 16, 19, 0.09);
+    --vix-shadow-sm: 0 1px 2px rgba(16, 16, 19, 0.06), 0 4px 14px rgba(16, 16, 19, 0.06);
+    --vix-shadow-md: 0 2px 6px rgba(16, 16, 19, 0.07), 0 18px 44px rgba(16, 16, 19, 0.1);
+    --vix-radius-lg: 20px;
+    --vix-radius-md: 14px;
+    --vix-radius-pill: 999px;
+    color-scheme: light;
+}
+
+/* ── App canvas: dotted grid + diagonal beams + soft vignettes ────────── */
+div[data-testid="stAppViewContainer"] {
+    background-color: var(--vix-bg-0);
+    background-image:
+        radial-gradient(circle, rgba(16, 16, 19, 0.1) 1px, transparent 1.1px),
+        linear-gradient(115deg, rgba(255, 255, 255, 0.65) 0%, rgba(255, 255, 255, 0) 28%),
+        linear-gradient(115deg, transparent 62%, rgba(255, 255, 255, 0.55) 78%, transparent 92%),
+        radial-gradient(1100px 500px at 85% -5%, rgba(255, 255, 255, 0.7), transparent 60%),
+        radial-gradient(900px 600px at 8% 108%, rgba(255, 255, 255, 0.55), transparent 60%),
+        linear-gradient(180deg, var(--vix-bg-1), var(--vix-bg-0));
+    background-size:
+        22px 22px,
+        100% 100%,
+        100% 100%,
+        100% 100%,
+        100% 100%,
+        100% 100%;
+}
+
+section[data-testid="stMain"] > div[data-testid="stMainBlockContainer"] {
+    padding-top: 0.9rem !important;
+    max-width: 1180px;
+}
+
+/* Headlines read like the reference: tight, heavy grotesk. */
+section[data-testid="stMain"] h1,
+section[data-testid="stMain"] h2 {
+    letter-spacing: -0.022em !important;
+    font-weight: 800 !important;
+    color: var(--vix-ink) !important;
+    text-wrap: balance;
+}
+
+/* ── Floating sidebar card ──────────────────────────────────────────── */
+section[data-testid="stSidebar"] {
+    background: transparent !important;
+    padding: 12px 0 12px 12px !important;
+}
+
+section[data-testid="stSidebar"] > div:first-child {
+    background: var(--vix-surface) !important;
+    border: 1px solid var(--vix-line) !important;
+    border-radius: var(--vix-radius-lg) !important;
+    box-shadow: var(--vix-shadow-md) !important;
+    overflow: hidden;
+}
+
+div[data-testid="stSidebarContent"],
+div[data-testid="stSidebarUserContent"] {
+    padding: 0.9rem 0.8rem 1rem !important;
+}
+
+/* Sidebar brand reads like the "Vixal" wordmark: heavy, compact. */
+section[data-testid="stSidebar"] strong {
+    font-size: 1.35rem !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.02em !important;
+    color: var(--vix-ink) !important;
+}
+
+/* Nav groups: tiny uppercase labels like PLAN / CREATE / POLISH. */
+section[data-testid="stSidebar"] .mpt-nav-group {
+    font-size: 0.62rem !important;
+    letter-spacing: 0.14em !important;
+    color: var(--vix-muted) !important;
+}
+
+/* Nav items: quiet rows; the current one is a soft white pill with shadow
+   and a dark left tick instead of a loud filled button. */
+div[class*="st-key-nav_item_"] button[kind="secondary"] {
+    border: 1px solid transparent !important;
+    border-radius: 12px !important;
+    background: transparent !important;
+    color: var(--vix-ink) !important;
+    font-weight: 550 !important;
+    box-shadow: none !important;
+}
+
+@media (hover: hover) and (pointer: fine) {
+    div[class*="st-key-nav_item_"] button[kind="secondary"]:hover {
+        background: rgba(16, 16, 19, 0.045) !important;
+        border-color: transparent !important;
+    }
+}
+
+div[class*="st-key-nav_item_"] button[kind="primary"] {
+    border: 1px solid var(--vix-line) !important;
+    border-radius: 12px !important;
+    background: var(--vix-field) !important;
+    color: var(--vix-ink) !important;
+    font-weight: 700 !important;
+    box-shadow: var(--vix-shadow-sm) !important;
+    border-left: 3px solid var(--vix-ink) !important;
+}
+
+/* "+ New video" CTA: the single dark gradient pill in the rail. */
+div[class*="st-key-nav_new_video"] button {
+    border: 0 !important;
+    border-radius: var(--vix-radius-pill) !important;
+    background: linear-gradient(180deg, #43434a 0%, #17171a 55%, #0b0b0d 100%) !important;
+    color: #fff !important;
+    font-weight: 700 !important;
+    box-shadow: 0 8px 20px rgba(10, 10, 12, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.25) !important;
+}
+
+div[class*="st-key-nav_new_video"] button p {
+    color: #fff !important;
+}
+
+/* ── Floating top bar pill ──────────────────────────────────────────── */
+div[class*="st-key-top_bar"] {
+    background: var(--vix-surface) !important;
+    border: 1px solid var(--vix-line) !important;
+    border-radius: 18px !important;
+    box-shadow: var(--vix-shadow-sm) !important;
+    padding: 0.55rem 0.9rem !important;
+    margin-bottom: 1.1rem !important;
+}
+
+.mpt-top-context {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+}
+
+.mpt-top-context__title {
+    font-weight: 750;
+    font-size: 0.95rem;
+    letter-spacing: -0.01em;
+    color: var(--vix-ink);
+    margin: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.mpt-top-context__sub {
+    font-size: 0.75rem;
+    color: var(--vix-muted);
+    margin: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ── Hero (Vixal page headers) ──────────────────────────────────────── */
+.mpt-hero {
+    text-align: center;
+    max-width: 760px;
+    margin: 0.4rem auto 1.2rem;
+    padding: 0 1rem;
+}
+
+.mpt-hero-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.64rem;
+    font-weight: 750;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--vix-muted);
+    /* color-mix instead of a fixed white: the pill stays translucent
+       over the dotted canvas in both themes. */
+    background: color-mix(in srgb, var(--vix-surface) 78%, transparent);
+    border: 1px solid var(--vix-line);
+    border-radius: var(--vix-radius-pill);
+    padding: 0.28rem 0.8rem;
+    margin: 0 0 0.7rem;
+    box-shadow: var(--vix-shadow-sm);
+}
+
+.mpt-hero-title {
+    font-size: clamp(1.7rem, 4.2vw, 2.9rem);
+    font-weight: 800;
+    letter-spacing: -0.025em;
+    line-height: 1.06;
+    color: var(--vix-ink);
+    margin: 0 0 0.55rem;
+    text-wrap: balance;
+}
+
+.mpt-hero-sub {
+    font-size: 0.92rem;
+    line-height: 1.55;
+    color: var(--vix-muted);
+    margin: 0;
+    text-wrap: balance;
+}
+
+/* Tool-grid header reuses the hero language: eyebrow becomes a pill badge. */
+.mpt-bench-eyebrow {
+    display: inline-block !important;
+    font-size: 0.62rem !important;
+    font-weight: 750 !important;
+    letter-spacing: 0.16em !important;
+    text-transform: uppercase !important;
+    color: var(--vix-muted) !important;
+    background: color-mix(in srgb, var(--vix-surface) 78%, transparent) !important;
+    border: 1px solid var(--vix-line) !important;
+    border-radius: var(--vix-radius-pill) !important;
+    padding: 0.28rem 0.8rem !important;
+    margin: 0.2rem 0 0.7rem !important;
+    box-shadow: var(--vix-shadow-sm) !important;
+}
+
+/* ── Composer card (big rounded prompt surface) ─────────────────────── */
+.mpt-composer {
+    background: var(--vix-surface);
+    border: 1px solid var(--vix-line);
+    border-radius: 24px;
+    box-shadow: var(--vix-shadow-md);
+    padding: 1rem 1.1rem;
+    margin: 0 0 0.9rem;
+}
+
+/* ── Tool cards → white studio cards with a visual header ───────────── */
+div[class*="st-key-bench_card_"] {
+    background: var(--vix-surface) !important;
+    border: 1px solid var(--vix-line) !important;
+    border-radius: var(--vix-radius-lg) !important;
+    box-shadow: var(--vix-shadow-sm) !important;
+    padding: 0 !important;
+    margin-bottom: 1rem !important;
+    overflow: hidden !important;
+    transition: transform 160ms cubic-bezier(0.23, 1, 0.32, 1), box-shadow 160ms ease !important;
+}
+
+@media (hover: hover) and (pointer: fine) {
+    div[class*="st-key-bench_card_"]:hover {
+        background: var(--vix-surface) !important;
+        transform: translateY(-2px);
+        box-shadow: var(--vix-shadow-md) !important;
+    }
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-visual {
+    position: relative;
+    height: 118px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-start;
+    padding: 0.6rem 0.7rem;
+    margin: 0.55rem 0.55rem 0;
+    border-radius: 13px;
+    overflow: hidden;
+    background:
+        radial-gradient(120px 70px at 82% 18%, rgba(255, 255, 255, 0.95), transparent 70%),
+        radial-gradient(200px 120px at 12% 110%, rgba(255, 255, 255, 0.5), transparent 65%),
+        linear-gradient(135deg, #dfe3ea, #f4f5f8 60%, #d4d9e1);
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-visual::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image: radial-gradient(circle, rgba(16, 16, 19, 0.13) 1px, transparent 1.1px);
+    background-size: 14px 14px;
+    opacity: 0.5;
+    pointer-events: none;
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-visual__mark {
+    position: relative;
+    z-index: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.92);
+    border: 1px solid rgba(16, 16, 19, 0.1);
+    box-shadow: 0 2px 8px rgba(16, 16, 19, 0.16);
+    font-size: 1.05rem;
+    font-weight: 800;
+    color: #26262b;
+}
+
+/* Per-card monochrome tints — one family, slightly different light. */
+div[class*="st-key-bench_card_"] .mpt-bench-visual[data-card="script"] {
+    background: radial-gradient(120px 70px at 82% 18%, rgba(255,255,255,.95), transparent 70%), linear-gradient(135deg, #d8dce4, #f5f6f9 60%, #cdd3dd);
+}
+div[class*="st-key-bench_card_"] .mpt-bench-visual[data-card="footage"] {
+    background: radial-gradient(120px 70px at 82% 18%, rgba(255,255,255,.95), transparent 70%), linear-gradient(135deg, #cfd6e2, #eef0f5 60%, #c3ccd9);
+}
+div[class*="st-key-bench_card_"] .mpt-bench-visual[data-card="voice"] {
+    background: radial-gradient(120px 70px at 82% 18%, rgba(255,255,255,.95), transparent 70%), linear-gradient(135deg, #e2e4e9, #f7f7f9 60%, #d0d3da);
+}
+div[class*="st-key-bench_card_"] .mpt-bench-visual[data-card="campaign"] {
+    background: radial-gradient(120px 70px at 82% 18%, rgba(255,255,255,.95), transparent 70%), linear-gradient(135deg, #d5dae3, #f2f4f8 60%, #ccd2de);
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-body {
+    padding: 0.7rem 0.85rem 0.85rem;
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-head {
+    margin-bottom: 0.25rem !important;
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-mark {
+    display: none !important;
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-title {
+    font-size: 0.92rem !important;
+}
+
+div[class*="st-key-bench_card_"] .mpt-bench-card__cta button,
+div[class*="st-key-bench_card_"] button {
+    border-radius: var(--vix-radius-pill) !important;
+}
+
+/* "Try now" reads as a small pill, not a full-width slab. */
+div[class*="st-key-bench_card_"] div[data-testid="stButton"] > button {
+    width: auto !important;
+    border-radius: var(--vix-radius-pill) !important;
+    padding: 0.28rem 0.95rem !important;
+    font-weight: 650 !important;
+    font-size: 0.8rem !important;
+    background: var(--vix-field) !important;
+    color: var(--vix-ink) !important;
+    border: 1px solid var(--vix-line) !important;
+    box-shadow: var(--vix-shadow-sm) !important;
+}
+
+/* ── Buttons: one dark primary, quiet white secondaries ─────────────── */
+div[data-testid="stButtonPrimary"] > button,
+div[data-testid="stLinkButton"] > a[kind="primary"] {
+    border: 0 !important;
+    border-radius: var(--vix-radius-pill) !important;
+    background: linear-gradient(180deg, #43434a 0%, #17171a 55%, #0b0b0d 100%) !important;
+    color: #fff !important;
+    font-weight: 700 !important;
+    box-shadow: 0 10px 24px rgba(10, 10, 12, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.25) !important;
+}
+
+div[data-testid="stButtonPrimary"] > button p {
+    color: #fff !important;
+}
+
+div[data-testid="stButton"] > button[kind="secondary"] {
+    border-radius: var(--vix-radius-pill) !important;
+    background: var(--vix-field) !important;
+    color: var(--vix-ink) !important;
+    border: 1px solid var(--vix-line) !important;
+    box-shadow: var(--vix-shadow-sm) !important;
+    font-weight: 600 !important;
+}
+
+/* ── Inputs: soft controls with hairline borders, both themes ────────
+   Base surfaces come from --vix-field so dark mode never inherits a
+   hardcoded white box. Streamlit's own label/help/caption colors are
+   left alone — they already follow the active theme. */
+div[data-testid="stTextInput"] input,
+div[data-testid="stTextArea"] textarea,
+div[data-testid="stNumberInput"] input,
+div[data-testid="stSelectbox"] > div > div,
+div[data-testid="stMultiSelect"] > div > div {
+    border-radius: var(--vix-radius-md) !important;
+    border: 1px solid var(--vix-line) !important;
+    background: var(--vix-field) !important;
+    color: var(--vix-ink) !important;
+    box-shadow: 0 1px 2px rgba(16, 16, 19, 0.05) !important;
+}
+
+/* Every keyboard-reachable field gets the same focus ring: text-like
+   fields via :focus, composite widgets (select, multiselect, uploader)
+   via :focus-within on their wrapper. */
+div[data-testid="stTextInput"] input:focus,
+div[data-testid="stTextArea"] textarea:focus,
+div[data-testid="stNumberInput"] input:focus {
+    border-color: rgba(16, 16, 19, 0.3) !important;
+    box-shadow: 0 0 0 3px rgba(16, 16, 19, 0.08) !important;
+    outline: none !important;
+}
+
+div[data-testid="stSelectbox"]:focus-within > div > div,
+div[data-testid="stMultiSelect"]:focus-within > div > div {
+    border-color: rgba(16, 16, 19, 0.3) !important;
+    box-shadow: 0 0 0 3px rgba(16, 16, 19, 0.08) !important;
+    outline: none !important;
+}
+
+/* File dropzones keep Streamlit's native dashed affordance; only the
+   radius is aligned so uploads sit visually with the other fields. */
+div[data-testid="stFileUploader"] section {
+    border-radius: var(--vix-radius-md) !important;
+}
+
+/* Settings panels sit on white cards so the 4-column grid reads as tiles. */
+div[class*="st-key-main_settings_grid"] div[data-testid="stVerticalBlockBorderWrapper"] {
+    background: var(--vix-surface) !important;
+    border: 1px solid var(--vix-line) !important;
+    border-radius: var(--vix-radius-lg) !important;
+    box-shadow: var(--vix-shadow-sm) !important;
+}
+
+/* Segmented pills (tabs / aspect / voice mode) like the reference chips. */
+div[data-testid="stPills"] button {
+    background: var(--vix-field) !important;
+    color: var(--vix-ink) !important;
+    border: 1px solid var(--vix-line) !important;
+    box-shadow: var(--vix-shadow-sm) !important;
+}
+
+div[data-testid="stPills"] button[kind="primary"] {
+    background: #17171a !important;
+    border-color: #17171a !important;
+    color: #fff !important;
+}
+
+div[data-testid="stPills"] button[kind="primary"] p {
+    color: #fff !important;
+}
+
+/* Roadmap cards: visibly "not yet" — dashed, quiet, honest. */
+.mpt-bench-card {
+    background: color-mix(in srgb, var(--vix-surface) 72%, transparent) !important;
+    border: 1px dashed rgba(16, 16, 19, 0.28) !important;
+    border-radius: var(--vix-radius-lg) !important;
+    box-shadow: none !important;
+}
+
+.mpt-bench-badge {
+    background: #17171a !important;
+    color: #fff !important;
+    font-size: 0.6rem !important;
+}
+
+/* Library / video thumbs get the reference's large radii. */
+div[data-testid="stVideo"] video {
+    border-radius: 16px !important;
+}
+
+div[class*="st-key-plan_thumb_"] img,
+.mpt-thumb {
+    border-radius: 12px !important;
+}
+
+/* ── Thumbnail studio card ────────────────────────────────────────────
+   The panel used to render as a bare subheader + loose controls, which is
+   why finished videos never *looked* like they had thumbnails. It now sits
+   on the same white studio card as everything else; controls inside reuse
+   the global pill/button/field rules, so only the card shell, the title
+   and the preview treatment live here. */
+div[class*="st-key-thumbnail_panel_"] {
+    background: var(--vix-surface) !important;
+    border: 1px solid var(--vix-line) !important;
+    border-radius: var(--vix-radius-lg) !important;
+    box-shadow: var(--vix-shadow-sm) !important;
+    padding: 0.85rem 1rem 0.4rem !important;
+    margin: 0.9rem 0 1rem !important;
+}
+
+div[class*="st-key-thumbnail_panel_"] h3 {
+    font-size: 1rem !important;
+    font-weight: 750 !important;
+    letter-spacing: -0.01em !important;
+    color: var(--vix-ink) !important;
+    margin-bottom: 0.15rem !important;
+}
+
+div[class*="st-key-thumbnail_panel_"] img[data-testid="stImage"] {
+    border-radius: 12px !important;
+    border: 1px solid var(--vix-line) !important;
+    box-shadow: var(--vix-shadow-sm) !important;
+}
+
+/* Empty / notice captions read as a proper empty state instead of a
+   whisper under the button. */
+div[class*="st-key-thumbnail_panel_"] div[data-testid="stCaptionContainer"] {
+    border: 1px dashed color-mix(in srgb, currentColor 22%, transparent) !important;
+    border-radius: 10px !important;
+    padding: 0.55rem 0.75rem !important;
+    margin: 0.45rem 0 !important;
+}
+
+div[class*="st-key-thumbnail_panel_"] div[data-testid="stCaptionContainer"] p {
+    font-size: 0.8rem !important;
+    color: var(--vix-muted) !important;
+}
+
+/* ── Pipeline health strip: stack on phones ─────────────────────────
+   Three status columns side-by-side are fine on desktop; on a 390px phone
+   each column would be ~90px and the status words wrap into stairs. Same
+   wrap trick as the settings grid above. */
+@media (max-width: 700px) {
+    div[class*="st-key-pipeline_health"]
+        > div[data-testid="stLayoutWrapper"]
+        > div[data-testid="stHorizontalBlock"] {
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: stretch !important;
+    }
+
+    div[class*="st-key-pipeline_health"]
+        > div[data-testid="stLayoutWrapper"]
+        > div[data-testid="stHorizontalBlock"]
+        > div[data-testid="stColumn"] {
+        width: 100% !important;
+        min-width: 0 !important;
+    }
+}
+
+/* ── Dark mode: same hierarchy, inverted canvas ───────────────────────
+   Every hardcoded light value above now flows through a token, so this
+   block only re-points the tokens and lifts the few surfaces that would
+   otherwise vanish (dark primary button, active pills, badges). */
+@media (prefers-color-scheme: dark) {
+    :root {
+        --vix-bg-0: #131417;
+        --vix-bg-1: #1a1c20;
+        --vix-surface: #23252c;
+        --vix-field: #2b2e36;
+        --vix-ink: #f4f5f7;
+        --vix-muted: #aab0bc;
+        --vix-line: rgba(255, 255, 255, 0.12);
+        --vix-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45), 0 6px 18px rgba(0, 0, 0, 0.35);
+        --vix-shadow-md: 0 2px 8px rgba(0, 0, 0, 0.45), 0 22px 50px rgba(0, 0, 0, 0.45);
+        color-scheme: dark;
+    }
+
+    div[data-testid="stAppViewContainer"] {
+        background-image:
+            radial-gradient(circle, rgba(255, 255, 255, 0.09) 1px, transparent 1.1px),
+            radial-gradient(1100px 500px at 85% -5%, rgba(255, 255, 255, 0.06), transparent 60%),
+            linear-gradient(180deg, var(--vix-bg-1), var(--vix-bg-0));
+    }
+
+    section[data-testid="stSidebar"] strong,
+    section[data-testid="stMain"] h1,
+    section[data-testid="stMain"] h2 {
+        color: var(--vix-ink) !important;
+    }
+
+    /* Quiet nav rows need a light hover wash to register at all. */
+    div[class*="st-key-nav_item_"] button[kind="secondary"]:hover {
+        background: rgba(255, 255, 255, 0.06) !important;
+    }
+
+    /* Primary actions can't stay near-black on a near-black canvas:
+       lift the gradient and add a hairline so the pill edge survives. */
+    div[data-testid="stButtonPrimary"] > button,
+    div[data-testid="stLinkButton"] > a[kind="primary"],
+    div[class*="st-key-nav_new_video"] button {
+        background: linear-gradient(180deg, #5b5b64 0%, #333338 55%, #232327 100%) !important;
+        border: 1px solid rgba(255, 255, 255, 0.16) !important;
+        color: #fff !important;
+        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.22) !important;
+    }
+
+    /* Active pills invert: light pill, dark text — same contrast deal
+       as the dark pill on light canvas. */
+    div[data-testid="stPills"] button[kind="primary"] {
+        background: #f2f3f6 !important;
+        border-color: transparent !important;
+        color: #17171a !important;
+    }
+
+    div[data-testid="stPills"] button[kind="primary"] p {
+        color: #17171a !important;
+    }
+
+    /* Focus rings need to be light to be seen. */
+    div[data-testid="stTextInput"] input:focus,
+    div[data-testid="stTextArea"] textarea:focus,
+    div[data-testid="stNumberInput"] input:focus {
+        border-color: rgba(255, 255, 255, 0.38) !important;
+        box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.12) !important;
+    }
+
+    div[data-testid="stSelectbox"]:focus-within > div > div,
+    div[data-testid="stMultiSelect"]:focus-within > div > div {
+        border-color: rgba(255, 255, 255, 0.38) !important;
+        box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.12) !important;
+    }
+
+    /* Card visuals stay light like reference imagery, but deepened a step
+       so they don't glow against the dark grid. */
+    div[class*="st-key-bench_card_"] .mpt-bench-visual,
+    div[class*="st-key-bench_card_"] .mpt-bench-visual[data-card="script"],
+    div[class*="st-key-bench_card_"] .mpt-bench-visual[data-card="footage"],
+    div[class*="st-key-bench_card_"] .mpt-bench-visual[data-card="voice"],
+    div[class*="st-key-bench_card_"] .mpt-bench-visual[data-card="campaign"] {
+        background:
+            radial-gradient(120px 70px at 82% 18%, rgba(255, 255, 255, 0.75), transparent 70%),
+            radial-gradient(200px 120px at 12% 110%, rgba(255, 255, 255, 0.28), transparent 65%),
+            linear-gradient(135deg, #9aa1ad, #c3c8d2 60%, #8b929d);
+    }
+
+    div[class*="st-key-bench_card_"] .mpt-bench-visual__mark {
+        background: rgba(20, 20, 24, 0.85);
+        color: #f2f3f6;
+        border-color: rgba(255, 255, 255, 0.16);
+    }
+
+    /* Amber "needs setup" flag text must lighten; the dark ochre used on
+       light canvas fails contrast on the same amber chip in the dark. */
+    div[class*="st-key-bench_card_"] .mpt-bench-head[data-state="needs_setup"] .mpt-bench-flag {
+        color: #ffd9a0;
+    }
+
+    /* Roadmap "not yet" badge: light chip so it reads as a label,
+       not a hole punched in the card. */
+    .mpt-bench-badge {
+        background: rgba(255, 255, 255, 0.85) !important;
+        color: #23252c !important;
+    }
+
+    .mpt-bench-card {
+        border-color: rgba(255, 255, 255, 0.3) !important;
+    }
+
+    /* Dropdown option lists and popovers are drawn by Streamlit on its own
+       layer; make sure the task popover edge survives the dark canvas. */
+    div[data-testid="stPopoverBody"] {
+        border: 1px solid var(--vix-line);
     }
 }

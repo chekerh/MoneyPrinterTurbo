@@ -73,7 +73,7 @@ class _FakeRedis:
 
 class TestMemoryState(unittest.TestCase):
     def test_get_task_and_get_all_tasks_return_isolated_snapshots(self):
-        state = MemoryState()
+        state = MemoryState(persist=False)
         state.update_task(
             "task-1",
             state=const.TASK_STATE_PROCESSING,
@@ -91,7 +91,7 @@ class TestMemoryState(unittest.TestCase):
         self.assertEqual(state.get_task("task-1")["videos"], ["first.mp4"])
 
     def test_concurrent_memory_updates_are_preserved(self):
-        state = MemoryState()
+        state = MemoryState(persist=False)
         thread_count = 5
         tasks_per_thread = 50
 
@@ -119,7 +119,7 @@ class TestMemoryState(unittest.TestCase):
 
     def test_patch_task_preserves_generated_outputs(self):
         """异步发布更新不能覆盖已经完成的视频任务字段。"""
-        state = MemoryState()
+        state = MemoryState(persist=False)
         state.update_task(
             "task-1",
             state=const.TASK_STATE_COMPLETE,

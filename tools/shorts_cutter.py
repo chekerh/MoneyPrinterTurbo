@@ -15,7 +15,7 @@ import os
 import sys
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-sys.path.insert(0, os.path.join(BASE_DIR, "MoneyPrinterTurbo"))
+sys.path.insert(0, BASE_DIR)
 
 from app.services import shorts_cutter  # noqa: E402, PLC0415
 

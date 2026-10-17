@@ -21,3 +21,6 @@ pydub==0.25.1
 audioop-lts==0.2.2; python_version >= "3.13"
 litellm==1.86.2
 pillow==11.3.0
+google-auth-oauthlib==1.4.1
+google-api-python-client==2.200.0
+playwright==1.63.0

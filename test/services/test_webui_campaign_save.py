@@ -73,7 +73,7 @@ def _campaign_posts_list():
 
 
 @pytest.fixture
-def campaign_save_app(tmp_path, monkeypatch):
+def campaign_save_app(tmp_path, monkeypatch, switch_view):
     applications_dir = ROOT_DIR / "test" / "test_data" / "media_library_app"
     plans_root = applications_dir / "plans"
     outputs_root = applications_dir / "outputs"
@@ -91,6 +91,8 @@ def campaign_save_app(tmp_path, monkeypatch):
     with patch.object(config, "try_save_config", return_value=True):
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
         app.run()
+        # 活动面板现在是左侧导航里的 campaign 视图
+        switch_view(app, "campaign")
         assert not app.exception
 
     return app, saved_root

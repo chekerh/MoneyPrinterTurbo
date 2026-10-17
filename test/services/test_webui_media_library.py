@@ -77,7 +77,7 @@ def _video_names(plan_lines):
 
 
 @pytest.fixture
-def media_library_app(tmp_path, monkeypatch):
+def media_library_app(tmp_path, monkeypatch, switch_view):
     _seed_channel(
         tmp_path,
         "testch",
@@ -97,12 +97,30 @@ def media_library_app(tmp_path, monkeypatch):
     with patch.object(config, "try_save_config", return_value=True):
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
         app.run()
+        # 成片库现在是左侧导航里独立的一屏，跑之前先切过去
+        switch_view(app, "library")
         assert not app.exception
         return app
 
 
 def _metrics(app):
     return {m.label: m.value for m in app.metric}
+
+
+def test_library_keeps_saved_posting_copy_with_selected_video(media_library_app, tmp_path):
+    from app.services import posting_package
+
+    for video in (tmp_path / "outputs").rglob("*.mp4"):
+        package = posting_package.fallback("Saved ocean title", "Saved ocean description.", "testch", "task1")
+        package["comment"] = "Footage sources:\nhttps://example.com/ocean"
+        posting_package.save_for_video(video, package)
+    app = media_library_app.run()
+    assert not app.exception
+    copy = [block.value for block in app.code]
+    assert "Saved ocean title" in copy
+    assert "Saved ocean description." in copy
+    assert "Footage sources:\nhttps://example.com/ocean" in copy
+    assert any(button.label == "Download posting text" for button in app.get("download_button"))
 
 
 def test_media_library_renders_per_channel_metrics_and_table(media_library_app):
@@ -131,7 +149,7 @@ def test_media_library_renders_per_channel_metrics_and_table(media_library_app):
     assert not app.exception
 
 
-def test_media_library_caps_large_tables(tmp_path, monkeypatch):
+def test_media_library_caps_large_tables(tmp_path, monkeypatch, switch_view):
     # 260 个「过期月份」引用视频模拟海量归档：表格只展示最新 200 条并提示总数。
     channel = "testch"
     bulk = []
@@ -154,6 +172,7 @@ def test_media_library_caps_large_tables(tmp_path, monkeypatch):
     with patch.object(config, "try_save_config", return_value=True):
         app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=60)
         app.run()
+        switch_view(app, "library")
 
     caption = next(
         c for c in app.caption if "Showing newest" in c.value and "videos" in c.value

@@ -82,6 +82,12 @@ from app.services import (
 )
 from app.services import elevenlabs_music as elevenlabs_music_service
 from app.services import sonilo as sonilo_service
+from app.services import subtitle_preview as subtitle_preview_service
+from app.services import copyright_audit as copyright_audit_service
+from app.services import orbs
+from app.services import publish_jobs
+from app.services import posting_package, youtube_upload
+from app.services import video_poster as video_poster_service
 from app.services import state as sm
 from app.services import task as tm
 from app.services import version_checker
@@ -179,6 +185,9 @@ _VIDEO_PLAYER_MAX_WIDTH = 480
 _VIDEO_PLAYER_MIN_WIDTH = 200
 _VIDEO_PLAYER_FALLBACK_WIDTH = 240
 _VIDEO_DIMENSIONS_CACHE: dict = {}
+#: 尺寸缓存的条目上限。键里带字节数和 mtime，所以仍在写入的成片每次探测都产生
+#: 一条新记录；不设上限的话，跑得越久占用越大。
+_VIDEO_DIMENSIONS_CACHE_MAX_ENTRIES = 256
 _RUNTIME_CONFIG_SECTIONS = {
     "app": config.app,
     "azure": config.azure,
@@ -683,6 +692,13 @@ def _probe_video_dimensions(video_file: str):
         logger.debug(f"failed to probe video dimensions: {video_file}, {e}")
 
     _VIDEO_DIMENSIONS_CACHE[cache_key] = dimensions
+    # 缓存键含 (路径, 字节数, mtime_ns)，因此**正在写入的成片每被探测一次就会
+    # 留下一条新条目** —— 2 秒轮询 × 2 小时渲染 = 每部片子几千条，永不回收。
+    # 这里按插入顺序淘汰最旧的，超过上限即收缩。尺寸探测很便宜（一次 ffprobe，
+    # 已被上面的键去重），宁可偶尔重算也不能让内存随任务数无界增长。
+    while len(_VIDEO_DIMENSIONS_CACHE) > _VIDEO_DIMENSIONS_CACHE_MAX_ENTRIES:
+        oldest_key = next(iter(_VIDEO_DIMENSIONS_CACHE))
+        del _VIDEO_DIMENSIONS_CACHE[oldest_key]
     return dimensions
 
 
@@ -718,12 +734,84 @@ def _render_video_player(video_file: str):
     st.video(video_file, width=_video_player_width(video_file))
 
 
+# 定义刻意放在**第一个使用点之前**（_task_final_video_dir）。
+#
+# Streamlit 脚本是自上而下执行的，而被 @st.cache_resource 包住的函数在
+# "还没有 ScriptRunContext" 的裸执行模式（例如从别的进程 import 本模块、
+# 或某些缓存重放路径）下会在定义当轮就真正执行一遍函数体。原来它定义在文件
+# 中部，而 _task_final_video_dir 在它之前就被调用过，于是那条路径上拿到的
+# 是一个尚未定义的全局名：NameError: '_cached_project_layout' is not defined。
+# 把定义挪到使用点之前，这条脆弱的时序依赖就没有了。
+@st.cache_resource(show_spinner=False)
+def _cached_project_layout():
+    """解析应用根与作品集根。作品集根缺失时不抛，交给调用方按不可用处理。"""
+    try:
+        return resolve_project_layout()
+    except Exception as exc:  # noqa: BLE001 - 配置缺失是可预期状态
+        logger.warning(f"project layout unavailable, thumbnails disabled: {exc}")
+        return None
+
+
+def _task_final_video_dir(task_id: str) -> str:
+    """
+    某个任务最终成片的权威目录：``<outputs_root>/<task_id>``。
+
+    最终成片是**唯一长期留存的视频**，从 ``b2b52cc`` 起写在作品集的 ``outputs``
+    下，而不是任务工作目录 —— 后者默认位于内存盘，任务结束就消失了。任务目录
+    现在只留中间产物（``combined-1.mp4``、音频、字幕、脚本）。
+
+    布局解析不可用时返回空串，调用方据此退回"成片可能还在任务目录"的老位置。
+    """
+    layout = _cached_project_layout()
+    if layout is None:
+        return ""
+    return str(layout.outputs_root / str(task_id))
+
+
+def _task_final_video_dirs(task_path: str) -> list[str]:
+    """
+    该任务的成片可能出现的位置，按权威性从高到低排列。
+
+    先作品集里的成片目录（当前写入位置），再任务目录（``b2b52cc`` 之前的老任务
+    仍可能把成片留在那里）。两处都不存在时调用方自然拿不到成片。
+    """
+    task_id = os.path.basename(os.path.normpath(task_path))
+    candidates = []
+    output_dir = _task_final_video_dir(task_id)
+    if output_dir:
+        candidates.append(output_dir)
+    if task_path not in candidates:
+        candidates.append(task_path)
+    return candidates
+
+
+def _is_allowed_task_video(candidate: str) -> bool:
+    """
+    成片是否位于允许读取/打开的根之内。
+
+    打开与预览按钮的路径来自目录扫描或运行期状态，仍然必须限制在受控目录内，
+    避免一次 UI 操作被异常路径扩展成任意本地文件读取能力。允许两个根：作品集
+    里的成片目录（成片的实际位置）和任务目录（老任务）。两个根都由布局或应用
+    自身的目录函数给出，不是用户可控的输入。
+    """
+    roots = []
+    layout = _cached_project_layout()
+    if layout is not None:
+        roots.append(str(layout.outputs_root))
+    roots.append(utils.task_dir())
+    return any(_is_within_root(candidate, root) for root in roots)
+
+
 def _find_final_task_video(task_path: str) -> str:
     """
-    返回任务目录中序号最小的、且已确认写入完成的最终成片。
+    返回该任务序号最小的、且已确认写入完成的最终成片。
 
     合成流程还会产生 combined、temp-clip 和 MoviePy 临时文件，这些文件不能
     表示任务已成功完成，因此这里只接受 ``final-<序号>.<扩展名>``。
+
+    搜索范围覆盖成片的两个可能位置：作品集里的 ``outputs/<task_id>/``（当前
+    写入位置）和任务目录（老任务）。只搜任务目录会让归档整条链路静默失效 ——
+    任务面板却仍然显示"已完成"，因为那一列读的是运行期状态而不是这里的返回值。
 
     仅凭文件名判断会让「刚开始写入」的成片立刻被当成完成态：ffmpeg 先创建
     目标文件，2 秒轮询的任务面板就会看到它，随后归档把半截文件复制进媒体库。
@@ -731,25 +819,27 @@ def _find_final_task_video(task_path: str) -> str:
     变化。代价是每个候选文件多一次 stat 与一次 ffprobe（结果有缓存），收益是
     归档链路不会再产出损坏成片。
     """
-    try:
-        files = os.listdir(task_path)
-    except OSError:
-        return ""
+    for search_dir in _task_final_video_dirs(task_path):
+        try:
+            files = os.listdir(search_dir)
+        except OSError:
+            continue
 
-    candidates = []
-    for file_name in files:
-        match = _FINAL_VIDEO_PATTERN.fullmatch(file_name)
-        if match:
-            candidates.append((int(match.group("index")), file_name))
+        candidates = []
+        for file_name in files:
+            match = _FINAL_VIDEO_PATTERN.fullmatch(file_name)
+            if match:
+                candidates.append((int(match.group("index")), file_name))
 
-    if not candidates:
-        return ""
+        if not candidates:
+            continue
 
-    _, file_name = min(candidates, key=lambda item: item[0])
-    video_file = os.path.join(task_path, file_name)
-    if not _is_settled_video_file(video_file):
-        return ""
-    return video_file
+        _, file_name = min(candidates, key=lambda item: item[0])
+        video_file = os.path.join(search_dir, file_name)
+        if _is_settled_video_file(video_file):
+            return video_file
+
+    return ""
 
 
 def _is_settled_video_file(video_file: str) -> bool:
@@ -1027,7 +1117,14 @@ def _collect_task_summaries(limit=20):
         }
 
     tasks = list(history_tasks.values())
-    return sorted(tasks, key=lambda item: item["mtime"], reverse=True)[:limit]
+    ordered = sorted(tasks, key=lambda item: item["mtime"], reverse=True)
+    # 同时把**未截断的总数**带出去。只回传列表的话，调用方无从知道磁盘上到底
+    # 有多少个任务，于是"显示 12 / 共 20"里的 20 其实是 limit 截断后的长度——
+    # 磁盘上有 200 个任务时界面会说"共 20 个"，仍然在骗人。
+    _TASK_SUMMARY_TOTAL = "task_summary_total"
+    for summary in ordered:
+        summary[_TASK_SUMMARY_TOTAL] = len(ordered)
+    return ordered[:limit]
 
 
 def _is_headless_server():
@@ -1162,6 +1259,7 @@ def _open_archive_folder_for_task(task_path):
     )
 
 
+@st.cache_data(show_spinner=False, max_entries=256)
 def _resolve_task_archive_dir(task_path: str) -> str:
     """由任务目录反查它归档到的频道视频目录；未归档或已丢失时返回空串。
 
@@ -1169,6 +1267,15 @@ def _resolve_task_archive_dir(task_path: str) -> str:
     包含计划序号、归档日期和主题 slug。这里不重新推导文件名，而是直接在归档
     根目录里查找与任务 ``task_id`` 关联的 ``.txt`` 边车文件——边车里就有
     ``task_id``，因此这是唯一不需要猜测的关联方式。
+
+    结果按 ``task_path`` 记忆化。任务面板每 2 秒刷新一次，一行一次调用，于是
+    每个任务每分钟触发 30 次 ``os.walk`` + 整棵频道树里所有 ``.txt`` 边车的读取
+    ——12 行就是每分钟 360 次遍历、上千次文件读，而结果只在"某个视频被归档"时
+    才变。缓存把它压到每任务每次会话一次。
+
+    缓存会在归档新成片后失效：归档路径只写 ``.plan_archived``，不碰这里的键，
+    所以 ``_auto_archive_plan_tasks`` 成功后必须显式清理，否则用户刚看到归档
+    结果，"打开归档目录"仍然会灰着。
     """
     meta_path = os.path.join(task_path, "plan_meta.json")
     channel = ""
@@ -1207,12 +1314,12 @@ def _resolve_task_archive_dir(task_path: str) -> str:
 
 
 def _open_task_video(video_file):
-    tasks_root = utils.task_dir()
     normalized_file = os.path.realpath(video_file)
 
-    # 视频路径来自任务目录扫描或运行期状态。这里仍然限制只能打开任务目录
-    # 内的文件，避免 UI 操作被异常路径扩展成任意本地文件打开能力。
-    if not _is_within_root(normalized_file, tasks_root):
+    # 视频路径来自任务目录扫描或运行期状态。这里仍然限制只能打开受控根内的
+    # 文件（作品集的成片目录与任务目录），避免 UI 操作被异常路径扩展成任意
+    # 本地文件打开能力。
+    if not _is_allowed_task_video(normalized_file):
         logger.warning(f"invalid task video path: {normalized_file}")
         return
     if not os.path.isfile(normalized_file):
@@ -1268,11 +1375,51 @@ def _delete_task(task_id, task_path, task_state=None):
             sm.state.delete_task(task_id)
         if os.path.isdir(normalized_path):
             shutil.rmtree(normalized_path)
-        logger.info(f"deleted task: {task_id}")
+        video_removed, video_note = _delete_task_output_video(task_id)
+        logger.info(f"deleted task: {task_id}, removed_output_video={video_removed}")
+        st.session_state["task_delete_video_note"] = video_note
         return True
     except Exception as e:
         logger.exception(f"failed to delete task: {task_id}, {e}")
         return False
+
+
+def _delete_task_output_video(task_id: str) -> tuple[bool, str]:
+    """
+    删除任务时一并清理作品集里的成片目录 ``outputs/<task_id>/``。
+
+    不清理的话，每次删除任务都会在 SSD 上留下 28–93 MB 的孤儿：任务目录没了，
+    而 ``_scan_history_tasks`` 只扫任务目录、``list_channel_videos`` 只扫名为
+    ``videos`` 的目录，于是这个文件从**每一个**界面都再也够不着。
+
+    但**未归档的成片不能删**：成片是唯一长期留存的视频，一次渲染要两个多小时。
+    只有当自动归档已经把一份副本放进频道媒体库时，原始副本才可以一起清掉；
+    否则保留，并把这件事告诉用户，由他们决定。``.plan_skipped`` 标记代表这个
+    任务被主动丢弃（主题在别处已录制），那种情况下同样有一份媒体库副本。
+
+    返回 ``(是否已删除, 给用户看的说明)``。
+    """
+    layout = _cached_project_layout()
+    if layout is None:
+        return False, tr("Task Delete Kept Video No Layout")
+
+    video_dir = layout.outputs_root / str(task_id)
+    if not video_dir.is_dir():
+        return False, ""
+
+    task_path = os.path.join(utils.task_dir(), str(task_id))
+    has_library_copy = any(
+        os.path.isfile(os.path.join(task_path, marker))
+        for marker in (".plan_archived", ".plan_skipped")
+    )
+    if not has_library_copy:
+        # 唯一的副本还在这里，删掉就等于丢掉两个多小时的渲染结果。
+        return False, tr("Task Delete Kept Video Unarchived").format(
+            path=str(video_dir)
+        )
+
+    shutil.rmtree(video_dir, ignore_errors=True)
+    return True, tr("Task Delete Removed Video")
 
 
 def _count_processing_tasks(tasks):
@@ -1353,6 +1500,51 @@ def _task_manager_label(processing_count):
     return f"{label} · {processing_count}"
 
 
+def _artifact_base_url() -> str:
+    """产物类端点（/download、/tasks）所在的服务器地址。
+
+    部署形态是**两个进程**：``python main.py`` 起 uvicorn，挂载 API、``/download``
+    与 ``/tasks``，并在 ``/`` 上提供上游静态落地页；而 WebUI 是单独用
+    ``streamlit run webui/Main.py`` 起的另一个端口。``app/asgi.py`` 从头到尾**没有**
+    把 Streamlit 挂进去。
+
+    因此 WebUI 里的相对链接 ``/download?...`` 打在 WebUI 自己的端口上，命中的是
+    Streamlit 的 HTML 兜底页：状态码 200、内容是整份 index.html。点"下载成片"
+    存下来的是一个网页，而不是视频——而且它看起来是成功的。
+    """
+    from app.utils.access_policy import resolve_bind_host
+
+    try:
+        host = resolve_bind_host(
+            config.listen_host,
+            allow_non_loopback=bool(
+                getattr(config, "allow_non_loopback_bind", False)
+            ),
+        )
+    except Exception:  # noqa: BLE001 - 拿不到就退回回环地址
+        host = "127.0.0.1"
+    if host in ("0.0.0.0", "::", ""):  # noqa: S104 - 通配地址不能写进 URL
+        host = "127.0.0.1"
+    return f"http://{host}:{config.listen_port}"
+
+
+def _generated_video_download_url(video_path: str, file_name: str | None = None) -> str:
+    """成片的流式下载链接。
+
+    ``path`` 来自浏览器端，属于不可信输入，因此这里只做百分号编码；真正的路径校验
+    在 /download 端点里（必须是允许根目录下的真实文件）。``file_name`` 只是给
+    浏览器一个建议文件名，同样不参与定位。
+    """
+    from urllib.parse import quote
+
+    url = f"{_artifact_base_url()}/download?path={quote(video_path)}"
+    if file_name:
+        # st.link_button 没有 file_name 参数（传了会直接 TypeError），所以建议文件名
+        # 只能走 URL 交给端点，由它交给 FileResponse 当作 Content-Disposition。
+        url = f"{url}&file_name={quote(file_name)}"
+    return url
+
+
 def _build_video_download_name(subject, index, total):
     """根据视频主题生成跨平台安全的下载文件名。"""
     safe_subject = _DOWNLOAD_FILENAME_INVALID_PATTERN.sub(" ", str(subject or ""))
@@ -1375,6 +1567,12 @@ def _build_video_download_name(subject, index, total):
 # 主题文字下方；这里把宽度让给操作列后两者各自独立成列。
 _TASK_TABLE_COLUMNS = [0.6, 0.85, 1.0, 1.3, 2.0, 0.75, 2.7]
 
+# 单次渲染的最大行数。12 行是刻意压低的：每行会触发 _resolve_task_archive_dir 的
+# 目录遍历，而这个面板每 2 秒刷新一次（见 _render_task_manager_entry）。上限必须
+# 是个具名常量而不是裸数字 —— 它现在同时被"显示多少行"和"告知用户藏了多少行"
+# 两处引用，裸数字迟早会只改一处。
+_TASK_TABLE_ROW_LIMIT = 12
+
 
 def _render_task_table(filtered_tasks, key_prefix):
     with st.container(key=f"task_table_header_{key_prefix}"):
@@ -1391,7 +1589,25 @@ def _render_task_table(filtered_tasks, key_prefix):
         st.info(tr("No Tasks Match Filter"))
         return
 
-    visible_tasks = filtered_tasks[:12]
+    visible_tasks = filtered_tasks[:_TASK_TABLE_ROW_LIMIT]
+    # 表格只渲染前 12 行，但必须说清楚被藏了多少行。不说的话，筛出 40 个任务时
+    # 界面只显示 12 个且毫无提示，看起来就像"只有 12 个任务"——用户会以为剩下的
+    # 任务丢了，或者以为筛选没生效。
+    #
+    # total 取自未截断的总数，而不是 len(filtered_tasks)：后者已经被
+    # _collect_task_summaries 的 limit 截断过，直接用会得到"共 20 个"这种
+    # 仍然是假话的提示。筛选态下没有对应的全量计数，此时如实退回到筛选后的长度。
+    total = max(
+        (int(task.get("task_summary_total") or 0) for task in filtered_tasks),
+        default=0,
+    )
+    hidden_total = total if total >= len(filtered_tasks) else len(filtered_tasks)
+    if hidden_total > len(visible_tasks):
+        st.caption(
+            tr("Showing Newest Of Tasks").format(
+                shown=len(visible_tasks), total=hidden_total
+            )
+        )
     list_height = min(390, max(96, len(visible_tasks) * 58))
     with st.container(height=list_height, border=False):
         for idx, task in enumerate(visible_tasks):
@@ -1426,7 +1642,20 @@ def _render_task_table(filtered_tasks, key_prefix):
                 else:
                     row_cols[1].write("—")
                 
-                row_cols[2].write(_task_state_label(task["state"], has_video))
+                # 正在跑的任务给一个动效，而不是又一行"处理中"文字。
+                #
+                # 状态列已经有文字说明了，动效在这里承担的是另一件事：**指示这一行还
+                # 活着**。任务面板每两秒刷新一次，纯文字的"处理中"看上去和"卡住了"
+                # 一模一样；一个在动的东西才说明还在推进。
+                if _task_state_filter_key(task) == "processing":
+                    state_cols = st.columns([1, 5], vertical_alignment="center")
+                    with state_cols[0]:
+                        orbs.orb("generate", size=20, label=tr("Task Status Processing"))
+                    state_cols[1].write(
+                        _task_state_label(task["state"], has_video)
+                    )
+                else:
+                    row_cols[2].write(_task_state_label(task["state"], has_video))
                 row_cols[3].write(_format_task_time(task["mtime"]))
                 # 主题渲染成带 title 的单行文本：CSS 负责省略号截断，保证每行
                 # 高度一致（多行主题会让整行的垂直居中失效），完整主题通过
@@ -1515,19 +1744,62 @@ def _render_task_table(filtered_tasks, key_prefix):
                         if is_busy
                         else delete_label
                     )
-                    if st.button(
+                    # 删除任务会 shutil.rmtree 整个任务目录，且没有回收站、没有撤销。
+                    # 直接放在行内按钮上一次点击就生效，误点无法挽回，所以在真正
+                    # rmtree 之前加一道确认：用 st.popover 把"确认/取消"收在同一
+                    # 个按钮里，不占用表格额外的一行，也不像 nonce 复选框那样需要
+                    # 多一次 rerun 才能看到状态。任务在生成中时整段都不渲染。
+                    with st.popover(
                         delete_label,
-                        key=f"delete_task_{key_prefix}_{task_id}",
-                        width='stretch',
-                        icon=":material/delete:",
+                        width="stretch",
+                        key=f"delete_task_popover_{key_prefix}_{safe_task_key}",
                         help=delete_help,
                         disabled=is_busy,
                     ):
-                        if _delete_task(task_id, task["task_path"], task["state"]):
-                            st.toast(tr("Task Deleted"))
+                        # 这里曾经尝试过"关闭时不渲染确认区"来省掉每 2 秒 60 个
+                        # 控件的重建，结论是**这条路走不通**，留在注释里免得再试一次：
+                        #   1. 内容完全为空时，Streamlit 会把这个 popover 直接禁用，
+                        #      按钮变灰、删除功能整个消失；
+                        #   2. 换成一个 st.empty() 占位，按钮恢复正常，但真实打开时
+                        #      弹层里只剩一块空白——popover 的展开状态并不会写进
+                        #      session_state[popover_key]，那道闸门在真实浏览器里
+                        #      永远读到 False。AppTest 里能通过是因为测试自己把那个
+                        #      键设成了 True，与真实交互不是一回事。
+                        st.caption(
+                            tr("Confirm Delete Task Caption").format(
+                                subject=task["subject"] or task_id
+                            )
+                        )
+                        confirm_cols = st.columns(2)
+                        if confirm_cols[0].button(
+                            tr("Confirm Delete"),
+                            key=f"delete_task_confirm_{key_prefix}_{safe_task_key}",
+                            width="stretch",
+                            type="primary",
+                            icon=":material/delete:",
+                        ):
+                            if _delete_task(task_id, task["task_path"], task["state"]):
+                                video_note = st.session_state.pop(
+                                    "task_delete_video_note", ""
+                                )
+                                st.toast(tr("Task Deleted"))
+                                if video_note:
+                                    # 未归档的成片被保留，或布局不可用导致没能清理。
+                                    # 不说出来的话，用户以为磁盘已经干净了。
+                                    st.warning(video_note)
+                                st.rerun()
+                            else:
+                                st.error(tr("Task Delete Failed"))
+                        if confirm_cols[1].button(
+                            tr("Cancel"),
+                            key=f"delete_task_cancel_{key_prefix}_{safe_task_key}",
+                            width="stretch",
+                        ):
+                            # popover 内容只在打开时渲染，点"取消"本身不需要任何
+                            # 状态：Streamlit 会在这次 rerun 后把 popover 关掉。
+# 整页 rerun：这些函数都不是 @st.fragment，scope="fragment" 在这里必定抛
+                            # StreamlitAPIException（点"发布""刷新缓存统计"都会炸）。
                             st.rerun()
-                        else:
-                            st.error(tr("Task Delete Failed"))
 
 
 def _render_task_manager_panel(tasks=None):
@@ -1569,7 +1841,7 @@ def _render_task_video_preview():
     if not preview_file:
         return
 
-    if not _is_within_root(preview_file, utils.task_dir()) or not os.path.isfile(
+    if not _is_allowed_task_video(preview_file) or not os.path.isfile(
         preview_file
     ):
         st.session_state.pop("task_preview_video_file", None)
@@ -1590,6 +1862,15 @@ def _render_task_video_preview():
         st.session_state.pop("task_preview_video_file", None)
         return
     _render_video_player(preview_file)
+
+    # 预览的不一定是任务成片，也可能是媒体库归档到频道目录的文件。缩略图面板
+    # 只认任务：父目录名不是任务 ID 时安静跳过，避免给频道文件建出无意义的
+    # 缩略图目录。任务 ID 恒为服务端生成的 UUID，这里只做格式校验。
+    try:
+        preview_task_id = str(UUID(task_name))
+    except (ValueError, AttributeError, TypeError):
+        return
+    _render_thumbnail_section(preview_task_id, surface="preview")
 
 
 def _plan_topic_recorded(channel, topic) -> bool:
@@ -1614,7 +1895,21 @@ def _auto_archive_plan_tasks() -> bool:
         if not task["video_file"]:
             continue
         task_path = task["task_path"]
-        if os.path.isfile(os.path.join(task_path, ".plan_archived")):
+        task_id = task["task_id"]
+        # An upload still owns the original file until its worker finishes.
+        try:
+            runtime_task = sm.state.get_task(task_id)
+        except Exception as exc:
+            logger.warning(f"defer archiving while task status is unavailable: {task_id}: {exc}")
+            continue
+        if tm.is_task_busy(runtime_task):
+            continue
+        # .plan_archived = 已归档；.plan_skipped = 主题在别处已录制，主动丢弃。
+        # 两者都表示"这个任务不再需要处理"，没有标记就会每 2 秒重扫一次。
+        if any(
+            os.path.isfile(os.path.join(task_path, marker))
+            for marker in (".plan_archived", ".plan_skipped")
+        ):
             continue
         meta_path = os.path.join(task_path, "plan_meta.json")
         if not os.path.isfile(meta_path):
@@ -1633,6 +1928,38 @@ def _auto_archive_plan_tasks() -> bool:
         if not channel or not topic:
             continue
         if _plan_topic_recorded(channel, topic):
+            # 主题在任意月份的月度计划里已标记为录制，于是**静默**丢弃这个任务的
+            # 成片：既不写标记（于是每 2 秒重扫一次，永远重试），也不记日志，
+            # 界面上什么提示都没有。用户刚花两个多小时渲出来的成片就此蒸发，
+            # 而唯一线索是它没出现在媒体库里。
+            #
+            # 常见成因是跨月：新的月度计划所有行都是 pending，
+            # first_pending_topic 于是重新给出 #1，而 #1 上个月已经做过。
+            # 所以这里必须留痕，并且写一个"已跳过"标记，让重扫收敛到一次。
+            logger.info(
+                f"skipped archiving already-recorded plan topic: "
+                f"task_id={task_id}, channel={channel}, topic={topic}"
+            )
+            try:
+                with open(
+                    os.path.join(task_path, ".plan_skipped"),
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    json.dump(
+                        {
+                            "task_id": task_id,
+                            "channel": channel,
+                            "topic": topic,
+                            "reason": "already-recorded",
+                        },
+                        handle,
+                        ensure_ascii=False,
+                    )
+            except OSError as exc:
+                logger.warning(
+                    f"failed to write plan skip marker: task_id={task_id}, error={exc}"
+                )
             continue
         try:
             base = archive_video.archive_channel_video(
@@ -1642,6 +1969,10 @@ def _auto_archive_plan_tasks() -> bool:
                 out_dir=plans.current_plan_dir(channel),
                 plans_root=plans.PLANS_DIR,
                 copy_media=True,
+                # 用 video_file 实际所在的目录，而不是"成片应该在哪"的那个目录。
+                # 两个解析器对同一个任务给出不同答案时（成片搬迁前留下的老任务
+                # 仍在任务目录里），按规范目录去取会报"成片缺失"并无限期重试。
+                final_video_dir=os.path.dirname(task["video_file"]),
             )
         except archive_video.ArchiveError as exc:
             # 归档失败（成片缺失、无法解析、复制不完整）时不写 .plan_archived，
@@ -1671,30 +2002,86 @@ def _auto_archive_plan_tasks() -> bool:
             logger.warning(
                 f"failed to write plan archive marker: task_id={task['task_id']}, error={exc}"
             )
+        # 归档目录解析是记忆化的，而它只写 .plan_archived、不碰缓存键。不清掉的话
+        # 这一行"打开归档目录"会一直灰着，直到会话结束——用户刚看到成片进了媒体库，
+        # 按钮却还是不能点。
+        _resolve_task_archive_dir.clear()
         archived = True
     return archived
 
 
 @st.fragment(run_every="2s")
 def _render_task_manager_entry():
-    # 任务可能由当前页面或其它页面触发生成。入口单独用 fragment 定时刷新，
-    # 只更新任务数量和 popover 内容，不打断主页面表单输入。
+    """顶栏的任务管理器入口：只负责开关与计数，真正的表由主区域承载。
+
+    之前任务表整个塞在 ``st.popover`` 里，于是每两秒重建一次——12 行任务 × 每行五个
+    操作控件，加上状态页签，上百个控件一秒重建 30 遍，而绝大多数轮次用户根本没在看。
+
+    试过"弹层关闭时不渲染弹层内容"，**走不通**，两个坑都踩过：
+    内容为空时 Streamlit 会直接把这个 popover 禁用（任务管理器和每一行的删除按钮
+    同时变灰，删除功能整个消失）；换成 ``st.empty()`` 占位后按钮恢复了，但
+    popover 的展开状态不写进 ``session_state``，那道闸门在真实浏览器里永远读到
+    False——AppTest 里能过是因为测试自己把键设成了 True，与真实交互不是一回事。
+
+    所以不再跟 popover 的内部状态较劲：改用自己控制的开关，并把表放到主区域。
+    这同时解决了一个体验问题——十几行带按钮的表格塞在弹层里本来就要滚动、会被
+    裁切、点外面就关掉，在主区域展开反而更顺手。
+    """
     if _auto_archive_plan_tasks():
         # 归档会新增媒体库条目并推进月度计划，触发一次整页刷新让各面板
         # 立即反映归档结果；未被归档的主题在后续轮询中会跳过，不会反复刷新。
         st.rerun(scope="app")
+
     task_summaries = _collect_task_summaries()
     processing_task_count = _count_processing_tasks(task_summaries)
+    is_open = bool(st.session_state.get("task_manager_open", False))
     with st.container(key="task_manager_entry", width="content"):
-        with st.popover(
+        if st.button(
             _task_manager_label(processing_task_count),
-            width="content",
-            key=(
-                "task_manager_popover_"
-                f"{st.session_state.get('task_manager_popover_nonce', 0)}"
+            key="task_manager_toggle",
+            type="primary" if is_open else "secondary",
+            icon=(
+                ":material/expand_less:" if is_open else ":material/expand_more:"
             ),
+            width="content",
         ):
-            _render_task_manager_panel(task_summaries)
+            st.session_state["task_manager_open"] = not is_open
+            st.rerun()
+
+
+def _render_task_manager_section():
+    """主区域里的任务表。只在用户展开时渲染。"""
+    if not st.session_state.get("task_manager_open", False):
+        return
+    task_summaries = _collect_task_summaries()
+    if not task_summaries:
+        st.caption(tr("No Tasks Yet"))
+        return
+    running = [t for t in task_summaries if _task_state_filter_key(t) == "processing"]
+    with st.container(key="task_manager_section", border=True):
+        heading, close_col = st.columns([6, 1], vertical_alignment="center")
+        if running:
+            # 有任务在跑时，标题旁放一个动效。
+            #
+            # 任务表每两秒刷新一次，纯文字的"处理中"和"卡住了"在界面上长得一模一样。
+            # 一个在动的东西才说明它还活着——而这正是用户盯着这一屏时唯一想知道的事。
+            head_left, title_col = st.columns([1, 8], vertical_alignment="center")
+            with head_left:
+                orbs.orb("generate", size=20, label=tr("Task Status Processing"))
+            with title_col:
+                st.markdown(f"**{tr('Task Manager')}**")
+        else:
+            heading.markdown(f"**{tr('Task Manager')}**")
+        with close_col:
+            if st.button(
+                tr("Close"),
+                key="task_manager_close",
+                icon=":material/close:",
+                width="stretch",
+            ):
+                st.session_state["task_manager_open"] = False
+                st.rerun()
+        _render_task_manager_panel(task_summaries)
 
 
 def _load_task_restore_payload(task_id):
@@ -1979,6 +2366,28 @@ def _render_pending_version_check():
     _render_brand()
 
 
+def _nav_title_and_hint(view):
+    """当前视图在左侧导航里登记的标题与说明键。"""
+    for _group_title, _items in _NAV_GROUPS:
+        for _key, _title, _icon, _hint in _items:
+            if _key == view:
+                return _title, _hint
+    return "Nav Generate", "Nav Generate Hint"
+
+
+def _render_top_bar_context():
+    """顶部栏里的当前页面名 + 一句说明，对应参考设计的工具标题行。"""
+    view = st.session_state.get("nav_view", _DEFAULT_VIEW)
+    title_key, hint_key = _nav_title_and_hint(view)
+    st.markdown(
+        f'<div class="mpt-top-context">'
+        f'<p class="mpt-top-context__title">{html.escape(tr(title_key))}</p>'
+        f'<p class="mpt-top-context__sub">{html.escape(tr(hint_key))}</p>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _render_top_bar():
     """渲染品牌、任务管理、设置和语言切换组成的页面顶部栏。"""
     # 顶部栏分为品牌区和操作区两个独立区域。窄屏下由 Streamlit
@@ -1996,6 +2405,7 @@ def _render_top_bar():
             _render_brand(update_snapshot.available_version)
         else:
             _render_pending_version_check()
+        _render_top_bar_context()
 
     with actions_col:
         with st.container(
@@ -2008,6 +2418,23 @@ def _render_top_bar():
         ):
             _render_task_manager_entry()
 
+            # 重播引导。默认只播一次，而它教的仅是手动生成那条路径——计划流、
+            # 媒体库、发布这些每天真正在用的操作一次都没覆盖，用户需要能再看一遍。
+            # 换 tour key 就是换一条 localStorage 记录，组件会重新播。
+            if st.button(
+                tr("Replay Onboarding Tour"),
+                key="replay_onboarding_tour_button",
+                type="secondary",
+                icon=":material/help:",
+                width="content",
+                help=tr("Replay Onboarding Tour Help"),
+            ):
+                st.session_state["onboarding_tour_replay_nonce"] = (
+                    st.session_state.get("onboarding_tour_replay_nonce", 0) + 1
+                )
+                st.session_state[f"{ONBOARDING_TOUR_KEY}-auto-started"] = False
+                st.rerun()
+
             if st.button(
                 tr("Settings"),
                 key="open_settings_dialog_button",
@@ -2015,7 +2442,11 @@ def _render_top_bar():
                 icon=":material/settings:",
                 width="content",
             ):
-                st.session_state["settings_dialog_open"] = True
+                # 设置现在是左侧导航里的一屏，不再是一层弹窗。这个按钮保留下来有两个
+                # 作用：它是新手引导第一步指向的目标，也是已经在生成页的用户最快的
+                # 入口——不用先找到侧栏。
+                st.session_state[_NAV_REQUEST_KEY] = "settings"
+                st.rerun()
 
             language_codes = list(locales.keys())
             selected_index = 0
@@ -2185,9 +2616,15 @@ def render_onboarding_tour():
         else:
             step.popover["nextBtnText"] = f"{next_text} &rarr;"
 
+    # 引导默认只播一次，完成状态由组件写进浏览器 localStorage。但"只播一次"
+    # 意味着用户看完一遍之后再也无法复习，而它教的又只是手动生成那条路径
+    # —— 真正每天在用的计划流、媒体库、发布一次都没讲。这里给一个重播入口：
+    # 换一个新的 tour key 即可。streamlit-tour 用 key 索引 localStorage，
+    # 新 key 就是一条全新的完成状态，不需要从 Python 侧清理浏览器存储。
+    replay_nonce = st.session_state.get("onboarding_tour_replay_nonce", 0)
     tour = Tour(
         steps=steps,
-        key=ONBOARDING_TOUR_KEY,
+        key=f"{ONBOARDING_TOUR_KEY}-{replay_nonce}",
         show_progress=True,
         animate=True,
         overlay_opacity=0.55,
@@ -2196,20 +2633,11 @@ def render_onboarding_tour():
 
     # 每个 Streamlit 会话只主动启动一次。是否已经完成则由组件通过浏览器
     # localStorage 判断，避免页面 rerun 或普通控件交互反复弹出引导。
+    # nonce 参与 key 后，重播需要把 auto-start 标志也一起清掉。
     auto_start_key = f"{ONBOARDING_TOUR_KEY}-auto-started"
     if not st.session_state.get(auto_start_key, False):
         st.session_state[auto_start_key] = True
         tour.start()
-
-
-@st.cache_resource(show_spinner=False)
-def _cached_project_layout():
-    """解析应用根与作品集根。作品集根缺失时不抛，交给调用方按不可用处理。"""
-    try:
-        return resolve_project_layout()
-    except Exception as exc:  # noqa: BLE001 - 配置缺失是可预期状态
-        logger.warning(f"project layout unavailable, thumbnails disabled: {exc}")
-        return None
 
 
 @st.fragment(run_every="500ms")
@@ -2254,12 +2682,15 @@ def _thumbnail_unavailable_notice(reason: object) -> None:
         )
 
 
-def _render_thumbnail_section(task_id: str):
+def _render_thumbnail_section(task_id: str, surface: str = "snapshot"):
     """
     在已完成结果下方渲染缩略图面板。
 
     任何失败都只影响这一段：缩略图是附加能力，不能让它把整个结果页打不开。
     读不到描述符时说明这个任务还没有成片身份记录，直接安静地不渲染。
+
+    :param surface: 同一任务可能同时出现在结果快照与任务预览里，控件键必须按
+        展示位置隔离，否则 Streamlit 会报重复控件 ID 而整页崩掉。
     """
     try:
         layout = _cached_project_layout()
@@ -2297,13 +2728,19 @@ def _render_thumbnail_section(task_id: str):
         logger.debug(f"thumbnail job watch failed: task_id={task_id}, error={exc}")
 
     try:
-        render_thumbnail_panel(
-            descriptor=descriptor,
-            manifest_path=layout.thumbnail_root / task_id / "manifest.json",
-            thumbnail_root=layout.thumbnail_root / task_id,
-            source_root=layout.storage_root / "tasks" / task_id,
-            tr=tr,
-        )
+        with st.container(key=f"thumbnail_panel_{surface}_{task_id}"):
+            render_thumbnail_panel(
+                descriptor=descriptor,
+                manifest_path=layout.thumbnail_root / task_id / "manifest.json",
+                thumbnail_root=layout.thumbnail_root / task_id,
+                # 成片目录是 layout.outputs_root/<task_id>，不是 storage/tasks/<task_id>。
+                # 最终成片是唯一长期留存的视频，b2b52cc 起就写在那里；任务目录只剩
+                # 中间产物（可能还在内存盘上）。传错目录会让每个缩略图作业都找不到
+                # 源文件而失败，而失败态此前什么都不渲染，用户只看到"点了没反应"。
+                source_root=layout.outputs_root / task_id,
+                tr=tr,
+                key_prefix=f"{surface}_{task_id}_",
+            )
     except Exception as exc:  # noqa: BLE001 - 同上，附加功能不应影响主流程
         logger.warning(
             f"failed to render thumbnail panel: task_id={task_id}, error={exc}"
@@ -2354,6 +2791,15 @@ def _render_generation_task_snapshot(task_id, task):
         return
 
     st.success(tr("Video Generation Completed"))
+    posting_state = task.get("cross_post_state")
+    if posting_state == const.CROSS_POST_STATE_FAILED:
+        st.warning(f"{tr('Video Publish Failed')}: {task.get('cross_post_error') or ''}")
+    elif posting_state == const.CROSS_POST_STATE_COMPLETE:
+        st.success(tr("Video Published"))
+    elif posting_state in (const.CROSS_POST_STATE_PENDING, const.CROSS_POST_STATE_PROCESSING):
+        st.caption(tr("Publishing"))
+    elif task.get("cross_post_skip_reason"):
+        st.caption(task["cross_post_skip_reason"])
     for warning in task.get("warnings") or []:
         if isinstance(warning, Mapping) and warning.get("code") == "sonilo_bgm_failed":
             st.warning(
@@ -2393,17 +2839,23 @@ def _render_generation_task_snapshot(task_id, task):
                     i + 1,
                     len(video_files),
                 )
-                with open(url, "rb") as video_file:
-                    st.download_button(
-                        download_label,
-                        data=video_file,
-                        file_name=download_name,
-                        mime=mimetypes.guess_type(url)[0] or "video/mp4",
-                        key=f"download_generated_video_{task_id}_{i}",
-                        icon=":material/download:",
-                        on_click="ignore",
-                        width='stretch',
-                    )
+                # 这里刻意用 link_button 指向 /download，而不是把文件读进内存交给
+                # st.download_button。结果页一屏可能有 3 条成片、每条 50 MB 上下，
+                # 旧写法等于用户只是**看一眼**结果页，进程就先多吃进 160 MB——
+                # 而这 160 MB 在按钮被点之前一次都没被用到。/download 以
+                # FileResponse 边读边发，常驻内存只有分块缓冲。
+                #
+                # st.link_button 只接受它自己那几个参数：早期版本给它传了
+                # file_name / mime，于是每一次渲染结果页都抛 TypeError，而上面那圈
+                # try/except 把异常吞成一条日志——成片与下载按钮就此整段消失，
+                # 界面看起来只是"这次没有产出视频"。建议文件名改由 URL 传给端点。
+                st.link_button(
+                    download_label,
+                    url=_generated_video_download_url(url, download_name),
+                    key=f"download_generated_video_{task_id}_{i}",
+                    icon=":material/download:",
+                    width='stretch',
+                )
     except Exception as exc:
         logger.exception(
             f"failed to render generated video preview: task_id={task_id}, "
@@ -2411,6 +2863,9 @@ def _render_generation_task_snapshot(task_id, task):
         )
 
     _render_thumbnail_section(task_id)
+    first_video = next((path for path in video_files if os.path.isfile(path)), None)
+    if first_video:
+        _render_posting_copy(first_video, task.get("video_subject") or "", "", f"task_{task_id}")
 
     _render_generation_logs(task_id)
     if st.session_state.get("handled_generation_task_id") != task_id:
@@ -2602,6 +3057,49 @@ def stable_selectbox(label, options, default_value, key, format_func=None, **kwa
         label,
         options=options,
         format_func=format_func,
+        key=widget_key,
+        **kwargs,
+    )
+
+
+def stable_pills(label, options, default_value, key, format_func=None, selection_mode="single", **kwargs):
+    """把少量离散选项渲染成横向筹码（chips），并保留与 ``stable_selectbox`` 相同的状态语义。
+
+    三个左右的选项用下拉框是浪费：用户要"点开、看清、再点一下"才能确认自己选了
+    什么，而选项就摆在那里。筹码一次就能选完，也让"当前选择"始终可见——画幅、
+    转场、字幕位置这类每天都要调的项尤其如此。
+
+    状态处理刻意与 ``stable_selectbox`` 对齐：session_state 里存业务值而不是下标，
+    展示文案只经 ``format_func`` 转换。这样翻译文案、选项顺序或上游配置变化都不会
+    把用户的选择冲掉——Streamlit 1.59 对控件状态复用非常敏感，历史上正是这一点导致
+    "第一次选择不生效、要再选一次"。
+    """
+    options = list(options)
+    if not options:
+        raise ValueError(f"pills options cannot be empty: {key}")
+
+    if default_value not in options:
+        default_value = options[0]
+
+    widget_key = localized_widget_key(key)
+    selected_value = st.session_state.get(widget_key)
+    if selection_mode == "single" and selected_value not in options:
+        st.session_state[widget_key] = default_value
+    elif selection_mode == "multi" and selected_value is not None:
+        # 上游选项变少时，剔掉已不存在的值；全被剔掉则回到默认值。
+        if not isinstance(selected_value, (list, tuple)):
+            selected_value = [selected_value]
+        pruned = [value for value in selected_value if value in options]
+        st.session_state[widget_key] = pruned or [default_value]
+
+    if format_func is None:
+        format_func = str
+
+    return st.pills(
+        label,
+        options=options,
+        format_func=format_func,
+        selection_mode=selection_mode,
         key=widget_key,
         **kwargs,
     )
@@ -2838,7 +3336,9 @@ def _render_cache_management_settings(panel):
             icon=":material/refresh:",
         ):
             _get_video_cache_stats.clear()
-            st.rerun(scope="fragment")
+            # 整页 rerun：这些函数都不是 @st.fragment，scope="fragment" 在这里必定抛
+            # StreamlitAPIException（点“发布”“刷新缓存统计”都会炸）。
+            st.rerun()
 
         if open_col.button(
             tr("Open Cache Directory"),
@@ -2856,6 +3356,7 @@ def _render_cache_management_settings(panel):
             disabled=cleanup_disabled,
             width='stretch',
             icon=":material/delete_sweep:",
+            help=tr("Clean Cache Now Help"),
         ):
             result = cache_manager.clean_video_cache(max_age_days=max_age_days)
             message_key = (
@@ -2876,7 +3377,9 @@ def _render_cache_management_settings(panel):
             # 危险确认状态被继续保留。
             st.session_state["video_cache_cleanup_confirm_nonce"] = confirm_nonce + 1
             _get_video_cache_stats.clear()
-            st.rerun(scope="fragment")
+            # 整页 rerun：这些函数都不是 @st.fragment，scope="fragment" 在这里必定抛
+            # StreamlitAPIException（点“发布”“刷新缓存统计”都会炸）。
+            st.rerun()
 
 
 # -----------------------------------------------------------------------------
@@ -3201,12 +3704,12 @@ def _render_key_backup_settings(panel):
 # 同时控制阅读行宽，避免弹窗在宽屏设备上显得过于松散。
 # Dialog 继承 fragment 行为，内部控件交互只重绘弹窗；函数末尾单独保存配置，
 # 关闭时通过回调触发整页同步，确保生成流程读取最新 Provider 和界面设置。
-@st.dialog(
-    tr("Settings"),
-    width="medium",
-    on_dismiss=_dismiss_settings_dialog,
-)
-def _render_settings_dialog():
+def _render_settings_body():
+    """设置项的正文。左侧导航的「设置」页与顶部栏的设置弹窗共用这一段。
+
+    两者刻意共用：设置项有二十多个，任何一处改而另一处漏掉，用户就会在"页面里有、
+    弹窗里没有"这种极难自查的分叉里迷路。
+    """
     with st.container():
         # 历史 hide_config 只用于隐藏旧基础设置面板。改为固定设置入口后，该值
         # 不再有用户可见意义，统一迁移为 false，避免旧配置影响后续版本。
@@ -3230,6 +3733,34 @@ def _render_settings_dialog():
         )
 
         with publish_config_panel:
+            st.subheader(tr("YouTube API Publishing"))
+            st.caption(tr("YouTube API Setup Help"))
+            for field, label in (
+                ("youtube_upload_client_id", "YouTube OAuth Client ID"),
+                ("youtube_upload_client_secret", "YouTube OAuth Client Secret"),
+            ):
+                current = str(config.app.get(field, "") or "")
+                value = st.text_input(tr(label), value=current, type="password", key=f"{field}_input")
+                if value != current:
+                    _set_runtime_config("app", field, value.strip())
+            privacy_options = ["public", "unlisted", "private"]
+            saved_privacy = config.app.get("youtube_upload_privacy_status", "public")
+            if saved_privacy not in privacy_options:
+                saved_privacy = "public"
+            privacy = st.selectbox(
+                tr("YouTube Privacy Status"), privacy_options,
+                index=privacy_options.index(saved_privacy), key="youtube_api_privacy",
+            )
+            if privacy != saved_privacy:
+                _set_runtime_config("app", "youtube_upload_privacy_status", privacy)
+            auto_publish = st.checkbox(
+                tr("YouTube Auto Publish"),
+                value=bool(config.app.get("youtube_upload_auto_publish", True)),
+                key="youtube_api_auto_publish",
+            )
+            if auto_publish != bool(config.app.get("youtube_upload_auto_publish", True)):
+                _set_runtime_config("app", "youtube_upload_auto_publish", auto_publish)
+            st.divider()
             st.write(tr("Automatically publish generated videos to social media using upload-post.com"))
             st.info(
                 tr("Upload-Post Setup Guide").format(
@@ -3307,7 +3838,7 @@ def _render_settings_dialog():
                 if upload_post_youtube_privacy_status != config.app.get("upload_post_youtube_privacy_status", "public"):
                     _set_runtime_config("app", "upload_post_youtube_privacy_status", upload_post_youtube_privacy_status)
 
-        # 左侧面板 - 日志设置
+        # 左侧面板 - 日志与完成行为
         with left_config_panel:
             hide_log = st.checkbox(
                 tr("Hide Log"),
@@ -3315,6 +3846,23 @@ def _render_settings_dialog():
                 key="hide_log_checkbox",
             )
             _set_runtime_config("ui", "hide_log", hide_log)
+
+            # 任务完成时自动弹出 Finder 窗口。这个行为每完成一个视频就触发一次，
+            # 此前只有 config.toml 里的开关、全应用没有任何界面入口，于是用户既
+            # 不知道它在发生，也没法在界面上关掉它——"界面一跳一跳"里它占很大一份。
+            # 读侧 _render_running_generation_task 用 .get(key, True) 兜底，这里
+            # 同用 True，两边对"键不存在"的解释必须一致，否则开关存下去的值和
+            # 实际行为会差一档。
+            open_folder = st.checkbox(
+                tr("Open Output Folder On Completion"),
+                value=config.ui.get("open_task_folder_on_completion", True),
+                key="open_task_folder_on_completion_checkbox",
+                help=tr("Open Output Folder On Completion Help"),
+            )
+            if open_folder != config.ui.get("open_task_folder_on_completion", True):
+                _set_runtime_config(
+                    "ui", "open_task_folder_on_completion", open_folder
+                )
 
         _render_cache_management_settings(cache_config_panel)
         # 密钥恢复会写回配置并清除密码控件状态，必须在下面渲染这些控件之前执行。
@@ -3690,6 +4238,17 @@ def _render_settings_dialog():
 # -----------------------------------------------------------------------------
 
 
+# 设置属于低频操作，顶部栏那个入口仍然用中等尺寸 Dialog：它多半是"临时改个 key
+# 就走"，弹窗关掉即回到原来的页面，不必把主页面整个换掉。
+@st.dialog(
+    tr("Settings"),
+    width="medium",
+    on_dismiss=_dismiss_settings_dialog,
+)
+def _render_settings_dialog():
+    _render_settings_body()
+
+
 def _create_loomloom_script_backend():
     """从当前 WebUI/config.toml 配置创建批量文案客户端。"""
     app_config_snapshot = config.snapshot_config_with_pending(config.app)
@@ -3840,6 +4399,7 @@ def _render_loomloom_video_settings(params):
         type="secondary",
         icon=":material/request_quote:",
         disabled=not token or batch is None,
+        help=tr("LoomLoom Video Quote Help"),
     ):
         try:
             quote_result = _create_loomloom_video_backend().quote(batch)
@@ -4125,6 +4685,7 @@ def _render_loomloom_script_generation(params):
         type="secondary",
         icon=":material/request_quote:",
         disabled=not effective_token or bool(st.session_state.get("loomloom_run_id")),
+        help=tr("LoomLoom Script Quote Help"),
     ):
         if not params.video_subject:
             st.toast(tr("Please Enter the Video Subject First"))
@@ -4198,6 +4759,7 @@ def _render_loomloom_script_generation(params):
             width='stretch',
             type="primary",
             disabled=(not quote_is_current or not confirm_charge or run_in_progress),
+            help=tr("LoomLoom Run Help"),
         ):
             try:
                 execution = _create_loomloom_script_backend().execute(
@@ -4590,7 +5152,8 @@ def _render_video_settings(panel, params):
             default_aspect_index = 1 if params.video_source == "coverr" else 0
             video_aspect_values = [value for _, value in video_aspect_ratios]
             video_aspect_config_key = f"video_aspect_{params.video_source}"
-            selected_aspect_ratio = stable_selectbox(
+            # 只有两个选项，用下拉框等于把选择藏起来。筹码一次点完，且当前选择始终可见。
+            selected_aspect_ratio = stable_pills(
                 tr("Video Ratio"),
                 options=video_aspect_values,
                 default_value=_saved_ui_choice(
@@ -4603,6 +5166,12 @@ def _render_video_settings(panel, params):
                     (v, label) for label, v in video_aspect_ratios
                 )[value],
             )
+            # 兜底到默认画幅：切到别的视图再切回来时，Streamlit 会丢掉本轮没有渲染的
+            # 控件状态，于是 st.pills 可能返回 None。None 传进 VideoAspect 会直接
+            # 抛 ValueError 把整页打断——这里退回默认画幅，页面照常可用。
+            selected_aspect_ratio = selected_aspect_ratio or video_aspect_values[
+                default_aspect_index
+            ]
             params.video_aspect = VideoAspect(selected_aspect_ratio)
             _set_runtime_config(
                 "ui", video_aspect_config_key, params.video_aspect.value
@@ -5706,7 +6275,12 @@ def _render_audio_settings(panel, params):
                 # 音色列表位于 Key 输入框之前渲染，必须先统一恢复重连状态并读取
                 # 配置/环境变量，否则页面会用空 Key 加载并缓存空音色列表。
                 saved_elevenlabs_api_key = _sync_elevenlabs_api_key_input()
-                cache_key = f"elevenlabs_voices_{saved_elevenlabs_api_key}"
+                # 缓存键必须用凭证摘要，不能直接拼原始 Key：session_state 会被
+                # Streamlit 序列化后送到浏览器，原始 Key 因此会出现在 devtools、
+                # 任何浏览器扩展的 session-state 转储里。MiniMax 那条路径已经用
+                # _credential_signature，这里此前是唯一的例外。摘要只用于缓存失效
+                # 判断，不写入配置、日志或任务文件。
+                cache_key = f"elevenlabs_voices_{_credential_signature(saved_elevenlabs_api_key)}"
                 if cache_key not in st.session_state:
                     st.session_state[cache_key] = voice.get_elevenlabs_voices(
                         saved_elevenlabs_api_key
@@ -6175,7 +6749,7 @@ def _render_subtitle_settings(panel, params):
                 if pos_value == saved_subtitle_position:
                     saved_position_index = i
                     break
-            selected_subtitle_position = stable_selectbox(
+            selected_subtitle_position = stable_pills(
                 tr("Position"),
                 options=[value for _, value in subtitle_positions],
                 default_value=subtitle_positions[saved_position_index][1],
@@ -6733,7 +7307,7 @@ def _plan_python() -> str:
 
 
 def _plan_uploader_tool() -> str:
-    return os.path.join(tools_dir, "youtube_uploader.py")
+    return os.path.join(tools_dir, "publish_video.py")
 
 
 def _run_plan_uploader(args, timeout=900) -> dict:
@@ -6760,35 +7334,206 @@ def _run_plan_uploader(args, timeout=900) -> dict:
         return {"success": False, "error": last_line}
 
 
-def _build_plan_params(channel, topic) -> VideoParams:
-    env = plans.read_automation_env(channel)
-    params = VideoParams(video_subject=topic)
-    if env.get("VIDEO_ASPECT"):
-        params.video_aspect = VideoAspect.portrait
-    if env.get("VOICE_NAME"):
-        params.voice_name = env["VOICE_NAME"]
+def _run_youtube_cli(args, timeout=300) -> dict:
+    """Run a YouTube CLI verb (``--youtube-*``) and parse its JSON line."""
+    command = [_plan_python(), os.path.join(root_dir, "cli.py")] + args
+    try:
+        proc = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=root_dir,
+        )
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": "YouTube command timed out"}
+    output = (proc.stdout or "").strip()
+    if not output:
+        return {
+            "success": False,
+            "error": (proc.stderr or "no output").strip()[-400:],
+        }
+    try:
+        return json.loads(output.splitlines()[-1])
+    except (ValueError, TypeError):
+        return {"success": False, "error": output.splitlines()[-1][:400]}
+
+
+#: ``automation.env`` 键 → ``VideoParams`` 字段。键是频道自己的配置文件里的写法，
+#: 值是模型字段名。
+#:
+#: 优先级是**频道文件压过表单**：这四个频道都刻意用自己的 VOICE_NAME / BGM_TYPE /
+#: BGM_VOLUME 做品牌区分，若改成表单压过文件，这些配置就全部失去意义，之前"设置
+#: 被丢弃"的抱怨只是换了个方向继续丢。真正要修的是**沉默**，不是优先级：以前文件
+#: 只覆盖 7 个键、其余 46 个设置被整个丢掉且无人提示；现在文件只覆盖它写了的键，
+#: 其余设置从表单照常生效，界面也把"这条路径会覆盖哪几项"直接列出来。
+_PLAN_ENV_FIELD_MAP: dict[str, str] = {
+    "VIDEO_ASPECT": "video_aspect",
+    "VIDEO_SOURCE": "video_source",
+    "VOICE_NAME": "voice_name",
+    "VOICE_RATE": "voice_rate",
+    "VOICE_VOLUME": "voice_volume",
+    "VIDEO_LANGUAGE": "video_language",
+    "PARAGRAPH_NUMBER": "paragraph_number",
+    "BGM_TYPE": "bgm_type",
+    "BGM_VOLUME": "bgm_volume",
+    "VIDEO_CLIP_DURATION": "video_clip_duration",
+    "VIDEO_CLIP_SPEED": "video_clip_speed",
+    "VIDEO_CONCAT_MODE": "video_concat_mode",
+    "VIDEO_TRANSITION_MODE": "video_transition_mode",
+    "VIDEO_COUNT": "video_count",
+    "SUBTITLE_ENABLED": "subtitle_enabled",
+    "SUBTITLE_POSITION": "subtitle_position",
+    "FONT_NAME": "font_name",
+    "FONT_SIZE": "font_size",
+    "TEXT_FORE_COLOR": "text_fore_color",
+    "STROKE_COLOR": "stroke_color",
+    "STROKE_WIDTH": "stroke_width",
+    "CAPTION_WORD_HIGHLIGHT": "caption_word_highlight",
+    "MATCH_MATERIALS_TO_SCRIPT": "match_materials_to_script",
+}
+
+#: 上面这张表里需要按数字解析的键。写错类型时跳过该键并留日志，而不是让
+#: pydantic 在提交任务时才炸——那时用户已经按下"生成"并等了一段时间。
+_PLAN_ENV_INT_FIELDS = frozenset(
+    {
+        "paragraph_number",
+        "video_clip_duration",
+        "video_count",
+        "font_size",
+        "stroke_width",
+    }
+)
+_PLAN_ENV_FLOAT_FIELDS = frozenset(
+    {"voice_rate", "voice_volume", "bgm_volume", "video_clip_speed"}
+)
+_PLAN_ENV_BOOL_FIELDS = frozenset(
+    {"subtitle_enabled", "caption_word_highlight", "match_materials_to_script"}
+)
+
+
+def _coerce_plan_env_value(field: str, raw: str):
+    """把 automation.env 的字符串转成 VideoParams 需要的类型。
+
+    解析失败返回 ``None``，由调用方跳过并记录。值形如 ``9:16`` 的 VIDEO_ASPECT 走
+    默认字符串路径即可，它本来就是枚举字符串。
+    """
+    text = str(raw).strip()
+    if field in _PLAN_ENV_BOOL_FIELDS:
+        lowered = text.lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        return None
+    if field in _PLAN_ENV_INT_FIELDS:
+        try:
+            return int(float(text))
+        except ValueError:
+            return None
+    if field in _PLAN_ENV_FLOAT_FIELDS:
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return text or None
+
+
+def _apply_plan_env(params: VideoParams, env: dict) -> tuple[VideoParams, list[str], list[str]]:
+    """把频道的 automation.env 叠在表单参数之上。
+
+    返回 ``(参数, 已覆盖的字段, 无法解析而被跳过的键)``。后两个列表给界面用：
+    覆盖了什么要说清楚，跳过了什么也要说清楚，否则用户改了一个拼错的键会以为它生效了。
+    """
+    applied: list[str] = []
+    skipped: list[str] = []
+    for key, raw in (env or {}).items():
+        field = _PLAN_ENV_FIELD_MAP.get(key)
+        if field is None:
+            continue  # 不是认识的键，保持静默：文件里常留着注释性配置
+        value = _coerce_plan_env_value(field, raw)
+        if value is None:
+            logger.warning(
+                f"ignoring unparseable automation.env value: {key}={raw!r} "
+                f"(field {field})"
+            )
+            skipped.append(key)
+            continue
+        try:
+            setattr(params, field, value)
+        except Exception as exc:  # noqa: BLE001 - 单个字段非法不该毁掉整次生成
+            logger.warning(
+                f"ignoring rejected automation.env value: {key}={raw!r} "
+                f"(field {field}, error={exc})"
+            )
+            skipped.append(key)
+            continue
+        applied.append(field)
+    return params, applied, skipped
+
+
+def _render_effective_parameters_readout(channel: str, env: dict) -> None:
+    """
+    一行说明这条路径会覆盖表单里的哪几项。
+
+    这里曾经是七个小节、两大段文字，用来解释"界面上的设置在这条路径上会被丢弃"。
+    那是把一份 bug 报告直接画进了界面。现在 ``automation.env`` 只覆盖它显式写了的
+    键，其余设置照常从表单生效，所以这里只需要回答一个问题：**按下这个按钮，我改的
+    设置会被谁盖掉？**
+    """
+    known = {
+        key: value
+        for key, value in (env or {}).items()
+        if key in _PLAN_ENV_FIELD_MAP
+    }
+    unknown = {key: value for key, value in (env or {}).items() if key not in _PLAN_ENV_FIELD_MAP}
+
+    summary = tr("Plan Overrides From Channel").format(
+        channel=channel,
+        count=len(known),
+    )
+    if not known:
+        st.caption(summary)
     else:
-        # Fallback voice for channels without automation.env
-        params.voice_name = "en-US-AvaMultilingualNeural"
-    if env.get("VOICE_RATE"):
-        try:
-            params.voice_rate = float(env["VOICE_RATE"])
-        except ValueError:
-            pass
-    if env.get("VIDEO_LANGUAGE"):
-        params.video_language = env["VIDEO_LANGUAGE"]
-    if env.get("PARAGRAPH_NUMBER"):
-        try:
-            params.paragraph_number = int(env["PARAGRAPH_NUMBER"])
-        except ValueError:
-            pass
-    if env.get("BGM_TYPE"):
-        params.bgm_type = env["BGM_TYPE"]
-    if env.get("BGM_VOLUME"):
-        try:
-            params.bgm_volume = float(env["BGM_VOLUME"])
-        except ValueError:
-            pass
+        st.caption(summary)
+        # 带上取值。只显示键名的话，看到 VOICE_NAME 仍然不知道它被设成了什么，
+        # 而这正是"我改的设置到底有没有被用上"要回答的问题。
+        st.write(
+            ", ".join(f"`{key}={value}`" for key, value in sorted(known.items()))
+        )
+    if unknown:
+        st.caption(tr("Plan Unknown Env Keys").format(count=len(unknown)))
+        st.write(", ".join(f"`{key}`" for key in sorted(unknown)))
+
+
+def _build_plan_params(channel, topic, base_params=None) -> VideoParams:
+    """
+    计划路径的参数：表单当前值 + 频道 automation.env 的覆盖。
+
+    早先这里是 ``VideoParams(video_subject=topic)`` —— 一个全新的对象，然后只套用
+    automation.env 里的七个键。界面上四列设置的其余部分连同它们在配置文件里的取值
+    一起被整个丢掉，于是一条花了两个多小时的渲染，用的是一份与界面显示无关的参数。
+
+    现在的顺序是：**以表单为准，再让频道文件覆盖它写了的键**。频道文件优先是因为这
+    四个频道正是靠它区分品牌的（各自的 VOICE_NAME / BGM_TYPE / BGM_VOLUME），
+    若反过来，频道配置就失去意义了；而"哪些键被覆盖"由上面的 readout 直接显示，
+    不再需要靠读代码去猜。
+
+    :param base_params: 表单当前的参数快照。``None`` 时退化为一份默认参数，
+        仅用于测试与没有快照的首轮渲染。
+    """
+    if base_params is None:
+        # video_subject 是必填字段，裸 VideoParams() 会抛 ValidationError；
+        # 这里传空串，与 _page_generate 的做法一致。
+        base_params = VideoParams(video_subject="")
+    # 深拷贝：直接改表单那份会让"手动生成"与"计划生成"共享对象，随后一次计划渲染
+    # 就把用户正在编辑的表单改掉了。
+    params = base_params.model_copy(deep=True)
+    params.video_subject = topic
+
+    env = plans.read_automation_env(channel)
+    _applied, _covered, _skipped = _apply_plan_env(params, env)
+
     system_prompt = plans.read_file_text(channel, "system_prompt.txt")
     if system_prompt:
         params.custom_system_prompt = system_prompt
@@ -6808,7 +7553,9 @@ def _submit_plan_generation(channel, topic) -> None:
             json.dump(plan_meta, handle, ensure_ascii=False)
     except OSError as exc:
         logger.warning(f"failed to write plan task metadata: channel={channel}, error={exc}")
-    params = _build_plan_params(channel, topic)
+    params = _build_plan_params(
+        channel, topic, st.session_state.get("form_params_snapshot")
+    )
     _save_runtime_config()
     try:
         st.toast(tr("Generating Video"))
@@ -6826,40 +7573,532 @@ def _submit_plan_generation(channel, topic) -> None:
     st.rerun()
 
 
-def _publish_via_browser(channel, video_path, title, index=None, plan_dir=None) -> dict:
-    description = plans.read_file_text(channel, "channel_description.md")
+@st.fragment(run_every="2s")
+def _publish_status(key: str):
+    """轮询一次发布作业，只重画这一小块。"""
+    job = publish_jobs.get_job(key)
+    if job is None or not job.done:
+        return
+    info = job.snapshot()
+    if job.status == "done":
+        st.success(tr("Video Published"))
+        published = job.result or {}
+        # API 路径把每个平台的结果收在 result.<platform> 下；保留顶层 url
+        # 是为了兼容仍然返回扁平结构的旧结果。
+        video_url = (published.get("result") or {}).get("youtube", {}).get(
+            "url"
+        ) or published.get("url")
+        if video_url:
+            st.write(video_url)
+    else:
+        st.error((job.result or {}).get("error", tr("Video Publish Failed")))
+    st.caption(tr("Publish Elapsed").format(seconds=info["elapsed"]))
+    if st.button(tr("Dismiss"), key=f"publish_dismiss_{key}", width="content"):
+        publish_jobs.clear_finished_jobs()
+        st.rerun()
+
+
+def _render_publish_button(*, key, label, button_key, disabled, work, primary=False):
+    """发布按钮：只负责启动作业，进度交给 :func:`_publish_status` 轮询。
+
+    同步跑发布会让整页冻结——上传一次几分钟，页面期间完全不可用。因此这里点了
+    就返回，作业在后台线程里跑。同一时间同一条片子只允许一个作业：发布是公开可见
+    且无法撤回的，重复提交比等待糟糕得多。
+    """
+    running = publish_jobs.is_running(key)
+    if st.button(
+        tr("Publishing") if running else label,
+        type="primary" if (primary and not running) else "secondary",
+        width="stretch",
+        disabled=disabled or running,
+        key=button_key,
+        icon=":material/upload:" if running else None,
+    ):
+        publish_jobs.start_publish_job(key, label, work)
+        # 整页 rerun：这些函数都不是 @st.fragment，scope="fragment" 在这里必定抛
+        # StreamlitAPIException（点“发布”“刷新缓存统计”都会炸）。
+        st.rerun()
+
+    job = publish_jobs.get_job(key)
+    if job is not None:
+        with st.container(key=f"publish_status_{key}"):
+            if not job.done:
+                # 原来是 st.progress(0.0, ...)：上传过程里没有任何可上报的进度，
+                # 于是那根条永远停在 0%。一条不动的进度条比没有进度更糟——它承诺了
+                # 一个不会到来的推进。换成"正在上传"的动效，如实说明只有一件事发生着。
+                status_line = st.columns([1, 6], vertical_alignment="center")
+                with status_line[0]:
+                    orbs.orb("upload", size=20, label=tr("Uploading To YouTube"))
+                status_line[1].caption(tr("Uploading To YouTube"))
+            _publish_status(key)
+
+
+def _publish_via_api(channel, video_path, title, index=None, plan_dir=None) -> dict:
+    """Publish via the YouTube Data API: no browser, no visible window."""
     result = _run_plan_uploader(
         [
-            "--profile",
+            "--channel",
             channel,
-            "--publish",
+            "--video",
             video_path,
-            "--title",
-            title,
-            "--description",
-            description,
+            "--platforms",
+            "youtube",
         ]
     )
-    if result.get("success") and index is not None and result.get("video_url"):
-        plans.mark_posted(channel, index, result["video_url"], plan_dir=plan_dir)
+    if result.get("success") and index is not None:
+        video_url = (
+            (result.get("result") or {}).get("youtube", {}).get("url") or
+            result.get("url")
+        )
+        if video_url:
+            plans.mark_posted(channel, index, video_url, plan_dir=plan_dir)
     return result
 
 
-def _latest_generated_video():
-    has_video = ""
-    subject = ""
-    for task in _scan_history_tasks(limit=30):
-        if task["video_file"]:
-            has_video = task["video_file"]
-            subject = task["subject"]
-            break
-    return has_video, subject
+def _render_posting_copy(video_path: str, subject: str, channel: str, key: str):
+    """Keep the video and ready-to-copy publishing text in the same view."""
+    with st.expander(tr("Posting Package")):
+        try:
+            package = posting_package.load_for_video(video_path, channel, subject)
+        except (OSError, ValueError) as exc:
+            st.error(str(exc))
+            return
+        if package.get("copy_source") == "fallback":
+            st.caption(tr("Posting Copy Fallback"))
+        for label, content in (
+            ("Posting Title", package["title"]),
+            ("Posting Description", package["caption"]),
+            ("Posting Hashtags", " ".join(package["hashtags"])),
+            ("Posting Comment", package["comment"]),
+        ):
+            st.caption(tr(label))
+            if content:
+                st.code(content, language=None)
+            else:
+                st.caption(tr("No Comment Draft"))
+        st.download_button(
+            tr("Download Posting Text"), posting_package.render_text(package),
+            file_name=Path(video_path).stem + ".posting.txt", mime="text/plain",
+            key=f"posting_text_{key}",
+        )
+        receipt_path = Path(video_path).with_suffix(".publish.json")
+        if receipt_path.is_file():
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                for platform, result in receipt.get("result", {}).items():
+                    if result.get("success"):
+                        st.success(f"{platform}: {result.get('url') or tr('Video Published')}")
+                    else:
+                        st.error(f"{platform}: {result.get('error') or tr('Video Publish Failed')}")
+                if receipt.get("pending"):
+                    st.warning(tr("Posting Outcome Unknown"))
+            except (OSError, ValueError, AttributeError):
+                st.warning(tr("Posting Receipt Invalid"))
+
+
+_DRAFT_PREVIEW_STYLE_FIELDS = (
+    "video_aspect",
+    "subtitle_enabled",
+    "subtitle_position",
+    "custom_position",
+    "font_name",
+    "font_size",
+    "text_fore_color",
+    "text_background_color",
+    "stroke_color",
+    "stroke_width",
+    "rounded_subtitle_background",
+)
+
+
+def _draft_preview_cache_key(params, text: str) -> tuple:
+    """只取影响画面的字段做缓存键。
+
+    语音、音乐这类不影响画面的参数如果也进键，用户每调一次音量就得重画一张图。
+    """
+    return (
+        tuple(getattr(params, field, None) for field in _DRAFT_PREVIEW_STYLE_FIELDS),
+        text,
+    )
+
+
+def _draft_preview_fallback_params() -> VideoParams:
+    """没有表单快照时，按**已保存的界面设置**造一份预览参数。
+
+    快照只有生成页会写，而左侧导航把工具台排在最前面，所以"一次都没进过生成页"
+    是正常路径。这时预览必须照样出得来，只是退化到用户保存过的那份设置。
+
+    不能直接用 ``VideoParams()`` 的字段默认值：``subtitle_enabled`` 之类的默认值
+    写死在 schema 里（``subtitle_enabled`` 默认 True），不读 ``config.ui``。那样
+    就会在一个关着字幕的账号上宣称字幕是开着的。所以这里逐个字段走控件自己用的
+    那套读取器（:func:`_saved_ui_bool` 等），保证预览与生成页看到的是同一份值。
+    """
+    params = VideoParams(video_subject="")
+    defaults = DEFAULT_SUBTITLE_SETTINGS
+
+    params.subtitle_enabled = _saved_ui_bool(
+        "subtitle_enabled", defaults["subtitle_enabled"]
+    )
+    params.subtitle_position = _saved_ui_choice(
+        "subtitle_position",
+        ("top", "center", "bottom", "custom"),
+        defaults["subtitle_position"],
+    )
+    params.font_name = _saved_ui_text(
+        "font_name", defaults["font_name"], max_length=200
+    )
+    params.font_size = int(
+        _saved_ui_number("font_size", defaults["font_size"], 8, 200, int)
+    )
+    params.custom_position = float(
+        _saved_ui_number("custom_position", defaults["custom_position"], 0.0, 100.0)
+    )
+    params.text_fore_color = _saved_ui_color(
+        "text_fore_color", defaults["text_fore_color"]
+    )
+    params.stroke_color = _saved_ui_color("stroke_color", defaults["stroke_color"])
+    params.stroke_width = float(
+        _saved_ui_number("stroke_width", defaults["stroke_width"], 0.0, 10.0)
+    )
+    # 字幕背景在 schema 里只有一个 text_background_color 字段，形状是"关=False /
+    # 开=颜色串"（兼容历史布尔值，见 subtitle_preview._resolve_background_color）。
+    # 颜色和圆角各自的开关/取值仍存在 UI 配置里，所以按控件的同一套读法取回来，
+    # 再合成这一个字段。
+    background_enabled = _saved_ui_bool(
+        "subtitle_background_enabled", defaults["subtitle_background_enabled"]
+    )
+    background_color = _saved_ui_color(
+        "subtitle_background_color", defaults["subtitle_background_color"]
+    )
+    params.text_background_color = background_color if background_enabled else False
+    params.rounded_subtitle_background = _saved_ui_bool(
+        "rounded_subtitle_background", defaults["rounded_subtitle_background"]
+    )
+    params.caption_word_highlight = _saved_ui_bool(
+        "caption_word_highlight", defaults["caption_word_highlight"]
+    )
+    # 宽高比由频道的 automation.env 在调用方覆盖，这里只兜住没有 env 的频道。
+    # video_aspect 在 schema 里是普通字符串（VideoAspect 是 str 枚举，但赋值后
+    # 不会自动变成枚举实例），所以默认值取枚举的 value 而不是 params 上的属性。
+    params.video_aspect = _saved_ui_choice(
+        "video_aspect",
+        tuple(item.value for item in VideoAspect),
+        VideoAspect.portrait.value,
+    )
+    return params
+
+
+def _render_draft_preview(container, channel: str, topic: str | None) -> None:
+    """把 9:16 草稿预览画进 ``container``。
+
+    预览读取生成页写下的表单快照，再套上该频道的 automation.env 覆盖——也就是
+    **这条频道真正会出片的那份参数**。只显示表单值会漏掉 env 里的品牌设置，而那
+    恰恰是最需要肉眼确认的一部分。
+
+    为什么读快照不会"慢一轮"：计划与生成现在是两个独立页面，控件状态存在全局
+    session_state 里。用户在生成页改完设置的那一次 rerun 已经把快照写好了，切到
+    计划页读到的正是他眼前这份设置。之前慢一轮是因为两个面板在**同一个页面**上
+    且计划面板排在表单之前——分页之后这个顺序问题不复存在。
+
+    渲染走的是出片同一段排版代码（见 app/services/subtitle_preview.py），所以字号、
+    颜色、描边、位置在这里是什么样，出片就是什么样。
+    """
+    text = str(topic or "").strip()
+    if not text:
+        return
+
+    params = st.session_state.get("form_params_snapshot")
+    if params is None:
+        # 甩一句"请先去生成页设置字幕"是不对的：用户并没有做错任何事，那句话只是
+        # 把界面自己的导航顺序说成了用户的操作失误。_build_plan_params 处理同一个
+        # 场景时早就是这个做法。
+        params = _draft_preview_fallback_params()
+
+    # 深拷贝后再套 env 覆盖：直接改快照会让"手动生成"与"计划生成"共享对象。
+    preview_params = params.model_copy(deep=True)
+    preview_params.video_subject = text
+    _apply_plan_env(preview_params, plans.read_automation_env(channel))
+
+    # 字幕关闭时 render_subtitle_draft_png 会给一张纯净底板（这是它刻意的诚实：
+    # 不谎报成片里有文字）。但这一页的预览是**字幕样张**，字号、位置、描边、
+    # 配色全在那四个控件里——对着纯黑板调这些参数，用户看不到任何反馈，只会觉得
+    # 设置没生效。所以这里强制把样张画出来，再用一行说明告诉用户成片里到底有没有
+    # 字幕。既看得见样式，又不谎报成片内容。
+    subtitles_enabled = bool(preview_params.subtitle_enabled)
+    preview_params.subtitle_enabled = True
+
+    key = _draft_preview_cache_key(preview_params, text)
+    cached = st.session_state.get("draft_preview_cache")
+    if not cached or cached[0] != key:
+        try:
+            png = subtitle_preview_service.render_subtitle_draft_png(
+                preview_params, text
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 预览失败不能挡住生成。字体缺失、参数异常都只该让预览退场。
+            logger.warning(f"draft preview unavailable: {type(exc).__name__}: {exc}")
+            st.session_state.pop("draft_preview_cache", None)
+            with container:
+                st.caption(tr("Draft Preview Unavailable"))
+            return
+        st.session_state["draft_preview_cache"] = (key, png)
+        cached = st.session_state["draft_preview_cache"]
+
+    with container:
+        st.image(
+            cached[1],
+            # 竖版预览必须限宽：按容器整宽铺开的话，一张 9:16 会高到把整页顶出视口。
+            # 300px 左右读起来才像一块手机屏。
+            width=300,
+        )
+        st.caption(tr("Draft Preview Note"))
+        if not subtitles_enabled:
+            st.caption(tr("Draft Preview Subtitles Off"))
+
+
+_PIPELINE_SCHEDULE_BASE_LABEL = "com.moneyprinterturbo.daily-shorts"
+
+
+def _expected_schedule_labels() -> list:
+    """期望存在的定时任务：基础任务 + 其余每个频道一个。"""
+    labels = [_PIPELINE_SCHEDULE_BASE_LABEL]
+    try:
+        channels = plans.list_channels()
+    except Exception:  # noqa: BLE001 - 读不到频道列表就只查基础任务
+        return labels
+    for channel in channels or []:
+        if channel and channel != "history-mysteries":
+            labels.append(f"{_PIPELINE_SCHEDULE_BASE_LABEL}.{channel}")
+    return labels
+
+
+def _pipeline_schedule_counts():
+    """返回 ``(已加载数, 应有数)``；查不到返回 ``None``。只读，不启停任何任务。"""
+    if not sys.platform.startswith("darwin"):
+        return None
+    try:
+        labels = _expected_schedule_labels()
+        ready = 0
+        for label in labels:
+            proc = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            ready += proc.returncode == 0
+        return ready, len(labels)
+    except Exception as exc:  # noqa: BLE001 - 查不到就报未知，不挡计划页
+        logger.debug(f"scheduler state check failed: {exc}")
+        return None
+
+
+def _pipeline_scheduler_state() -> str:
+    """launchd 定时任务状态：loaded / partial / not_loaded / unknown。"""
+    counts = _pipeline_schedule_counts()
+    if counts is None:
+        return "unknown"
+    ready, total = counts
+    if ready >= total:
+        return "loaded"
+    if ready <= 0:
+        return "not_loaded"
+    return "partial"
+
+
+def _parse_schedule_run_outcome(tail_lines) -> bool | None:
+    """从日志尾部判断上次定时运行的成败；看不出返回 ``None``。纯函数。"""
+    for line in reversed(list(tail_lines or [])):
+        text = str(line)
+        if "SUCCESS on attempt" in text:
+            return True
+        if "attempts failed" in text:
+            return False
+    return None
+
+
+def _pipeline_last_run(channel: str):
+    """该频道最近一次定时运行的 ``{mtime, ok, name}``；没有返回 ``None``。只读。"""
+    log_dir = Path(root_dir).parent / "logs"
+    try:
+        candidates = sorted(log_dir.glob(f"daily_{channel}_*.log"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not candidates:
+        return None
+    latest = candidates[-1]
+    try:
+        mtime = latest.stat().st_mtime
+        with open(latest, encoding="utf-8", errors="replace") as handle:
+            tail = handle.readlines()[-40:]
+    except OSError:
+        return None
+    return {"mtime": mtime, "ok": _parse_schedule_run_outcome(tail), "name": latest.name}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_youtube_channel_info(channel: str) -> dict:
+    """5 分钟缓存的频道连接状态。未配置时直接返回，不产生任何网络请求。"""
+    try:
+        info = youtube_upload.channel_info(channel)
+        return dict(info) if isinstance(info, Mapping) else {"success": False}
+    except Exception as exc:  # noqa: BLE001 - 状态查询失败按"未连接"显示
+        return {"success": False, "error": str(exc)[:200]}
+
+
+def _render_pipeline_health_strip(channel: str):
+    """计划页顶部的自动化健康条。
+
+    只读：只查 launchd 状态、读日志尾部、读发布连接状态。绝不提交任务、
+    绝不启停调度、绝不发布——这一段的存在意义是让"自动化悄悄停了"这种事
+    在界面上可见，而不是再去制造一次意外触发。
+    """
+    try:
+        counts = _pipeline_schedule_counts()
+        last = _pipeline_last_run(channel)
+        publish = _cached_youtube_channel_info(channel)
+    except Exception as exc:  # noqa: BLE001 - 健康条永远不能挡住计划页
+        logger.debug(f"pipeline health strip skipped: {exc}")
+        return
+
+    with st.container(key="pipeline_health", border=True):
+        st.markdown(f"**{tr('Pipeline Health')}**")
+        cols = st.columns(3)
+        with cols[0]:
+            if counts is None:
+                st.caption(tr("Pipeline Scheduler Unknown"))
+            else:
+                ready, total = counts
+                if ready >= total:
+                    st.success(tr("Pipeline Scheduler Running"))
+                elif ready <= 0:
+                    st.warning(tr("Pipeline Scheduler Stopped"))
+                else:
+                    st.warning(
+                        tr("Pipeline Scheduler Partial").format(
+                            ready=ready, total=total
+                        )
+                    )
+        with cols[1]:
+            if not last:
+                st.caption(tr("Pipeline Last Run Never"))
+            else:
+                when = datetime.fromtimestamp(last["mtime"]).strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+                if last["ok"] is True:
+                    st.success(
+                        tr("Pipeline Last Run").format(
+                            when=when, result=tr("Pipeline Run Ok")
+                        )
+                    )
+                elif last["ok"] is False:
+                    st.error(
+                        tr("Pipeline Last Run").format(
+                            when=when, result=tr("Pipeline Run Failed")
+                        )
+                    )
+                else:
+                    st.caption(
+                        tr("Pipeline Last Run").format(
+                            when=when, result=tr("Pipeline Run Unknown")
+                        )
+                    )
+        with cols[2]:
+            if publish.get("success"):
+                st.success(
+                    tr("Pipeline Publish Connected").format(
+                        name=html.escape(
+                            str(publish.get("channel_name") or channel)
+                        )
+                    )
+                )
+            else:
+                st.warning(tr("Pipeline Publish Missing"))
+
+
+def _render_youtube_connect_button(channel: str, *, button_key: str, result_key: str):
+    """一块"连接 YouTube 频道"按钮：先查状态，已连直接记下；否则走一次 OAuth。
+
+    计划页与登录屏共用这一份流程，行为完全一致（先 `--youtube-status`，
+    失败才 `--youtube-authorize`，成功后重查状态）。调用方只决定按钮放在哪、
+    用什么 key 隔离各自的会话结果。
+    """
+    if st.button(
+        tr("Channel Sign In"),
+        width='stretch',
+        disabled=bool(
+            (st.session_state.get(result_key) or {}).get("logged_in")
+        ),
+        key=button_key,
+        help=tr("Channel Connect Help"),
+    ):
+        # 一次性 OAuth：浏览器只会在这里出现一次。授权后 token 绑定该频道，
+        # 之后所有发布都走 API，不占用交互会话。
+        check = _run_youtube_cli(
+            ["--youtube-status", "--channel", channel], timeout=180
+        )
+        if check.get("success"):
+            st.session_state[result_key] = {
+                "success": True,
+                "logged_in": True,
+                **check,
+            }
+            st.rerun()
+        else:
+            authorization = _run_youtube_cli(
+                ["--youtube-authorize", "--channel", channel], timeout=240
+            )
+            if authorization.get("success"):
+                info = _run_youtube_cli(
+                    ["--youtube-status", "--channel", channel], timeout=180
+                )
+                st.session_state[result_key] = {
+                    "logged_in": bool(info.get("success")), **info,
+                }
+                st.rerun()
+            else:
+                st.error(authorization.get("error") or tr("Channel Login Failed"))
+
+
+def _remembered_youtube_login(channel: str, *, result_key: str):
+    """本机已存 token 即视为已记住：打开应用直接显示已连接，不用再点一次。
+
+    会话里已有结果（刚点完按钮）时以会话为准；否则读一次带缓存的连接状态。
+    token 本来就落在 ``storage/credentials/youtube/`` 并保持 0600 权限，
+    这里只是把它显示出来，没有复制或移动任何凭据。
+    """
+    login = st.session_state.get(result_key)
+    if login:
+        return login
+    info = _cached_youtube_channel_info(channel)
+    if info.get("success"):
+        return {"logged_in": True, **info}
+    return None
+
+
+def _render_youtube_login_detail(channel: str, *, result_key: str):
+    """已连接明细 / 未连接提示。`None`（从未点过且本机无 token）时不画。"""
+    login = _remembered_youtube_login(channel, result_key=result_key)
+    if not login:
+        return
+    if login.get("logged_in"):
+        # 频道名来自 Google API，与用户输入一样不可信：不转义的话名字里的
+        # 下划线会被 Markdown 渲染成斜体，名字本身就显示错了。
+        detail = html.escape(str(login.get("channel_name") or tr("Channel Logged In")))
+        channel_id = html.escape(str(login.get("channel_id") or ""))
+        st.caption(f"✅ {detail}" + (f" ({channel_id})" if channel_id else ""))
+        if login.get("channel_mismatch"):
+            st.warning(tr("Channel Mismatch Warning"))
+    else:
+        st.caption(f"⚠️ {tr('Channel Not Logged In')}")
 
 
 def _render_plan_panel():
+    """渲染计划面板：频道、待办主题、覆盖摘要、草稿预览与本月记录。"""
     channels = [c for c in plans.list_channels() if c]
     if not channels:
-        return
+        return None
     default_channel = (
         "history-mysteries" if "history-mysteries" in channels else channels[0]
     )
@@ -6870,6 +8109,8 @@ def _render_plan_panel():
         key="plan_channel_select",
     )
 
+    _render_pipeline_health_strip(channel)
+
     pending = plans.first_pending_topic(channel)
     env = plans.read_automation_env(channel)
 
@@ -6878,12 +8119,15 @@ def _render_plan_panel():
         st.markdown(
             f"**{tr('Today Topic')}** #{index}: {topic}"
         )
-        if env:
-            st.caption(" · ".join(f"{k}={v}" for k, v in env.items()))
     else:
-        st.info(tr("All Topics Recorded"))
+        # 这个状态现在每个月都会真正到达：30 条主题一旦全部录过就不会再被给出，
+        # 所以文案要说清下一步做什么，而不是只说"都录完了"。旧的"退回第一条待办"
+        # 行为会让按钮每个月重新烧一次已做过的主题，渲完再被归档丢弃。
+        st.info(tr("All Topics Recorded").format(channel=channel))
+        st.caption(tr("All Topics Recorded Next Step").format(channel=channel))
 
     action_cols = st.columns([1, 1, 1], vertical_alignment="center")
+    _render_effective_parameters_readout(channel, env)
     with action_cols[0]:
         if st.button(
             tr("Generate Today Video"),
@@ -6894,87 +8138,138 @@ def _render_plan_panel():
         ):
             _submit_plan_generation(channel, pending[1])
 
-    latest_video, latest_subject = _latest_generated_video()
     with action_cols[1]:
-        if st.button(
-            tr("Publish Latest Video"),
-            width='stretch',
-            disabled=not latest_video,
-            key="plan_publish_latest_button",
-        ):
-            with st.spinner(tr("Uploading To YouTube")):
-                result = _publish_via_browser(
-                    channel, latest_video, latest_subject or os.path.basename(latest_video)
-                )
-            if result.get("success"):
-                st.success(tr("Video Published"))
-                if result.get("video_url"):
-                    st.write(result["video_url"])
-            else:
-                st.error(result.get("error", tr("Video Publish Failed")))
-            st.rerun()
+        # 这里曾经有一个「发布最新视频」按钮，已删除。
+        #
+        # 它的取值是"**任意**任务目录里最新的那个成片"（_latest_generated_video
+        # 不区分频道），发布目标却是上面选中的那个频道账号。于是在多频道工作流
+        # 里点一下，就可能把 money-finance 的片子发到 history-mysteries 的频道上
+        # ——而 youtube_uploader 把可见性硬编码为 public，发出去即刻公开，无法撤回。
+        #
+        # 它还固定传 index=None，于是月度计划的那一行永远不会被标记为已发布，
+        # "生成今日视频"会反复给同一个主题。
+        #
+        # 跨频道发错的风险现在由 youtube_upload 兜底：token 绑定的频道与
+        # youtube_upload_channel_id 不一致时发布会直接失败，不会发出去了。
+        #
+        # 正确入口是媒体库里每条视频自己的「发布」按钮：那个按钮从所属频道的
+        # 归档记录取来源，并且总是带着 plan_dir，所以计划行会被正确标记。
+        st.caption(
+            tr("Publish Videos From The Library").format(channel=channel)
+        )
 
-    login = st.session_state.get("plan_login_result")
     with action_cols[2]:
-        if st.button(
-            tr("Channel Sign In"),
-            width='stretch',
-            disabled=bool(login and login.get("logged_in")),
-            key="plan_channel_login_button",
-        ):
-            check = _run_plan_uploader(["--profile", channel, "--check"], timeout=180)
-            if check.get("logged_in"):
-                st.session_state["plan_login_result"] = check
-                st.rerun()
-            elif _run_plan_uploader(
-                ["--profile", channel, "--login"], timeout=240
-            ).get("success"):
-                st.session_state["plan_login_result"] = {
-                    "success": True,
-                    "logged_in": True,
-                }
-                st.rerun()
+        _render_youtube_connect_button(
+            channel,
+            button_key="plan_channel_login_button",
+            result_key=f"plan_login_result_{channel}",
+        )
+
+    _render_youtube_login_detail(channel, result_key=f"plan_login_result_{channel}")
+
+    # 预览与计划表并排：9:16 竖图如果按整幅宽度铺开，会高到把整页内容顶出视口。
+    # 收在左侧窄列里，它才读起来像一块手机屏，而不是一张海报。
+    preview_col, rows_col = st.columns([1.05, 3.6], vertical_alignment="top")
+
+    with preview_col:
+        _render_draft_preview(preview_col, channel, pending[1] if pending else None)
+
+    with rows_col:
+        plan_rows = plans.load_monthly_plan(channel)
+        if plan_rows:
+            recorded = [row for row in plan_rows if row["recorded"]]
+            if recorded:
+                _render_plan_rows_table(channel, recorded)
             else:
-                st.error(tr("Channel Login Failed"))
+                st.caption(tr("No Recorded Topics Yet"))
 
-    if login:
-        if login.get("logged_in"):
-            st.caption(f"✅ {tr('Channel Logged In')}")
-        else:
-            st.caption(f"⚠️ {tr('Channel Not Logged In')}")
 
-    plan_rows = plans.load_monthly_plan(channel)
-    if not plan_rows:
+# 计划表的列宽。表头与每一行必须用同一套，否则标题和数据会错位——
+# 而且错位在有缩略图的时候特别难看，因为缩略图那一列宽度是固定的。
+_PLAN_ROW_COLUMNS = [0.62, 2.35, 1.15, 1.15, 1.05]
+
+
+def _render_plan_row_header():
+    """计划表的表头。
+
+    之前这一列只有一个"🔗 / —"，没有任何说明。那个破折号到底是"没发布"还是
+    "文件丢了"，光看符号分不出来；而这一列又是判断哪几条能直接发布的唯一依据。
+    """
+    header = st.columns(_PLAN_ROW_COLUMNS, vertical_alignment="center")
+    # 这里不能用 tr("Index")：它在英文里是 "#"，而 st.caption 走 Markdown 渲染，
+    # 孤零零一个 "#" 会被当成一级标题，渲染成一片空白。表头因此少了最左边一列。
+    header[0].caption(tr("Plan Number"))
+    header[1].caption(tr("Topic"))
+    header[2].caption(tr("Status"))
+    header[3].caption(tr("Thumbnail"))
+    header[4].caption(tr("Task Actions"))
+
+
+def _render_plan_poster(container, video_path: str, topic_key: str):
+    """在计划行里画一张封面缩略图，没有封面时给一块说明性的占位。
+
+    缩略图是这一列存在的理由：只看主题文字判断不出成片长什么样，而计划面板本来就是
+    用来快速扫一眼"这个月做了什么"的。
+    """
+    if not video_path:
+        container.markdown(
+            f"<div class='mpt-thumb mpt-thumb--empty' "
+            f"title='{html.escape(tr('Thumbnail No Preview Yet'))}'></div>",
+            unsafe_allow_html=True,
+        )
         return
-    st.divider()
+
+    poster = video_poster_service.poster_frame_path(video_path)
+    if poster is None:
+        container.markdown(
+            f"<div class='mpt-thumb mpt-thumb--empty' "
+            f"title='{html.escape(tr('Thumbnail No Preview Yet'))}'></div>",
+            unsafe_allow_html=True,
+        )
+        return
+    # 必须套一层带 key 的容器：st.image 输出的是 <img>，直接给 img 限高只能靠
+    # 选择器命中容器。Streamlit 会把 st-key-<key> 加到容器 class 上，样式就挂在那里。
+    with container.container(key=f"plan_thumb_{topic_key}"):
+        st.image(str(poster), width="stretch")
+
+
+def _render_plan_rows_table(channel: str, rows: list[dict]):
+    st.caption(tr("Recorded Topics"))
     with st.container(border=True, key="plan_rows_container"):
-        for row in plan_rows:
-            if not row["recorded"]:
-                continue
+        _render_plan_row_header()
+        for row in rows:
             video_path = plans.find_video_path(channel, row["index"])
             post_disabled = bool(row["posted"]) or not video_path
-            cols = st.columns([0.5, 4.0, 0.9, 1.6], vertical_alignment="center")
+            cols = st.columns(_PLAN_ROW_COLUMNS, vertical_alignment="center")
             cols[0].write(f"#{row['index']}")
             cols[1].write(row["topic"])
-            cols[2].write("🔗" if row["posted"] else "—")
-            with cols[3]:
-                if st.button(
-                    tr("Post Video"),
-                    width='stretch',
+            # 用带文字的状态徽章替掉裸露的符号，并把"已发布"直接链出去。
+            if row["posted"]:
+                cols[2].markdown(
+                    f"<a class='mpt-status mpt-status--posted' "
+                    f"href='{html.escape(str(row['posted']))}' "
+                    f"target='_blank' rel='noopener'>{html.escape(tr('Posted To YouTube'))}</a>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                cols[2].markdown(
+                    f"<span class='mpt-status mpt-status--draft'>"
+                    f"{html.escape(tr('Not Posted'))}</span>",
+                    unsafe_allow_html=True,
+                )
+            _render_plan_poster(
+                cols[3], video_path, f"{channel}_{row['index']}"
+            )
+            with cols[4]:
+                _render_publish_button(
+                    key=publish_jobs.job_key("video", channel, video_path),
+                    label=tr("Post Video"),
                     disabled=post_disabled,
-                    key=f"plan_post_row_{channel}_{row['index']}",
-                ):
-                    with st.spinner(tr("Uploading To YouTube")):
-                        result = _publish_via_browser(
-                            channel, video_path, row["topic"], index=row["index"]
-                        )
-                    if result.get("success"):
-                        st.success(tr("Video Published"))
-                        if result.get("video_url"):
-                            st.write(result["video_url"])
-                    else:
-                        st.error(result.get("error", tr("Video Publish Failed")))
-                    st.rerun()
+                    button_key=f"plan_post_row_{channel}_{row['index']}",
+                    work=lambda channel=channel, video_path=video_path, row=row:
+                    _publish_via_api(channel, video_path, row["topic"], index=row["index"]),
+                )
+
 
 
 def _media_library_entries(channel):
@@ -7061,30 +8356,26 @@ def _render_media_library():
                 f"{html.escape(entry['topic'])}</p>",
                 unsafe_allow_html=True,
             )
+            _render_posting_copy(local, entry["topic"], channel, f"library_{channel}_{pick_index}")
+            if not youtube_upload.is_configured(channel):
+                st.caption(tr("YouTube Connection Required"))
             action_cols = st.columns([1, 1, 3], gap="small")
             with action_cols[0]:
-                if st.button(
-                    tr("Post Video"),
-                    type="primary",
-                    width='stretch',
+                _render_publish_button(
+                    key=publish_jobs.job_key("video", channel, local),
+                    label=tr("Post Video"),
+                    button_key=f"media_library_post_{channel}_{pick_index}",
                     disabled=entry["posted"] or not readable,
-                    key=f"media_library_post_{channel}_{pick_index}",
-                ):
-                    with st.spinner(tr("Uploading To YouTube")):
-                        result = _publish_via_browser(
-                            channel,
-                            local,
-                            entry["topic"],
-                            index=entry["plan_index"],
-                            plan_dir=entry["plan_dir"],
-                        )
-                    if result.get("success"):
-                        st.success(tr("Video Published"))
-                        if result.get("video_url"):
-                            st.write(result["video_url"])
-                    else:
-                        st.error(result.get("error", tr("Video Publish Failed")))
-                    st.rerun()
+                    primary=True,
+                    work=lambda channel=channel, local=local, entry=entry:
+                    _publish_via_api(
+                        channel,
+                        local,
+                        entry["topic"],
+                        index=entry["plan_index"],
+                        plan_dir=entry["plan_dir"],
+                    ),
+                )
             with action_cols[1]:
                 if st.button(
                     tr("Open Folder"),
@@ -7336,10 +8627,17 @@ def _render_campaign_panel():
                             st.session_state["video_subject"] = post.get("title") or ""
                             st.session_state["video_script"] = post.get("script") or ""
                             # 单击语义：把活动标题文案载入生成表单，并立即触发视频生成。
-                            # 生成控制面板在同一次页面执行中会消费该标志，沿用与手动
-                            # 点击“生成视频”完全一致的校验与提交流程。
+                            # 生成控制面板在**生成视图**上，而活动面板在另一个视图，
+                            # 因此这里同时切过去：否则标志被设下了却没人消费，用户点了
+                            # 按钮却什么也没发生。切过去之后，生成控件在同一轮里读到
+                            # 这个标志，沿用与手动点击"生成视频"完全一致的提交流程。
                             st.session_state["campaign_auto_generate"] = True
                             st.toast(tr("Campaign Subject Loaded"))
+                            # 必须再跑一轮：上面那个"有待生成就切到生成视图"的判断
+                            # 在本次执行的更早处已经过去了，此时标志才被写进去。
+                            # 不显式 rerun 的话，本次执行渲染的还是活动视图，
+                            # 标志留到下一次交互才被消费——单击出片就成了两次点击。
+                            st.rerun()
                 accept_cols = st.columns([1, 1], gap="small", vertical_alignment="center")
                 with accept_cols[0]:
                     if st.button(
@@ -7385,12 +8683,980 @@ def _render_campaign_panel():
                 )
 
 
-def _render_application():
-    """按固定顺序渲染顶部栏、弹窗、生成表单和任务结果。"""
-    _render_top_bar()
+def _page_login():
+    """左侧导航「登录」：应用打开即落到这一屏，先连好各频道的 YouTube 账号。
 
-    if st.session_state.get("settings_dialog_open", False):
-        _render_settings_dialog()
+    每个频道连一次即可，token 落在 ``storage/credentials/youtube/`` 并保持
+    0600 权限；下次打开直接显示已连接，不需要重复操作。
+    """
+    with st.container(key="page_login"):
+        st.markdown(
+            f'<div class="mpt-hero">'
+            f'<p class="mpt-hero-badge">{html.escape(tr("Login Hero Badge"))}</p>'
+            f'<p class="mpt-hero-title">{html.escape(tr("Login Hero Title"))}</p>'
+            f'<p class="mpt-hero-sub">{html.escape(tr("Login Hero Sub"))}</p>'
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        client_id = str(config.app.get("youtube_upload_client_id", "") or "").strip()
+        client_secret = str(
+            config.app.get("youtube_upload_client_secret", "") or ""
+        ).strip()
+        if not (client_id and client_secret):
+            st.warning(tr("Login Client Missing"))
+            st.caption(tr("Login Client Setup"))
+            if st.button(
+                tr("Settings"),
+                key="login_go_settings_button",
+                type="secondary",
+                icon=":material/settings:",
+            ):
+                st.session_state[_NAV_REQUEST_KEY] = "settings"
+                st.rerun()
+
+        channels = [c for c in plans.list_channels() if c]
+        if not channels:
+            st.markdown(
+                f"<p class='mpt-empty-state'>{html.escape(tr('Login No Channels'))}</p>",
+                unsafe_allow_html=True,
+            )
+            return
+
+        st.caption(tr("Login Remembered Note"))
+        columns = st.columns(3)
+        for index, channel in enumerate(channels):
+            with columns[index % 3]:
+                with st.container(key=f"login_card_{channel}", border=True):
+                    st.markdown(f"**{html.escape(channel)}**")
+                    info = _cached_youtube_channel_info(channel)
+                    if info.get("success"):
+                        st.success(
+                            tr("Pipeline Publish Connected").format(
+                                name=html.escape(
+                                    str(info.get("channel_name") or channel)
+                                )
+                            )
+                        )
+                        if info.get("channel_mismatch"):
+                            st.warning(tr("Channel Mismatch Warning"))
+                    else:
+                        st.warning(tr("Pipeline Publish Missing"))
+                    _render_youtube_connect_button(
+                        channel,
+                        button_key=f"login_signin_{channel}",
+                        result_key=f"login_result_{channel}",
+                    )
+                    _render_youtube_login_detail(
+                        channel, result_key=f"login_result_{channel}"
+                    )
+
+
+def _page_plan():
+    """左侧导航「计划」：今天的待办主题、频道覆盖、草稿预览、本月记录。"""
+    with st.container(key="page_plan"):
+        _render_plan_panel()
+
+
+def _page_library():
+    """左侧导航「成片库」：按频道列出归档成片，并提供发布入口。"""
+    with st.container(key="page_library"):
+        _render_media_library()
+
+
+_COPYRIGHT_VERDICT_BADGES = {
+    "low": "mpt-badge--posted",
+    "medium": "mpt-badge--warn",
+    "high": "mpt-badge--broken",
+}
+
+_COPYRIGHT_VERDICT_LABELS = {
+    "low": "Copyright Verdict Low",
+    "medium": "Copyright Verdict Medium",
+    "high": "Copyright Verdict High",
+}
+
+
+def _render_copyright_report(report: dict):
+    """审计报告：总 verdict + 逐项来源与风险 + 能力边界声明。"""
+    verdict = report.get("verdict", "medium")
+    st.markdown(
+        f'<p><span class="mpt-badge {html.escape(_COPYRIGHT_VERDICT_BADGES.get(verdict, "mpt-badge--draft"))}">'
+        f'{html.escape(tr(_COPYRIGHT_VERDICT_LABELS.get(verdict, "Copyright Verdict Medium")))}'
+        f"</span></p>",
+        unsafe_allow_html=True,
+    )
+    for item in report.get("items", []):
+        with st.container(key=f"copyright_item_{item.get('kind')}", border=True):
+            risk = item.get("risk", "medium")
+            st.markdown(
+                f'<p class="mpt-media-caption">'
+                f'<span class="mpt-badge {html.escape(_COPYRIGHT_VERDICT_BADGES.get(risk, "mpt-badge--draft"))}">'
+                f'{html.escape(tr(_COPYRIGHT_VERDICT_LABELS.get(risk, "Copyright Verdict Medium")))}'
+                f"</span>"
+                f"<span>{html.escape(tr(item.get('title_key', '')))}"
+                f" · {html.escape(str(item.get('source_name', '')))}"
+                f"</span></p>",
+                unsafe_allow_html=True,
+            )
+            note_template = tr(item.get("note_key", ""))
+            try:
+                note = note_template.format(name=str(item.get("source_name", "")))
+            except (KeyError, IndexError, ValueError):
+                note = note_template
+            st.caption(note)
+    st.caption(tr("Copyright Disclaimer"))
+
+
+def _page_copyright():
+    """左侧导航「版权检查」：对一条成片做素材来源审计，发布前看风险。"""
+    with st.container(key="page_copyright"):
+        st.markdown(
+            f'<div class="mpt-hero">'
+            f'<p class="mpt-hero-badge">{html.escape(tr("Copyright Hero Badge"))}</p>'
+            f'<p class="mpt-hero-title">{html.escape(tr("Copyright Hero Title"))}</p>'
+            f'<p class="mpt-hero-sub">{html.escape(tr("Copyright Hero Sub"))}</p>'
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        candidates = [
+            task
+            for task in _collect_task_summaries(limit=30)
+            if task.get("video_file")
+        ]
+        if not candidates:
+            st.markdown(
+                f"<p class='mpt-empty-state'>{html.escape(tr('Copyright No Video'))}</p>",
+                unsafe_allow_html=True,
+            )
+            return
+
+        options = [task["task_id"] for task in candidates]
+        by_id = {task["task_id"]: task for task in candidates}
+        # 任务可能在别处被删掉（任务管理里删成片是日常操作），而下拉框的上次
+        # 选择还留在会话里。带着一个已不存在的 id 进 selectbox，生产环境会
+        # 直接整页报错；先把它收敛回首个有效选项。
+        saved_pick = st.session_state.get("copyright_task_select")
+        if saved_pick is not None and saved_pick not in options:
+            st.session_state["copyright_task_select"] = options[0]
+        # Triage at a glance: each row carries its risk verdict, so the queue
+        # reads worst-first instead of forcing a click per video. Same cost
+        # class as the task scans above (one small JSON read per task).
+        verdicts = {}
+        for task in candidates:
+            script_data = _safe_load_task_script(task.get("task_path", ""))
+            params = script_data.get("params", {}) if script_data else {}
+            verdicts[task["task_id"]] = copyright_audit_service.audit_video_assets(
+                params
+            )["verdict"]
+        selected_id = st.selectbox(
+            tr("Copyright Pick Video"),
+            options=options,
+            format_func=lambda task_id: (
+                f"{tr(_COPYRIGHT_VERDICT_LABELS.get(verdicts.get(task_id, 'medium'), 'Copyright Verdict Medium'))}"
+                f" — {_format_task_subject(by_id[task_id].get('subject'), max_length=36)}"
+            ),
+            key="copyright_task_select",
+        )
+        stored = st.session_state.get("copyright_report") or {}
+        if stored.get("task_id") != selected_id:
+            stored = {}
+        if st.button(
+            tr("Copyright Check"),
+            key="copyright_check_button",
+            type="primary",
+            icon=":material/shield:",
+        ):
+            task = by_id[selected_id]
+            script_data = _safe_load_task_script(task.get("task_path", ""))
+            params = script_data.get("params", {}) if script_data else {}
+            stored = {
+                "task_id": selected_id,
+                "report": copyright_audit_service.audit_video_assets(params),
+            }
+            st.session_state["copyright_report"] = stored
+        if stored.get("report"):
+            _render_copyright_report(stored["report"])
+
+
+def _page_campaign():
+    """左侧导航「活动」：从 brief 生成成套可发布内容。"""
+    with st.container(key="page_campaign"):
+        _render_campaign_panel()
+
+
+def _page_settings():
+    """左侧导航「设置」：模型、素材源、语音、接口与缓存。
+
+    这一屏是**页面**而不是弹窗——弹窗关掉之后主区域会空着，用户会以为页面坏了。
+    顶部栏那个设置按钮保留 Dialog 形态，供"临时改一个 key 就走"的场景使用。
+    """
+    with st.container(key="page_settings"):
+        _render_settings_body()
+
+
+# ── 工具台 ──────────────────────────────────────────────────────────────
+#
+# 参考设计是一张卡片网格：每张卡一个能力，配一句"它做什么"和一个入口。我们照它的
+# 形制做，但**状态必须是真的**——参考设计里 7 张卡长得一模一样，因为它背后是一个
+# 封闭产品；本应用的能力要靠本地模型、免费额度的 key、乃至二进制才可能跑起来，
+# 于是"能不能用"是每张卡各自不同的一件事。把它显示出来，比事后让用户在点下去之后
+# 才发现强。
+#
+# 每张卡的三种状态：
+#   ready       现在就能用
+#   needs_setup 缺凭据/缺前置条件，CTA 变成"去配置"并跳设置页
+#   waiting     依赖上一步的产物（缩略图要先有完成的��务），说清还差什么
+#
+# ``orb`` 字段是这张卡对应的思考动效状态。``app/services/orbs.py`` 早就把业务动作
+# 映射好了，其中大半此前没有任何调用点——把它们接回真实的操作，卡片上的图标才不是
+# 凭空选的装饰。
+_TOOLS_BENCH_TOOLS = [
+    {
+        "key": "script",
+        "title": "Bench Script",
+        "desc": "Bench Script Desc",
+        "icon": ":material/description:",
+        "orb": "composing",
+        "ready_when": "llm",
+        "target": ("generate", "focus_script"),
+        "cta": "Bench Try Now",
+    },
+    {
+        "key": "footage",
+        "title": "Bench Footage",
+        "desc": "Bench Footage Desc",
+        "icon": ":material/perm_media:",
+        "orb": "searching",
+        "ready_when": "media",
+        "target": ("generate", "focus_footage"),
+        "cta": "Bench Try Now",
+    },
+    {
+        "key": "voice",
+        "title": "Bench Voice",
+        "desc": "Bench Voice Desc",
+        "icon": ":material/record_voice_over:",
+        "orb": "listening",
+        "ready_when": "tts",
+        "target": ("generate", "focus_voice"),
+        "cta": "Bench Try Now",
+    },
+    {
+        "key": "subtitles",
+        "title": "Bench Subtitles",
+        "desc": "Bench Subtitles Desc",
+        "icon": ":material/subtitles:",
+        # 字幕排版完全在本地跑，不需要任何 key，因此永远就绪。
+        "orb": "working",
+        "ready_when": "always",
+        "target": ("generate", "focus_subtitles"),
+        "cta": "Bench Try Now",
+    },
+    {
+        "key": "assembly",
+        "title": "Bench Assembly",
+        "desc": "Bench Assembly Desc",
+        "icon": ":material/movie_edit:",
+        "orb": "working",
+        "ready_when": "always",
+        "target": ("generate", "focus_generate"),
+        "cta": "Bench Try Now",
+    },
+    {
+        "key": "thumbnails",
+        "title": "Bench Thumbnails",
+        "desc": "Bench Thumbnails Desc",
+        "icon": ":material/image:",
+        "orb": "shaping",
+        "ready_when": "has_task",
+        "target": ("generate", "open_tasks"),
+        "cta": "Bench Try Now",
+    },
+    {
+        "key": "campaign",
+        "title": "Bench Campaign",
+        "desc": "Bench Campaign Desc",
+        "icon": ":material/campaign:",
+        "orb": "composing",
+        "ready_when": "llm",
+        "target": ("campaign", None),
+        "cta": "Bench Try Now",
+    },
+    {
+        "key": "plan",
+        "title": "Bench Plan",
+        "desc": "Bench Plan Desc",
+        "icon": ":material/calendar_month:",
+        "orb": "solving",
+        "ready_when": "always",
+        "target": ("plan", None),
+        "cta": "Bench Try Now",
+    },
+    {
+        "key": "library",
+        "title": "Bench Library",
+        "desc": "Bench Library Desc",
+        "icon": ":material/video_library:",
+        "orb": "breathing",
+        "ready_when": "always",
+        "target": ("library", None),
+        "cta": "Bench Try Now",
+    },
+]
+
+
+# 就绪度判定的唯一口径：**当前选中的那一个**有没有配齐，而不是"有没有配过别的"。
+#
+# 此前三张卡（脚本、素材、配音）都是"任一凭据即就绪"：配了 Coverr 的 key、素材源
+# 选的却是 Pexels，卡片照样显示 Ready，点进去生成时才被提交校验拦下。提交校验
+# （_render_generation_controls）本来就是按选中项逐项 gate 的，这里的判定必须与它
+# 同构，否则"Ready"就是一句谎言。TTS 的 key 还分散在各自的配置段里
+# （[elevenlabs]、[siliconflow]、[fish_audio]……），判定必须走运行时真正读的那些
+# 解析函数，而不是猜一个 [app] 段里的同名键。
+def _has_cred(*values) -> bool:
+    """任一值非空即为已配置。图库 key 可能是字符串或数组，两种都接受。"""
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            if any(str(item or "").strip() for item in value):
+                return True
+        elif str(value or "").strip():
+            return True
+    return False
+
+
+_TTS_SERVER_LABELS = {
+    "azure-tts-v1": "Azure TTS V1",
+    "azure-tts-v2": "Azure TTS V2",
+    "siliconflow": "SiliconFlow TTS",
+    "gemini-tts": "Google Gemini TTS",
+    "mimo-tts": "Xiaomi MiMo TTS",
+    "minimax-tts": "MiniMax TTS",
+    "elevenlabs": "ElevenLabs TTS",
+    "chatterbox": "Chatterbox TTS",
+    "fish_audio": "Fish Audio TTS",
+}
+
+_MEDIA_SOURCE_LABELS = {
+    "pexels": "Pexels",
+    "pixabay": "Pixabay",
+    "coverr": "Coverr",
+    "wavespeed": "WaveSpeed",
+    "volcengine_seedance": "Seedance",
+    "loomloom": "LoomLoom",
+    "local": "Local files",
+}
+
+
+def _selected_llm_detail() -> tuple[bool, str]:
+    """所选 LLM Provider 是否可调用。返回 ``(就绪, 提供方 id)``。
+
+    镜像 app/services/llm.py 的准入判定：注册表里找不到、要 key 没 key、必填
+    附加字段缺失，运行时都会直接抛错。这里提前说出来，而不是等任务失败。
+    模型名与地址都有内置回退（resolve_*），只在回退后仍为空时才算缺失。
+    """
+    try:
+        provider_id = str(
+            config.app.get("llm_provider", "") or DEFAULT_LLM_PROVIDER_ID
+        ).lower()
+        provider = get_llm_provider(provider_id)
+        if provider is None:
+            return False, provider_id
+        if provider_id == "ollama":
+            # 与运行时一致：地址按运行环境推导，不需要 key。
+            return True, provider_id
+        if provider.requires_api_key and not _has_cred(
+            config.app.get(provider.config_key("api_key"))
+        ):
+            return False, provider_id
+        model_name = provider.resolve_model_name(
+            config.app.get(provider.config_key("model_name"), "")
+        )
+        if provider.requires_model_name and not model_name:
+            return False, provider_id
+        base_url = provider.resolve_base_url(
+            config.app.get(provider.config_key("base_url"), "")
+        )
+        if provider.requires_base_url and not base_url:
+            return False, provider_id
+        for field in provider.extra_fields:
+            if field.required:
+                value = config.app.get(
+                    provider.config_key(field.config_suffix), ""
+                ) or field.default_value
+                if not str(value or "").strip():
+                    return False, provider_id
+        return True, provider_id
+    except Exception as exc:  # noqa: BLE001 - 判定失败按"未就绪"处理
+        logger.debug(f"selected llm readiness check failed: {exc}")
+        return False, ""
+
+
+def _missing_key_message(name: str) -> str:
+    """未就绪时的说明：先点名缺的是哪一项，再保留通用引导句。"""
+    specific = tr("Bench Needs Key For").format(name=name)
+    return f"{specific} {tr('Bench Needs Key')}"
+
+
+def _selected_media_state() -> tuple[str, str]:
+    """所选素材源是否可拉取。返回 ``(状态, 缺什么)``。"""
+    source = str(config.app.get("video_source", "") or "pexels")
+    label = _MEDIA_SOURCE_LABELS.get(source, source)
+    if source == "local":
+        # 本地素材在生成页现场选择，工具台上无法"就绪"，也不能叫"待配置"
+        # （设置页里没有能填的东西）。waiting 会把用户送去生成页，正好是
+        # 选文件的地方。
+        return "waiting", tr("Bench Needs Local Files")
+    try:
+        if source == "loomloom":
+            ok = _has_cred(config.app.get("loomloom_api_token"))
+        elif source == "wavespeed":
+            ok = _has_cred(config.app.get("wavespeed_api_keys"))
+        elif source == "volcengine_seedance":
+            ok = volcengine_seedance.is_enabled(
+                config.snapshot_config_with_pending(config.app)
+            )
+        elif source in ("pexels", "pixabay", "coverr"):
+            ok = _has_cred(
+                config.app.get(f"{source}_api_keys"),
+                config.app.get(f"{source}_api_key"),
+            )
+        else:
+            # 提交校验会以 "Please Select a Valid Video Source" 拒绝它。
+            return "needs_setup", _missing_key_message(label)
+    except Exception as exc:  # noqa: BLE001 - 判定失败按"未就绪"处理
+        logger.debug(f"selected media readiness check failed: {exc}")
+        return "needs_setup", _missing_key_message(label)
+    if ok:
+        return "ready", ""
+    return "needs_setup", _missing_key_message(label)
+
+
+def _selected_tts_state() -> tuple[str, str]:
+    """所选配音链路是否可发声。返回 ``(状态, 缺什么)``。"""
+    server = str(config.ui.get("tts_server", "") or "azure-tts-v1")
+    mode = config.ui.get("voice_mode")
+    if mode not in {VOICE_MODE_TTS, VOICE_MODE_UPLOAD, VOICE_MODE_NONE}:
+        # 与音频面板的默认逻辑保持一致：无配音哨兵才进无配音，否则自动配音。
+        mode = (
+            VOICE_MODE_NONE
+            if server == voice.NO_VOICE_NAME
+            else VOICE_MODE_TTS
+        )
+    if mode == VOICE_MODE_NONE:
+        return "ready", ""
+    if mode == VOICE_MODE_UPLOAD:
+        # 音频文件在生成页现场上传，同样只能是 waiting，目标正是生成页。
+        return "waiting", tr("Bench Needs Upload Audio")
+    label = _TTS_SERVER_LABELS.get(server, server)
+    try:
+        if server in ("azure-tts-v1", "azure-tts-v2"):
+            # 运行时两个缺一即抛错，只配 key 不配 region 照样失败。
+            ok = _has_cred(
+                _safe_config_get(config.azure, "speech_key")
+            ) and _has_cred(_safe_config_get(config.azure, "speech_region"))
+        elif server == "siliconflow":
+            ok = _has_cred(_safe_config_get(config.siliconflow, "api_key"))
+        elif server == "gemini-tts":
+            ok = _has_cred(config.app.get("gemini_api_key"))
+        elif server == "mimo-tts":
+            ok = _has_cred(config.app.get("mimo_api_key"))
+        elif server == "minimax-tts":
+            # 与运行时同一解析顺序：独立段 → [app] 段 → 环境变量。
+            ok = _has_cred(voice.get_minimax_tts_api_key())
+        elif server == "elevenlabs":
+            ok = _has_cred(voice.get_elevenlabs_api_key())
+        elif server == "chatterbox":
+            # 自托管服务：配了地址即视为配好，服务是否在线是运行时的事。
+            ok = _has_cred(_safe_config_get(config.chatterbox, "base_url"))
+        elif server == "fish_audio":
+            ok = _has_cred(voice.get_fish_audio_api_key())
+        else:
+            return "needs_setup", _missing_key_message(label)
+    except Exception as exc:  # noqa: BLE001 - 判定失败按"未就绪"处理
+        logger.debug(f"selected tts readiness check failed: {exc}")
+        return "needs_setup", _missing_key_message(label)
+    if ok:
+        return "ready", ""
+    return "needs_setup", _missing_key_message(label)
+
+
+def _summaries_show_finished(summaries) -> bool:
+    """任务摘要里是否存在已完成的成片。纯判定，可独立测试。"""
+    for item in summaries or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("video_file"):
+            return True
+        if _normalize_task_state(item.get("state")) == const.TASK_STATE_COMPLETE:
+            return True
+    return False
+
+
+def _bench_tool_state(tool) -> tuple[str, str]:
+    """这张卡现在处于什么状态，返回 ``(状态, 缺什么)``。
+
+    状态判定只有三个来源：所选能力的真实配置（与提交校验同构）、有没有跑完的
+    任务（产物）、以及"永远就绪"（纯本地能力）。"配过别的 key"不算就绪——那
+    正是之前满屏 Ready 点进去却失败的原因。
+    """
+    ready_when = tool.get("ready_when", "always")
+    if ready_when == "always":
+        return "ready", ""
+
+    if ready_when == "llm":
+        ok, provider_id = _selected_llm_detail()
+        if ok:
+            return "ready", ""
+        if provider_id:
+            return "needs_setup", _missing_key_message(provider_id)
+        return "needs_setup", tr("Bench Needs Key")
+
+    if ready_when == "media":
+        return _selected_media_state()
+
+    if ready_when == "tts":
+        return _selected_tts_state()
+
+    if ready_when == "has_task":
+        # 缩略图只能挂在一条**已完成**的任务上（渲染入口只在生成视图的任务快照里），
+        # 所以没有任务时这张卡该说的是"还差什么"，而不是"点进去是空的"。
+        # 注意不能只读会话里的 active 标记：那份字典只登记"刚提交"，从不写回终态，
+        # 在这里读它等于永远 waiting。直接看任务摘要（历史 + 运行态），与任务面板
+        # 是同一份事实来源。
+        try:
+            finished = _summaries_show_finished(_collect_task_summaries(limit=20))
+        except Exception as exc:  # noqa: BLE001 - 判定失败按"没有成片"处理
+            logger.debug(f"thumbnail readiness check failed: {exc}")
+            finished = False
+        if finished:
+            return "ready", ""
+        return "waiting", tr("Bench Needs Finished Task")
+
+    return "ready", ""
+
+
+def _render_tools_bench():
+    """工具台：一屏看全所有能力，以及每一项此刻能不能用。"""
+    st.markdown(
+        f'<p class="mpt-bench-eyebrow">{html.escape(tr("Bench Eyebrow"))}</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"## {html.escape(tr('Bench Title'))}")
+    st.markdown(
+        f'<p class="mpt-bench-subtitle">{html.escape(tr("Bench Subtitle"))}</p>',
+        unsafe_allow_html=True,
+    )
+
+    columns = st.columns(3)
+    for index, tool in enumerate(_TOOLS_BENCH_TOOLS):
+        with columns[index % 3]:
+            _render_bench_card(tool)
+
+
+_BENCH_STATE_LABELS = {
+    "ready": "Bench State Ready",
+    "needs_setup": "Bench State Needs Setup",
+    "waiting": "Bench State Waiting",
+}
+
+
+def _render_bench_card(tool):
+    """一张工具卡。整张卡可点，状态与 CTA 按真实就绪度变化。"""
+    state, missing = _bench_tool_state(tool)
+    view, action = tool["target"]
+    title = tr(tool["title"])
+
+    with st.container(key=f"bench_card_{tool['key']}"):
+        # 参考设计的每张卡顶部都有一块浅色视觉区。本应用没有定制 3D 素材，就用
+        # 同一家族的单色渐变 + 首字母字标来表达——比一张通用图库插画诚实，也比
+        # 一个空白盒子少很多"图片加载失败"的误会。色调按 data-card 区分。
+        st.markdown(
+            f'<div class="mpt-bench-visual" data-card="{html.escape(tool["key"])}">'
+            f'<span class="mpt-bench-visual__mark">{html.escape(title[:1])}</span>'
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="mpt-bench-body">'
+            f'<div class="mpt-bench-head"'
+            f' data-card="{html.escape(tool["key"])}"'
+            f' data-state="{html.escape(state)}">'
+            f'<span class="mpt-bench-title">{html.escape(title)}</span>'
+            f'<span class="mpt-bench-flag">'
+            f'{html.escape(tr(_BENCH_STATE_LABELS[state]))}</span>'
+            f"</div>"
+            f'<p class="mpt-bench-desc">{html.escape(tr(tool["desc"]))}</p>'
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        if missing:
+            st.caption(missing)
+
+        # 未就绪的卡不跳到那个能力上去——跳过去只会让人对着一个空的控件发呆。
+        # 它跳到设置页，并把缺的那项说清楚。这是"能点"与"点了有用"的区别。
+        if state == "needs_setup":
+            cta_label = tr("Bench Configure")
+            target_view = "settings"
+        else:
+            cta_label = f"{tr(tool['cta'])} →"
+            target_view = view
+
+        # 一律用次级按钮。九张卡九个实心主按钮会把整屏变成一片红，而"一屏一个
+        # 主操作"正是参考设计让密集界面显得安静的原因。卡片的按钮是入口提示，
+        # 不是这一屏要你做的事。
+        if st.button(
+            cta_label,
+            key=f"bench_go_{tool['key']}",
+            width="stretch",
+            type="secondary",
+            icon=tool["icon"],
+        ):
+            if action == "open_tasks":
+                st.session_state["task_manager_open"] = True
+            elif action:
+                st.session_state["bench_focus"] = action
+            st.session_state[_NAV_REQUEST_KEY] = target_view
+            st.rerun()
+
+
+def _page_bench():
+    """左侧导航「工具台」：所有能力的一屏总览。"""
+    with st.container(key="page_bench"):
+        _render_tools_bench()
+
+
+# 参考设计的工具台里有七张卡，本应用只实现了其中一部分。这里照它的形制列出
+# **尚未实现**的能力，每一张都明确标注"待实现"，并写清缺什么。对照关系：
+#   Script Writer   → 已有（Bench Script）
+#   Prompt Builder  → 待实现（电影感提示词改写）
+#   Video Generator → 部分有（素材拼装 + AI 片段服务），纯 AI 成片仍是路线图
+#   Image Generator → 待实现（配图/缩略图底图仍需外部准备）
+#   AI Ad Generator → 待实现（多角度广告变体）
+#   Skit Builder    → 待实现（多镜分场）
+#   AI Voiceover    → 已有（Bench Voice）
+#   Auto Captions   → 部分有（字幕排版已有，成片级导出预设待实现）
+#   Video Editor    → 待实现（时间线剪辑）
+_ROADMAP_TOOLS = [
+    {
+        "key": "prompt_builder",
+        "title": "Roadmap Prompt Builder",
+        "desc": "Roadmap Prompt Builder Desc",
+        "icon": ":material/auto_fix:",
+        "needs": "Roadmap Prompt Builder Needs",
+    },
+    {
+        "key": "ai_image",
+        "title": "Roadmap AI Image",
+        "desc": "Roadmap AI Image Desc",
+        "icon": ":material/image:",
+        "needs": "Roadmap AI Image Needs",
+    },
+    {
+        "key": "skit_builder",
+        "title": "Roadmap Skit Builder",
+        "desc": "Roadmap Skit Builder Desc",
+        "icon": ":material/theater_comedy:",
+        "needs": "Roadmap Skit Builder Needs",
+    },
+    {
+        "key": "timeline_editor",
+        "title": "Roadmap Timeline Editor",
+        "desc": "Roadmap Timeline Editor Desc",
+        "icon": ":material/filmstrip:",
+        "needs": "Roadmap Timeline Editor Needs",
+    },
+    {
+        "key": "ad_variants",
+        "title": "Roadmap Ad Variants",
+        "desc": "Roadmap Ad Variants Desc",
+        "icon": ":material/campaign:",
+        "needs": "Roadmap Ad Variants Needs",
+    },
+    {
+        "key": "generation_search",
+        "title": "Roadmap Search",
+        "desc": "Roadmap Search Desc",
+        "icon": ":material/search:",
+        "needs": "Roadmap Search Needs",
+    },
+]
+
+
+def _render_roadmap_bench():
+    """未实现能力的占位卡片。"""
+    with st.expander(tr("Roadmap Bench"), expanded=False):
+        st.caption(tr("Roadmap Bench Note"))
+        columns = st.columns(3)
+        for index, tool in enumerate(_ROADMAP_TOOLS):
+            with columns[index % 3]:
+                st.markdown(
+                    f'<div class="mpt-bench-card">'
+                    f'<p class="mpt-bench-title">{html.escape(tr(tool["title"]))}</p>'
+                    f'<p class="mpt-bench-desc">{html.escape(tr(tool["desc"]))}</p>'
+                    f'<p class="mpt-bench-badge">{html.escape(tr("Roadmap Badge"))}</p>'
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                st.button(
+                    tr("Roadmap Not Yet"),
+                    key=f"roadmap_{tool['key']}",
+                    disabled=True,
+                    width="stretch",
+                    help=tr(tool["needs"]),
+                )
+
+
+def _page_generate():
+    """左侧导航「生成」：脚本、素材、音频、字幕四组参数 + 唯一的生成按钮。
+
+    这一页刻意只放参数和一个主动作。计划、成片库、活动各有自己的页面，不再和参数
+    挤在同一屏——之前它们是三个折叠面板叠在参数区上方，展开与否都会重绘，真正每天
+    要用的"填参数、点生成"被挤到了页面最下面。
+    """
+    with st.container(key="page_generate"):
+        # 参考设计的每个工具页顶部都是一组居中 hero：小徽章 + 大标题 + 一句副标题。
+        # 生成页的四个参数面板就是本应用的"工具区"，hero 让它读起来像一个工具，
+        # 而不是一张配置表。
+        st.markdown(
+            f'<div class="mpt-hero">'
+            f'<p class="mpt-hero-badge">{html.escape(tr("Generate Hero Badge"))}</p>'
+            f'<p class="mpt-hero-title">{html.escape(tr("Generate Hero Title"))}</p>'
+            f'<p class="mpt-hero-sub">{html.escape(tr("Generate Hero Sub"))}</p>'
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        with st.container(key="main_settings_grid"):
+            panel = st.columns(4)
+
+        params = VideoParams(video_subject="")
+        params.match_materials_to_script = bool(
+            st.session_state.get("match_materials_to_script", False)
+        )
+        _render_script_settings(panel[0], params)
+        uploaded_files = _render_video_settings(panel[1], params)
+        uploaded_audio_file, uploaded_bgm_file, voice_mode = _render_audio_settings(
+            panel[2], params
+        )
+        _render_subtitle_settings(panel[3], params)
+
+        # 计划页在另一个页面读这份快照来画预览，因此每次都要更新。
+        st.session_state["form_params_snapshot"] = params.model_copy(deep=True)
+
+        _render_roadmap_bench()
+
+        generation_submitted = _render_generation_controls(
+            params,
+            uploaded_files,
+            uploaded_audio_file,
+            uploaded_bgm_file,
+            voice_mode,
+        )
+
+        # 生成分支在启动后台线程前已经请求过保存。普通控件交互继续请求非阻塞保存；
+        # 如果后台任务正在使用配置，配置层会在任务结束时自动应用并落盘最新值。
+        if not generation_submitted:
+            _save_runtime_config()
+
+
+# 左侧导航按**工作阶段**分组，而不是按功能罗列。
+#
+# 分组依据是"这条视频走到哪一步了"：先计划、再生成、最后成片与发布。功能罗列
+# （比如"设置 / 计划 / 库 / 活动"）在条目变多之后用户得自己记住每个入口属于哪一段，
+# 而分组之后位置本身就说明了顺序。
+_NAV_GROUPS = [
+    # 登录屏放在最上面并作为落地页：先连好各频道的 YouTube 账号，发布链路才是
+    # 通的；否则用户在媒体库点发布时才发现没登录。连过的 token 存在本机，
+    # 之后打开直接是已连接状态，不需要重复操作。
+    ("Nav Group Account", [
+        ("login", "Nav Login", ":material/login:", "Nav Login Hint"),
+    ]),
+    ("Nav Group Bench", [
+        ("bench", "Nav Bench", ":material/grid_view:", "Nav Bench Hint"),
+    ]),
+    ("Nav Group Plan", [
+        ("plan", "Nav Plan", ":material/calendar_month:", "Nav Plan Hint"),
+    ]),
+    ("Nav Group Create", [
+        ("generate", "Nav Generate", ":material/movie_edit:", "Nav Generate Hint"),
+        ("campaign", "Nav Campaign", ":material/campaign:", "Nav Campaign Hint"),
+    ]),
+    ("Nav Group Library", [
+        ("library", "Nav Library", ":material/video_library:", "Nav Library Hint"),
+        ("copyright", "Nav Copyright", ":material/shield:", "Nav Copyright Hint"),
+    ]),
+    ("Nav Group System", [
+        ("settings", "Nav Settings", ":material/settings:", "Nav Settings Hint"),
+    ]),
+]
+
+# 扁平视图表，保留给"某个键对应哪一屏"的查表使用
+_NAV_VIEWS = {
+    key: (title, icon)
+    for _group, items in _NAV_GROUPS
+    for key, title, icon, _hint in items
+}
+
+# 落地页。默认值放在常量里而不是散在两处：导航栏读它、视图分发用它兜底，
+# 两边必须永远是同一个值。
+_DEFAULT_VIEW = "login"
+
+# 导航请求用的旁路键。直接写 ``st.session_state["nav_view"]`` 会被 Streamlit 拒绝：
+# 那个键属于左侧导航的 radio 控件，控件一旦创建，本轮就不能再从代码里改它。
+# 于是需要跳转的地方只写这个旁路键，由导航栏在**创建控件之前**消费。
+_NAV_REQUEST_KEY = "_nav_requested_view"
+
+_VIEW_RENDERERS = {
+    "login": _page_login,
+    "bench": _page_bench,
+    "generate": _page_generate,
+    "plan": _page_plan,
+    "library": _page_library,
+    "copyright": _page_copyright,
+    "campaign": _page_campaign,
+    "settings": _page_settings,
+}
+
+
+def _safe_config_get(section, key, default=""):
+    """从配置段里取值，段本身缺失或不是字典时退回默认值。
+
+    ``config.azure`` 这类段在用户删掉整段配置后会变成 None 或非字典，直接下标
+    会把"读取凭据"这种无害操作变成崩溃——而崩溃发生在渲染侧栏的时候。
+    """
+    try:
+        if not isinstance(section, dict):
+            return default
+        value = section.get(key, default)
+    except Exception:  # noqa: BLE001 - 取值失败按"没配"处理
+        return default
+    return default if value is None else value
+
+
+def _free_tool_readiness() -> list[tuple[bool, str]]:
+    """每一项能力当前是否可用，返回 ``(是否就绪, 名称)``。
+
+    口径与工具台卡片完全一致：看**当前选中的**提供方/素材源/配音服务有没有配齐，
+    而不是"有没有配过别的"。侧栏这张卡只是把同样的三个结论数出来。
+    """
+    llm_ok, _ = _selected_llm_detail()
+    checks = [(llm_ok, tr("Free Tool Script"))]
+
+    media_state, _ = _selected_media_state()
+    checks.append((media_state == "ready", tr("Free Tool Media")))
+
+    tts_state, _ = _selected_tts_state()
+    checks.append((tts_state == "ready", tr("Free Tool Voice")))
+    return checks
+
+
+def _render_navigation_rail():
+    """左侧导航栏，返回当前选中的视图。
+
+    这里用 ``st.sidebar`` 里的 radio，而不是 ``st.navigation``：两者外观一样，都是
+    左侧竖排导航，但后者把每个页面变成独立脚本，AppTest 无法切页——那意味着媒体库、
+    计划面板、设置页的几十个既有用例全部失去被测能力。radio 只是一个 session_state
+    键，测试里 ``app.session_state["nav_view"] = "plan"`` 就能走到那一屏。
+
+    每个条目带一行说明，理由和参考设计一致：一个光有图标和标题的竖排列表，
+    隔几周回来就忘了每个入口是干什么的；一行 6 个字的副标题比一次点击去试探便宜。
+    """
+    # 必须在 radio 创建之前落实跳转请求，否则会撞上 Streamlit 的
+    # "cannot be modified after the widget with key ... is instantiated"。
+    requested = st.session_state.pop(_NAV_REQUEST_KEY, None)
+    if requested in _NAV_VIEWS:
+        st.session_state["nav_view"] = requested
+
+    selected = st.session_state.get("nav_view", _DEFAULT_VIEW)
+    # 记下这一屏到底是哪一屏。落地页是"没设过就算出来的"默认值，不写回 session
+    # 状态的话，没有任何地方能知道用户此刻站在哪一屏上——包括测试。写回之后，
+    # "落地页是不是工具台"就是一件可以被断言的事，而不是只能靠肉眼看截图。
+    st.session_state["nav_view"] = selected
+    with st.sidebar:
+        st.markdown(f"**{tr('App Brand')}**")
+        # 参考设计的侧栏顶部是一个深色 "+ New video" 主按钮：它是全应用唯一
+        # 常驻的主操作。生成页才是本应用的"新视频"入口，点它即切过去。
+        if st.button(
+            f"+ {tr('New Video')}",
+            key="nav_new_video",
+            type="primary",
+            width="stretch",
+        ):
+            st.session_state[_NAV_REQUEST_KEY] = "generate"
+            st.session_state["bench_focus"] = "focus_generate"
+            st.rerun()
+        st.caption(tr("Navigation Hint"))
+        st.divider()
+        for group_title, items in _NAV_GROUPS:
+            st.markdown(f'<p class="mpt-nav-group">{tr(group_title)}</p>',
+                        unsafe_allow_html=True)
+            for key, title, icon, hint in items:
+                is_current = key == selected
+                # 用按钮而不是 radio：需要每条带副标题，而 radio 只能给纯文本选项。
+                # 点击即切换，与 Streamlit 的 st.rerun 语义一致。
+                if st.button(
+                    f"{tr(title)}",
+                    key=f"nav_item_{key}",
+                    type="primary" if is_current else "secondary",
+                    icon=icon,
+                    width="stretch",
+                    help=tr(hint),
+                ):
+                    selected = key
+                    st.session_state["nav_view"] = key
+                    st.rerun()
+        st.divider()
+        _render_free_tools_card()
+    return selected
+
+
+def _render_free_tools_card():
+    """侧栏底部的「免费工具」状态卡。
+
+    这张卡回答的是每个用户第一次都会问、但界面上从没说过的问题：**这些功能真的免费
+    吗？** 本应用只依赖本地能力或带免费额度的服务，额度用完会直接失败而不是扣钱——
+    但这一点此前只存在于文档里，界面上一个字的提示都没有。
+
+    因此把"能不能用"直接摆出来：本地的一律可用；需要额度的显示是否已经配好。
+    不显示额度数字——各家额度与刷新策略差异很大，写死在界面上很快就会过期成谎言。
+    """
+    checks = _free_tool_readiness()
+    ready = sum(1 for ok, _ in checks if ok)
+    total = len(checks)
+
+    # 其它面板（登录卡、版权行、健康条）都是带边框的容器，只有这一张卡还是
+    # 裸文本——视觉层级上它看起来像"剩下的"，而不是"常驻的状态卡"。
+    with st.container(key="free_tools_card", border=True):
+        st.markdown(f"**{tr('Free Tools')}**")
+        if ready == total:
+            st.success(tr("Free Tools Ready").format(ready=ready, total=total))
+        else:
+            st.warning(tr("Free Tools Partial").format(ready=ready, total=total))
+        for ok, label in checks:
+            st.markdown(
+                f'<p class="mpt-free-item">{"✅" if ok else "○"} {html.escape(label)}</p>',
+                unsafe_allow_html=True,
+            )
+        st.caption(tr("Free Tools Note"))
+
+
+def _render_view(view: str):
+    """渲染选中的那一屏。"""
+    renderer = _VIEW_RENDERERS.get(view) or _VIEW_RENDERERS["generate"]
+    renderer()
+
+
+def _render_application():
+    """左侧导航 + 各页面。
+
+    之前所有功能挤在一个长页面上：三个折叠面板 + 四列参数 + 生成按钮。折叠与否都会
+    重绘，真正每天要用的"填参数、点生成"被推到页面最底部，而任务面板每两秒又在整个
+    页面上重画一次，于是"点一下要等半秒"成了日常手感。
+
+    拆成左侧导航之后，每一屏只做一件事，常用的那一屏不再被别的功能挤下去。
+    """
+    _render_top_bar()
 
     if _apply_pending_settings_preset():
         st.success(tr("Settings Preset Imported"))
@@ -7403,47 +9669,16 @@ def _render_application():
     if restore_applied or restore_succeeded:
         st.success(tr("Task Configuration Loaded"))
 
-    with st.expander(tr("Content Plan And Publishing"), expanded=True):
-        _render_plan_panel()
-
-    with st.expander(tr("Generated Videos Library"), expanded=False):
-        _render_media_library()
-
-    with st.expander(tr("Campaign Content Studio"), expanded=False):
-        _render_campaign_panel()
-
-    with st.container(key="main_settings_grid"):
-        panel = st.columns(4)
-    left_panel = panel[0]
-    middle_panel = panel[1]
-    audio_panel = panel[2]
-    right_panel = panel[3]
-
-    params = VideoParams(video_subject="")
-    params.match_materials_to_script = bool(
-        st.session_state.get("match_materials_to_script", False)
-    )
-    _render_script_settings(left_panel, params)
-
-    uploaded_files = _render_video_settings(middle_panel, params)
-    uploaded_audio_file, uploaded_bgm_file, voice_mode = _render_audio_settings(
-        audio_panel, params
-    )
-
-    _render_subtitle_settings(right_panel, params)
-
-    generation_submitted = _render_generation_controls(
-        params,
-        uploaded_files,
-        uploaded_audio_file,
-        uploaded_bgm_file,
-        voice_mode,
-    )
-
-    # 生成分支在启动后台线程前已经请求过保存。普通控件交互继续请求非阻塞保存；
-    # 如果后台任务正在使用配置，配置层会在任务结束时自动应用并落盘最新值。
-    if not generation_submitted:
-        _save_runtime_config()
+    view = _render_navigation_rail()
+    # 任务表放在主区域、当前视图之上。展开时才渲染，关闭时一行都不产生——
+    # 这正是之前用 popover 做不到的事。
+    _render_task_manager_section()
+    # 活动面板的"用作视频主题"要求单击即出片。生成控件住在生成视图上，所以这里
+    # 直接把它切过去——不去改 nav_view：那个键属于导航栏的 radio 控件，本轮
+    # 已经创建过，Streamlit 不允许再从代码里改。
+    if st.session_state.get("campaign_auto_generate"):
+        view = "generate"
+    _render_view(view)
 
 
 _render_application()
