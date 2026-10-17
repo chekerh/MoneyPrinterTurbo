@@ -423,6 +423,8 @@
         "Pipeline Publish Connected": "YouTube 已连接（{name}）",
         "Pipeline Publish Missing": "YouTube 未连接",
         "Pipeline Publish Expired": "之前连过，但保存的登录已过期——请重新登录",
+        "Pipeline Publish Unverified": "已登录——暂时无法验证。请为该项目启用 YouTube Data API 后刷新。",
+        "Channel Signed In Unverified": "已登录并保存在本机，但暂时无法验证连接。重复登录没有用——请确认该项目已启用 YouTube Data API。",
         "Login Preflight": "登录能成功之前必须先设置这两项",
         "Login Preflight TestUsers": "把你要登录的 Google 账号添加到「受众群体 → 测试用户」。没添加之前 Google 会拒绝，并提示「尚未完成 Google 验证流程」。",
         "Login Preflight Production": "随后把同意屏幕切换到「生产环境」。测试模式下 Google 会在 7 天后让保存的登录失效，定时任务会因此每周中断一次。",
@@ -701,6 +703,7 @@
         "YouTube API Setup Help": "在 Google Cloud 启用 YouTube Data API v3 并创建桌面应用 OAuth 凭据，然后在计划页面为每个赛道登录频道。",
         "YouTube OAuth Client ID": "YouTube OAuth 客户端 ID",
         "YouTube OAuth Client Secret": "YouTube OAuth 客户端密钥",
-        "YouTube Auto Publish": "自动发布成片到已连接的 YouTube 频道"
+        "YouTube Auto Publish": "自动发布成片到已连接的 YouTube 频道",
+        "Channel Login Expired": "登录已过期——请重新登录（同意屏幕停在测试模式时，Google 会在 7 天后让保存的登录失效）"
     }
 }

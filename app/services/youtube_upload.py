@@ -82,6 +82,23 @@ def token_path(channel: str) -> str:
     return os.path.join(credentials_root(), f"{_slug(channel)}.json")
 
 
+def has_saved_token(channel: str) -> bool:
+    """这个频道有没有存过授权凭据——**不**调用任何 API。
+
+    界面需要区分三件完全不同的事，而它们此前被混成一句"未登录"：
+
+    * 从来没登录过（本机没有 token）
+    * 登录过、但 token 已失效（``needs_reauth``）
+    * 登录过、token 有效，**只是这次验证没跑通**——例如项目还没启用 YouTube
+      Data API，接口调用被拒。第三种最容易被误报成第一种：用户明明刚看到
+      "authentication flow completed"，界面却说没登录，于是反复重复登录。
+    """
+    try:
+        return os.path.exists(token_path(channel))
+    except Exception:  # noqa: BLE001 - 读不到路径就按"没有"处理
+        return False
+
+
 def is_configured(channel: str = "") -> bool:
     """OAuth 客户端已配置，且（指定频道时）该频道已有 token。"""
     client_id, client_secret = client_credentials()

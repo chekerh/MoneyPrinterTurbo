@@ -8081,6 +8081,12 @@ def _remembered_youtube_login(channel: str, *, result_key: str):
     info = _cached_youtube_channel_info(channel)
     if info.get("success"):
         return {"logged_in": True, **info}
+    # 验证没通过时也必须返回一个"未登录"结果，否则刷新页面后这条状态整个
+    # 消失：用户刚授权完看到"已连接"，刷新一下变成什么都没说，分不清是登录
+    # 丢了还是暂时查不了。只要本机有凭据，就把状态带出去（登录过 vs 从未登录
+    # 的区分由调用方用 has_saved_token 做）。
+    if youtube_upload.has_saved_token(channel):
+        return {"logged_in": False, **info}
     return None
 
 
@@ -8097,6 +8103,15 @@ def _render_youtube_login_detail(channel: str, *, result_key: str):
         st.caption(f"✅ {detail}" + (f" ({channel_id})" if channel_id else ""))
         if login.get("channel_mismatch"):
             st.warning(tr("Channel Mismatch Warning"))
+    elif login.get("needs_reauth"):
+        # token 过期和"查不了"要分开说：过期的根因通常是同意屏幕停在 Testing，
+        # 重新授权之后 7 天还会再坏一次；只说"未登录"会让人以为只是没配过。
+        st.caption(f"⏳ {tr('Channel Login Expired')}")
+    elif youtube_upload.has_saved_token(channel):
+        # 本机确实存着凭据，只是这次**验证没跑通**（最常见：项目还没启用
+        # YouTube Data API）。此时说"未登录"会把用户推进"再登一次"的死循环，
+        # 而重登解决不了接口没通的问题。
+        st.caption(f"🔑 {tr('Channel Signed In Unverified')}")
     else:
         st.caption(f"⚠️ {tr('Channel Not Logged In')}")
 
@@ -8811,6 +8826,11 @@ def _page_login():
                         # 连过、但 token 过期了。这不是"还没连"，是"要重新连"，
                         # 而且多半是同意屏幕停在 Testing 导致的。
                         st.error(tr("Pipeline Publish Expired"))
+                    elif youtube_upload.has_saved_token(channel):
+                        # 关键区分：本机确实存了凭据，只是这次**验证没跑通**
+                        # （最常见的是项目还没启用 YouTube Data API）。说成
+                        # "未登录"会把用户引向重复登录，而重登解决不了这个问题。
+                        st.info(tr("Pipeline Publish Unverified"))
                     else:
                         st.warning(tr("Pipeline Publish Missing"))
                     _render_youtube_connect_button(

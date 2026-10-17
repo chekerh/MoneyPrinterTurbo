@@ -428,3 +428,49 @@ class TestApiNotEnabledIsExplained:
         )
         assert "not enabled" in why
         assert "youtube data api v3" in how.lower()
+
+
+class TestSavedTokenIsNotTheSameAsVerifiedLogin:
+    """本机存了凭据 != 这次验证通过了。
+
+    用户刚看到"authentication flow completed"，界面却说"未登录"——于是反复
+    登录，而重登解决不了真正的原因（项目还没启用 YouTube Data API）。界面必须
+    能区分这三种状态，因为三者的下一步动作完全不同。
+    """
+
+    def test_has_saved_token_reads_the_disk_without_calling_google(self, tmp_path, monkeypatch):
+        from app.services import youtube_upload
+
+        monkeypatch.setattr(youtube_upload, "token_path", lambda ch: str(tmp_path / f"{ch}.json"))
+
+        assert youtube_upload.has_saved_token("niche-a") is False
+
+        (tmp_path / "niche-a.json").write_text("{}")
+        assert youtube_upload.has_saved_token("niche-a") is True
+        # 别的频道不受影响——"给哪个频道登录"是这套流程的基本单位。
+        assert youtube_upload.has_saved_token("niche-b") is False
+
+    def test_a_dead_token_is_still_a_saved_token(self, tmp_path, monkeypatch):
+        """过期要报 needs_reauth，但凭据确实还在磁盘上。
+
+        两个信号都不能丢：前者告诉用户去修同意屏幕，后者保证界面显示的是
+        "登录过但要重登"，而不是从未登录。
+        """
+        from app.services import youtube_upload
+
+        monkeypatch.setattr(youtube_upload, "token_path", lambda ch: str(tmp_path / f"{ch}.json"))
+        (tmp_path / "gone.json").write_text("{}")
+
+        with (
+            patch.object(youtube_upload, "is_configured", return_value=True),
+            patch.object(
+                youtube_upload,
+                "_service_for",
+                side_effect=Exception("invalid_grant: Token has been expired or revoked."),
+            ),
+        ):
+            result = youtube_upload.channel_info("gone")
+
+        assert result["success"] is False
+        assert result["needs_reauth"] is True
+        assert youtube_upload.has_saved_token("gone") is True

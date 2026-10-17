@@ -1168,6 +1168,86 @@ def longform_parse_json(response: str):
     return longform.parse_json_block(response)
 
 
+#: 幻灯片 JSON 的 schema。这几种变体是刻意的：一张通篇只有标题的卡片看起来
+#: 就是"PPT 模板"，而数字卡和引语卡能提供视觉节奏上的对比。
+_SLIDE_SCHEMA = """[
+  {"kind": "section", "kicker": "short label or empty", "title": "headline", "bullets": ["point", "point"]},
+  {"kind": "stat", "stat": "the number or short phrase", "stat_caption": "what the number means"},
+  {"kind": "quote", "quote": "the quoted claim", "attribution": "who said it"},
+  {"kind": "compare", "left": "one side", "right": "the other side"}
+]"""
+
+
+def generate_slide_plan(
+    section_summaries: List[dict],
+    video_subject: str,
+    video_language: str = "",
+    app_config=None,
+):
+    """
+    为长视频规划幻灯片，返回解析后的 JSON。
+
+    每一段至少一张 ``section`` 幻灯片；数字和引语只在内容真的支撑时才用——
+    为了凑版式硬造一个数字，是这类内容最容易露怯的地方。
+    """
+    roster = "\n".join(
+        f"{entry.get('index')}. {entry.get('title') or ''} — "
+        f"{entry.get('intent') or ''}\n"
+        f"   narration starts: {(entry.get('preview') or '')[:260]}"
+        for entry in section_summaries
+    )
+
+    language_rule = (
+        f"Write all slide text in {video_language}." if video_language else ""
+    )
+    prompt = f"""# Role: Explainer Video Slide Planner
+
+## Goals:
+Plan the on-screen cards for a long-form explainer video. Each card replaces the
+stock footage for the stretch of narration it covers, so the card must actually
+say something useful — a viewer should be able to read the card and still follow
+the narration.
+
+## Constraints:
+1. Return ONLY a JSON array matching this schema:
+{_SLIDE_SCHEMA}
+2. Produce exactly one "section" card per section listed below, in the same
+   order. You may insert "stat", "quote" or "compare" cards between them.
+3. 2 to 5 bullets per section card. Each bullet is one line, under 140
+   characters. Never repeat the title as a bullet.
+4. Never write a card that just restates the title. If a section has nothing
+   concrete to put on screen, use its title and the single strongest fact.
+5. Use "stat" only when the narration states a real number, share or
+   magnitude. Never invent a figure to fill the layout.
+6. No slide numbers, no page furniture, no "thank you" or "subscribe" cards.
+7. Card text is display copy: short, concrete, no sentences longer than one line.
+{language_rule}
+
+## Context:
+### Video Subject
+{video_subject}
+
+### Sections
+{roster}
+""".strip()
+
+    logger.info(f"planning slides for {len(section_summaries)} sections")
+
+    response = _generate_response(prompt=prompt, app_config=app_config)
+    if not response or response.startswith("Error: "):
+        raise RuntimeError(
+            f"failed to plan slides: "
+            f"{response.removeprefix('Error: ').strip() if response else 'empty response'}"
+        )
+
+    payload = longform_parse_json(response)
+    if payload is None:
+        raise RuntimeError(
+            f"slide plan response was not parseable JSON: {response[:400]!r}"
+        )
+    return payload
+
+
 # =============================================================================
 # Social publishing metadata
 #

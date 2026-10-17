@@ -27,6 +27,7 @@ from app.services import (
     posting_package,
     section_materials,
     section_render,
+    slide_source,
     sonilo,
     subtitle,
     task_artifacts,
@@ -780,13 +781,138 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
+def get_slide_materials(
+    task_id,
+    params,
+    video_script,
+    longform_plan=None,
+    *,
+    on_progress=None,
+):
+    """
+    ``video_source="slides"`` 的素材阶段：渲染幻灯片并转成素材列表。
+
+    返回的是**图片路径列表**，与 ``video_source="local"`` 分支保持同一种返回
+    形状，因此下游的渲染阶段不需要区分素材是库存视频还是幻灯片截图。
+
+    幻灯片的停留时长由各段口播时长决定（一张幻灯片覆盖一段），所以段数
+    不会远多于幻灯片数；这里不做等分，而是把每段的实际时长挂到对应幻灯片上，
+    让 ``section_render`` 在拼素材轨时用得上。
+    """
+    slides = _plan_slide_content(task_id, params, video_script, longform_plan)
+    if not slides:
+        _mark_task_failed(
+            task_id,
+            "materials",
+            "slide planning produced no usable slides",
+        )
+        return None
+
+    if on_progress:
+        on_progress(45, f"rendering {len(slides)} slides")
+
+    rendered = slide_source.render_slides(
+        slides,
+        output_dir=utils.task_dir(task_id),
+        video_aspect=params.video_aspect,
+    )
+    if not rendered:
+        _mark_task_failed(
+            task_id,
+            "materials",
+            "failed to render slides; check that Playwright chromium is installed",
+        )
+        return None
+
+    logger.info(f"slide materials ready: {len(rendered)} images")
+    return rendered
+
+
+def _plan_slide_content(task_id, params, video_script, longform_plan):
+    """产出幻灯片列表：优先让模型规划，失败或过少时用兜底规划补齐。"""
+    sections = list(longform_plan.outline) if longform_plan else []
+    target_seconds = int(longform_plan.target_seconds) if longform_plan else 0
+
+    slides: list = []
+    if sections:
+        summaries = [
+            {
+                "index": section.index,
+                "title": section.title,
+                "intent": section.intent,
+                "preview": section.text,
+                "duration": round(section.duration, 1),
+            }
+            for section in sections
+        ]
+        try:
+            payload = llm.generate_slide_plan(
+                section_summaries=summaries,
+                video_subject=params.video_subject,
+                video_language=str(getattr(params, "video_language", "") or ""),
+            )
+            slides = slide_source.coerce_slides(payload)
+        except Exception as exc:  # noqa: BLE001 - 降级到兜底规划
+            logger.warning(f"slide planning failed, using fallback: {exc}")
+
+    if not slides:
+        if not sections:
+            # 没有分段（短视频配幻灯片源）：整篇脚本当一段处理。
+            from app.services.longform import Section
+
+            sections = [Section(index=1, title=params.video_subject, text=video_script)]
+            target_seconds = max(
+                longform.words_for_target(
+                    len(video_script.split()), cjk=False
+                )
+                // max(longform.WORDS_PER_SECOND_EN, 1),
+                60,
+            )
+        slides = slide_source.plan_slides(
+            sections,
+            target_seconds=target_seconds or 60,
+            per_section=1,
+        )
+
+    # 幻灯片数量不该少于分段数：一张都没有对应段落的分段会被渲染成素材空档。
+    if sections and len(slides) < len(sections):
+        logger.info(
+            f"slide plan has {len(slides)} slides for {len(sections)} sections; "
+            "padding with fallback slides"
+        )
+        padded = slide_source.plan_slides(
+            sections, target_seconds=target_seconds or 60, per_section=1
+        )
+        slides = (slides + padded)[: len(sections)]
+
+    # 把每段的实际时长挂到对应幻灯片上，供素材轨按真实口播时长取用。
+    cursor = 0.0
+    for section in sections:
+        if cursor >= len(slides):
+            break
+        slides[cursor].duration = max(float(section.duration or 0.0), 0.0)
+        cursor += 1
+    return slides
+
+
 def get_video_materials(
     task_id,
     params,
     video_terms,
     audio_duration,
     loomloom_video_request: loomloom.LoomLoomConfirmedVideoRequest | None = None,
+    longform_plan=None,
+    on_progress=None,
 ):
+    if params.video_source == "slides":
+        logger.info("\n\n## rendering slide materials")
+        return get_slide_materials(
+            task_id,
+            params,
+            getattr(params, "video_script", "") or "",
+            longform_plan=longform_plan,
+            on_progress=on_progress,
+        )
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
@@ -1704,15 +1830,26 @@ def _run_pipeline(
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20)
 
     # 3. Generate audio
-    audio_file, audio_duration, sub_maker = generate_audio(
-        task_id,
-        params,
-        video_script,
-        voice_preview=voice_preview,
-        allow_server_file_input=allow_server_file_input,
-        longform_plan=longform_plan,
-        on_progress=_report_progress if use_longform else None,
-    )
+    # 短视频路径不传 longform_plan / on_progress：这两个参数只对分段 TTS 有
+    # 意义，传进去只会让调用签名在所有下游测试和 mock 上产生无谓的差异。
+    if use_longform:
+        audio_file, audio_duration, sub_maker = generate_audio(
+            task_id,
+            params,
+            video_script,
+            voice_preview=voice_preview,
+            allow_server_file_input=allow_server_file_input,
+            longform_plan=longform_plan,
+            on_progress=_report_progress,
+        )
+    else:
+        audio_file, audio_duration, sub_maker = generate_audio(
+            task_id,
+            params,
+            video_script,
+            voice_preview=voice_preview,
+            allow_server_file_input=allow_server_file_input,
+        )
     if not audio_file:
         return _mark_task_failed(
             task_id,
@@ -1748,13 +1885,24 @@ def _run_pipeline(
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
-    downloaded_videos = get_video_materials(
-        task_id,
-        params,
-        video_terms,
-        audio_duration,
-        loomloom_video_request=loomloom_video_request,
-    )
+    if use_longform:
+        downloaded_videos = get_video_materials(
+            task_id,
+            params,
+            video_terms,
+            audio_duration,
+            loomloom_video_request=loomloom_video_request,
+            longform_plan=longform_plan,
+            on_progress=_report_progress,
+        )
+    else:
+        downloaded_videos = get_video_materials(
+            task_id,
+            params,
+            video_terms,
+            audio_duration,
+            loomloom_video_request=loomloom_video_request,
+        )
     if not downloaded_videos:
         return _mark_task_failed(
             task_id,

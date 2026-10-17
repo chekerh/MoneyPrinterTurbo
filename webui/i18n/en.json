@@ -424,6 +424,8 @@
         "Pipeline Publish Connected": "YouTube connected ({name})",
         "Pipeline Publish Missing": "YouTube not connected",
         "Pipeline Publish Expired": "Signed in before, but the saved login expired — sign in again",
+        "Pipeline Publish Unverified": "Signed in — cannot verify yet. Enable the YouTube Data API for this project, then refresh.",
+        "Channel Signed In Unverified": "Signed in and saved on this machine, but the connection could not be verified yet. Sign-in again will not help — check the YouTube Data API is enabled for the project.",
         "Login Preflight": "Two things to set before sign-in will work",
         "Login Preflight TestUsers": "Add the Google account you will sign in with under Audience → Test users. Until then Google refuses it with \"has not completed the Google verification process\".",
         "Login Preflight Production": "Set the consent screen to In production afterwards. In Testing mode Google expires the saved login after 7 days, which would stop the daily schedule every week.",
@@ -701,6 +703,7 @@
         "YouTube API Setup Help": "Use Google Cloud OAuth credentials for a Desktop app with YouTube Data API v3 enabled. Then connect each niche with Channel sign in on the Plan page.",
         "YouTube OAuth Client ID": "YouTube OAuth client ID",
         "YouTube OAuth Client Secret": "YouTube OAuth client secret",
-        "YouTube Auto Publish": "Automatically publish finished videos to connected YouTube channels"
+        "YouTube Auto Publish": "Automatically publish finished videos to connected YouTube channels",
+        "Channel Login Expired": "Login expired — sign in again (Google expires saved logins after 7 days while the consent screen is in Testing)"
     }
 }

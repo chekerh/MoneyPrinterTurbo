@@ -482,6 +482,32 @@ def _is_complete(section_file: str, expected_duration: float) -> bool:
     return meta.duration >= max(expected_duration - 1.0, 0.5)
 
 
+def _resolve_concat_mode(params: Any) -> Any:
+    """
+    拿到一个真正的 ``VideoConcatMode`` 枚举。
+
+    ``combine_videos`` 会直接读 ``video_concat_mode.value``，而该字段在
+    未经 ``task._run_pipeline`` 归一化的 params 上可能是字符串，也可能是
+    ``None``（API 显式传 null、或历史任务记录缺这个字段）。分段渲染是新入口，
+    不能假设上游一定已经归一化过——否则这里会抛
+    ``'NoneType' object has no attribute 'value'``，而且是在渲染了半条片子
+    之后才炸。
+    """
+    from app.models.schema import VideoConcatMode
+
+    mode = getattr(params, "video_concat_mode", None)
+    if isinstance(mode, VideoConcatMode):
+        return mode
+    if isinstance(mode, str) and mode:
+        try:
+            return VideoConcatMode(mode)
+        except ValueError:
+            logger.warning(f"unknown video_concat_mode={mode!r}; using sequential")
+            return VideoConcatMode.sequential
+    # 长视频默认顺序拼接：素材是按脚本顺序下载的，随机打乱等于放弃这个特性。
+    return VideoConcatMode.sequential
+
+
 def _render_one_section(
     *,
     task_id: str,
