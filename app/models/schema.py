@@ -31,6 +31,14 @@ class VideoTransitionMode(str, Enum):
     zoom_out = "ZoomOut"
 
 
+class ContentLength(str, Enum):
+    """成片时长档位。short 完全走旧的单次流水线，medium/long 走分段流水线。"""
+
+    short = "short"
+    medium = "medium"
+    long = "long"
+
+
 class VideoAspect(str, Enum):
     landscape = "16:9"
     portrait = "9:16"
@@ -82,6 +90,12 @@ class VideoParams(BaseModel):
     # 赛道（Niche）：决定品牌句、钩子写法与目标长度。
     # 见 app/services/niche_brand.py。留空则使用通用写法（没有品牌句）。
     channel: str = ""
+    # 成片时长档位。short（默认）行为与之前完全一致；medium/long 启用分段
+    # 流水线，见 app/services/longform.py。
+    content_length: str = Field(default="short", max_length=16)
+    # 显式目标秒数，会被夹到 content_length 对应档位的区间内。留空则用赛道
+    # 画像的长视频目标，再退到档位默认值。
+    content_target_seconds: Optional[int] = Field(default=None, ge=60, le=7200)
     video_script: str = ""  # Script used to generate the video
     video_terms: Optional[str | list] = None  # Keywords used to generate the video
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
@@ -184,6 +198,10 @@ class VideoScriptParams:
 
     video_subject: Optional[str] = "春天的花海"
     video_language: Optional[str] = ""
+    # 脚本生成也要知道目标时长：medium/long 时 generate_script 会改走
+    # "先大纲再逐段写"的路径。
+    content_length: str = Field(default="short", max_length=16)
+    content_target_seconds: Optional[int] = Field(default=None, ge=60, le=7200)
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)

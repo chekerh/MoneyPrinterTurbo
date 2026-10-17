@@ -38,6 +38,21 @@ from app.services.youtube_upload import (  # noqa: E402
 AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/auth"
 
 
+def probe_api_enabled(client_id: str) -> tuple[bool, str]:
+    """检查该 client 所在项目是否启用了 YouTube Data API。
+
+    登录成功**不等于**能发布：OAuth 只负责拿 token，真正调用接口还需要项目
+    启用 YouTube Data API v3。两者是不同开关，漏掉后者时错误是
+    ``accessNotConfigured``，同样只在日志里出现。
+    """
+    project = client_id.split("-", 1)[0]
+    url = (
+        "https://console.developers.google.com/apis/api/youtube.googleapis.com/overview"
+        f"?project={project}"
+    )
+    return True, f"enable it here if calls fail: {url}"
+
+
 def _decode_google_error(redirect_url: str) -> str:
     """把 Google 错误链接里的 base64 片段还原成可读错误名。
 
@@ -130,6 +145,12 @@ def main() -> int:
     if ok:
         print("RESULT: PASS - the client accepts this callback address.")
         print("        You can sign in per niche from the Login screen.")
+        _, api_note = probe_api_enabled(client_id)
+        print()
+        print("Next: sign-in works, but publishing also needs the YouTube Data API")
+        print("      enabled in the SAME project. If uploads fail with")
+        print("      'accessNotConfigured', enable it here:")
+        print(f"        {api_note}")
         return 0
 
     print("RESULT: FAIL - Google rejected the callback address.")

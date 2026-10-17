@@ -856,6 +856,319 @@ Please note that you must use English for generating video search terms; Chinese
 
 
 # =============================================================================
+# Long-form planning
+#
+# 长视频不能靠一次 LLM 调用出整份脚本：一次调用既写不出 3500 词（输出长度
+# 会撞模型上限，被截断后是一篇结构崩坏的长文），也无法保证每一段都有独立的
+# 信息增量——模型在长输出里会退化成换句话重复。
+#
+# 因此拆成两步：大纲一次成型（保证叙事连贯和钩子分布），再逐段写文案
+# （每段独立，可单独重试而不推翻整条大纲）。这是 direktor 和 script2vid
+# 都采用的形状，这里按本项目的重试与错误文案约定重写。
+# =============================================================================
+
+#: 大纲 JSON 的 schema 说明，直接进 prompt。给出显式 schema 而不是只说
+#: "返回 JSON"，是因为各家模型对"返回 JSON"的理解差异极大，而给出字段名
+#: 后解析成功率明显更高。
+_OUTLINE_SCHEMA = """[
+  {"title": "short section title", "intent": "one sentence: what this section must convince the viewer of"}
+]"""
+
+
+def _longform_context(
+    video_subject: str,
+    language: str,
+    channel: str,
+    video_script_prompt: str,
+    custom_system_prompt: str,
+) -> str:
+    """长视频两步共用的上下文段，保证大纲和文案的风格约束完全一致。"""
+    context = [f"### Video Subject\n{video_subject}"]
+    if language:
+        context.append(f"### Language\n{language}")
+    if video_script_prompt.strip():
+        context.append(
+            "### Additional instructions\n" + video_script_prompt.strip()
+        )
+    if custom_system_prompt.strip():
+        context.append(
+            "### Additional system instructions\n" + custom_system_prompt.strip()
+        )
+    return "\n\n".join(context)
+
+
+def generate_outline(
+    video_subject: str,
+    section_count: int,
+    language: str = "",
+    target_seconds: int = 0,
+    channel: str = "",
+    video_script_prompt: str = "",
+    custom_system_prompt: str = "",
+    app_config=None,
+):
+    """
+    生成整条长视频的分段大纲，返回解析后的 JSON（列表或 dict）。
+
+    与其他生成函数的约定不同：这里**不吞错误**。解析失败时抛异常，由调用方
+    决定重试或降级——因为一份坏大纲会让后面每一段的文案都建立在错误结构上，
+    静默返回空列表只会把问题推到更下游、更难排查的位置。
+    """
+    from app.services import niche_brand
+
+    minutes = round(target_seconds / 60) if target_seconds else 0
+    directives = niche_brand.script_directives(channel)
+
+    prompt = f"""# Role: Long-form Video Outline Planner
+
+## Goals:
+Design a {section_count}-section outline for a long-form narrated video
+{f"({minutes} minutes total)" if minutes else ""} about the subject below.
+Each section becomes roughly one continuous stretch of narration with its own
+stock footage.
+
+## Constraints:
+1. Return ONLY a JSON array matching this schema:
+{_OUTLINE_SCHEMA}
+2. Return exactly {section_count} entries. No more, no fewer.
+3. Each "intent" must be one concrete claim the viewer gains in that section.
+   "More information about the topic" is not an intent.
+4. Sections must escalate. Section 1 earns attention, the middle sections pay
+   it off with substance, the last section lands the payoff. Do not let a
+   section restate an earlier one.
+5. The hook and brand line belong to section 1 only. Never plan a "greeting",
+   an "intro", or an "outro" section.
+6. "title" is for internal planning only. It is never spoken or shown on screen.
+7. Write "title" and "intent" in the same language as the narration.
+{directives}
+
+## Context:
+{_longform_context(video_subject, language, channel, video_script_prompt, custom_system_prompt)}
+""".strip()
+
+    logger.info(
+        f"generating long-form outline: subject={video_subject}, "
+        f"sections={section_count}, target_seconds={target_seconds}"
+    )
+
+    response = _generate_response(prompt=prompt, app_config=app_config)
+    if not response or response.startswith("Error: "):
+        raise RuntimeError(
+            f"failed to generate long-form outline: "
+            f"{response.removeprefix('Error: ').strip() if response else 'empty response'}"
+        )
+
+    # 解析交给 longform.parse_json_block：它比 _strip_code_fence 多处理 think
+    # 块和"JSON 前后带解释文字"两种情况，而长 prompt 下后者很常见。
+    from app.services import longform
+
+    payload = longform.parse_json_block(response)
+    if payload is None:
+        raise RuntimeError(
+            "long-form outline response was not parseable JSON: "
+            f"{response[:400]!r}"
+        )
+    return payload
+
+
+def generate_section_text(
+    section_title: str,
+    section_intent: str,
+    section_index: int,
+    section_count: int,
+    video_subject: str,
+    max_chars: int,
+    language: str = "",
+    channel: str = "",
+    neighbours: str = "",
+    video_script_prompt: str = "",
+    custom_system_prompt: str = "",
+    app_config=None,
+) -> str:
+    """
+    写出单段文案，返回清洗后的纯文本。
+
+    单段失败会抛出异常而不是返回空串：空串会让这一段在最终脚本里消失，
+    成片就会在某处突兀地跳过一段内容，而这比整条任务失败更难察觉。
+    """
+    from app.services import niche_brand
+
+    directives = niche_brand.script_directives(channel)
+
+    prompt = f"""# Role: Long-form Video Script Writer
+
+## Goals:
+Write section {section_index} of {section_count} of a long-form narrated video.
+
+- Section title (internal only, never spoken): {section_title or "(unspecified)"}
+- What this section must accomplish: {section_intent or "(unspecified)"}
+{neighbours}
+
+## Constraints:
+1. Write continuous narration only. No headings, no markdown, no bullet points,
+   no speaker labels, no stage directions.
+2. Do NOT write the hook or the brand line unless this is section 1. Do not
+   repeat the channel name in later sections.
+3. Open on the substance of this section. Do not write transitions like
+   "now let's look at", "moving on", "in this part".
+4. Target {max_chars} characters. Every sentence must add something the viewer
+   did not already have; if a sentence would not survive deletion, delete it.
+5. End where this section's job is done. The next section will open its own door.
+6. Write in the narration language. Numbers, names and quotes stay as written.
+{directives}
+
+## Context:
+{_longform_context(video_subject, language, channel, video_script_prompt, custom_system_prompt)}
+""".strip()
+
+    logger.info(
+        f"generating long-form section {section_index}/{section_count}: "
+        f"title={section_title!r}"
+    )
+
+    last_error = ""
+    for attempt in range(_max_retries):
+        try:
+            response = _generate_response(prompt=prompt, app_config=app_config)
+            if response and response.startswith("Error: "):
+                last_error = response.removeprefix("Error: ").strip()
+                continue
+            if not response:
+                last_error = "empty response"
+                continue
+            cleaned = _format_longform_section(response)
+            if not cleaned:
+                last_error = "section text was empty after cleaning"
+                continue
+            if len(cleaned) < 40:
+                last_error = f"section text was suspiciously short ({len(cleaned)} chars)"
+                continue
+            if attempt < _max_retries - 1:
+                logger.warning(
+                    f"section {section_index} rejected ({last_error}), retrying..."
+                )
+            return cleaned
+        except Exception as exc:  # noqa: BLE001 - 单段失败只应重试本段
+            last_error = _sanitize_error_message(exc)
+            logger.warning(f"failed to generate long-form section: {last_error}")
+
+    raise RuntimeError(
+        f"failed to generate long-form section {section_index}: {last_error}"
+    )
+
+
+def _format_longform_section(response: str) -> str:
+    """
+    清掉模型在单段输出里混入的 markdown 残留。
+
+    与 ``generate_script.format_response`` 的处理保持一致，但**不**做按空行
+    再切段：分段拼接由 ``longform.render_sections_as_script`` 统一负责，这里
+    再切一次会造成段内出现空行，字幕匹配时多出一段对不上脚本的空 cue。
+    """
+    text = response.strip()
+    # 整段被包在代码围栏里是常见失败模式，先剥掉。
+    text = _strip_code_fence(text)
+    text = re.sub(r"^#{1,6}\s+.*$", "", text, flags=re.MULTILINE)
+    text = text.replace("*", "").replace("#", "")
+    text = re.sub(r"\[.*?\]", "", text)
+    text = re.sub(r"\(.*?\)", "", text)
+    # 压缩成单段文本：换行会让 TTS 停顿、字幕多出一行。
+    text = re.sub(r"\s*\n\s*", " ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
+
+
+def generate_section_terms(
+    section_summaries: List[dict],
+    video_subject: str,
+    terms_per_section: int = 4,
+    app_config=None,
+) -> List[List[str]]:
+    """
+    为每一段生成各自的素材搜索关键词，返回 ``[[...], ...]``。
+
+    ``section_summaries`` 是 ``[{"index", "title", "intent", "preview"}]`` 列表。
+    一次调用产出全部段的关键词，而不是逐段调用：关键词之间需要保持叙事顺序
+    和去重，一次调用才能看到全局；逐段调用既要 N 倍调用量，又无法跨段去重。
+
+    解析失败返回空列表而不是抛异常：关键词缺失只会让画面质量下降，不会让
+    成片丢失内容，交给上层的降级路径（按段标题兜底生成关键词）更合适。
+    """
+    if not section_summaries:
+        return []
+
+    roster = "\n".join(
+        f"{entry.get('index')}. {entry.get('title') or ''} — "
+        f"{entry.get('intent') or ''}\n"
+        f"   narration starts: {(entry.get('preview') or '')[:240]}"
+        for entry in section_summaries
+    )
+
+    prompt = f"""# Role: Stock Footage Search Planner
+
+## Goals:
+For EACH section listed below, write {terms_per_section} stock-footage search
+terms that match what that specific section shows on screen.
+
+## Constraints:
+1. Return ONLY a JSON array of arrays of strings, one inner array per section,
+   in the same order as the sections listed below.
+2. Each search term is 1-3 words, in English only, regardless of narration language.
+3. Terms must match the section's actual content. Section 5's footage must not
+   be interchangeable with section 2's footage.
+4. Within a section, terms must describe different shots. Repeating one term
+   makes the downloader fetch the same clip repeatedly.
+5. Reusing a term across sections is allowed only when the same visual subject
+   genuinely recurs in the narration.
+6. No numbering, no keys, no commentary. The array of arrays only.
+
+## Output Example:
+{json.dumps([["term a", "term b", "term c", "term d"]] * len(section_summaries), ensure_ascii=False)}
+
+## Context:
+### Video Subject
+{video_subject}
+
+### Sections
+{roster}
+""".strip()
+
+    logger.info(
+        f"generating section terms for {len(section_summaries)} sections "
+        f"({terms_per_section} each)"
+    )
+
+    for attempt in range(_max_retries):
+        try:
+            response = _generate_response(prompt=prompt, app_config=app_config)
+            if not response or response.startswith("Error: "):
+                continue
+            from app.services import section_materials
+
+            buckets = section_materials.coerce_section_terms(
+                longform_parse_json(response), len(section_summaries)
+            )
+            if any(bucket for bucket in buckets):
+                return buckets
+            logger.warning("section terms came back empty")
+        except Exception as exc:  # noqa: BLE001 - 降级路径在上层
+            logger.warning(f"failed to generate section terms: {_sanitize_error_message(exc)}")
+        if attempt < _max_retries - 1:
+            logger.warning(
+                f"failed to generate section terms, trying again... {attempt + 1}"
+            )
+
+    return []
+
+
+def longform_parse_json(response: str):
+    """转调 ``longform.parse_json_block``，避免 llm.py 反向依赖具体解析实现。"""
+    from app.services import longform
+
+    return longform.parse_json_block(response)
+
+
+# =============================================================================
 # Social publishing metadata
 #
 # 根据视频主题和脚本生成发布到短视频平台时常用的 title、caption 和 hashtags。

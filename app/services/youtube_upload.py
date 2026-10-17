@@ -147,6 +147,13 @@ OAUTH_ERROR_HINTS = {
         "The client ID and client secret do not belong to the same OAuth client.",
         "Re-copy both values from the same credential in Google Cloud Console.",
     ),
+    "accessNotConfigured": (
+        "The YouTube Data API is not enabled in the Google Cloud project that "
+        "owns this OAuth client — so sign-in works but every upload is refused.",
+        "Open the link Google prints, or go to APIs & Services -> Library -> "
+        "enable 'YouTube Data API v3' for the same project as the client, then "
+        "wait a couple of minutes.",
+    ),
 }
 
 

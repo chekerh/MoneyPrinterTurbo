@@ -410,3 +410,21 @@ class TestExpiredTokenIsNamedNotBuried:
         assert result["success"] is False
         assert result.get("needs_reauth") is True, "过期 token 没有被标记"
         assert "signed in again" in result["error"].lower()
+
+
+class TestApiNotEnabledIsExplained:
+    """登录成功不等于能发布——API 启用是另一个开关。
+
+    OAuth 只负责拿到 token；真正调用接口还需要项目启用 YouTube Data API v3。
+    漏掉后者时 Google 回 accessNotConfigured，而这个错误同样只出现在日志里。
+    """
+
+    def test_access_not_configured_gets_a_fix(self):
+        from app.services.youtube_upload import explain_oauth_failure
+
+        why, how = explain_oauth_failure(
+            "HttpError 403 ... accessNotConfigured ... YouTube Data API v3 has "
+            "not been used in project 314980975331"
+        )
+        assert "not enabled" in why
+        assert "youtube data api v3" in how.lower()

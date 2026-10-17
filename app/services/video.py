@@ -455,6 +455,99 @@ def concat_video_clips_with_ffmpeg(
         delete_files(concat_list_file)
 
 
+def mux_audio(
+    video_path: str,
+    output_file: str,
+    *,
+    bgm_file: str = "",
+    bgm_volume: float = 0.2,
+    voice_volume: float = 1.0,
+    threads: int = 2,
+    codec: str | None = None,
+) -> bool:
+    """
+    在已有画音的视频上混一层背景音乐，输出成片。
+
+    输入视频自带旁白音轨（分段渲染时逐段混入、拼接时 ``-c:a copy`` 保留），
+    因此这里只处理 BGM：
+
+    - 没有 BGM 时是纯重封装，画面不重编码；
+    - 有 BGM 时用 ``amix`` 混合，BGM 用 ``-stream_loop`` 循环到视频时长。
+
+    刻意走 ffmpeg 而不是 MoviePy：MoviePy 的 ``CompositeAudioClip`` 对几十分钟
+    的音频会解码成 numpy 数组驻留内存，而这里只是两条音轨按权重相加，
+    ffmpeg 的流式处理在时长和内存上都更可控。
+
+    Returns:
+        True 表示成片已写入；False 表示失败，此时不删除输入文件。
+    """
+    effective_codec = codec or _get_effective_video_codec()
+
+    command = [utils.get_ffmpeg_binary(), "-y", "-hide_banner", "-loglevel", "error", "-i", video_path]
+
+    if bgm_file and path.exists(bgm_file):
+        try:
+            volume = max(float(bgm_volume or 0.0), 0.0)
+        except (TypeError, ValueError):
+            volume = 0.2
+        try:
+            voice_gain = max(float(voice_volume or 1.0), 0.0)
+        except (TypeError, ValueError):
+            voice_gain = 1.0
+
+        command += [
+            "-stream_loop",
+            "-1",
+            "-i",
+            bgm_file,
+            "-filter_complex",
+            (
+                f"[0:a]volume={voice_gain}[voice];"
+                f"[1:a]volume={volume}[bgm];"
+                # amix 的 normalize 会把两条轨拉到等响，听感上旁白会明显变闷。
+                # 固定 normalize=0，权重只由上面的 volume 决定。
+                "[voice][bgm]amix=inputs=2:normalize=0:duration=first[mix]"
+            ),
+            "-map",
+            "0:v",
+            "-map",
+            "[mix]",
+            "-c:v",
+            effective_codec,
+            "-c:a",
+            "aac",
+            "-shortest",
+        ]
+    else:
+        # 无 BGM：视频流直接复制，只重封装音频（若存在）。
+        command += ["-c", "copy"]
+
+    command += [
+        "-threads",
+        str(threads or 2),
+        "-pix_fmt",
+        "yuv420p",
+        output_file,
+    ]
+
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        logger.error(
+            f"failed to mux audio into {output_file}: "
+            f"returncode={result.returncode}, stderr={(result.stderr or '')[-500:]}"
+        )
+        return False
+
+    if not path.exists(output_file):
+        logger.error(f"audio mux reported success but {output_file} is missing")
+        return False
+    return True
+
+
 def _sanitize_image_file(image_path: str) -> str:
     # 某些本地图片虽然能被 Pillow 打开，但会因为损坏的 EXIF/eXIf 元数据导致
     # ImageClip 在解析阶段直接抛异常。这里重新导出一份“干净图片”，把坏元数据剥离掉。

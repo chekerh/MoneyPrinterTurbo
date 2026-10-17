@@ -29,6 +29,7 @@ __all__ = [
     "resolve_niche",
     "known_channels",
     "script_directives",
+    "longform_preference",
 ]
 
 DEFAULT_NICHE = "general"
@@ -50,6 +51,15 @@ class NicheProfile:
     min_seconds: int = 60
     #: 目标词数（英文口径）。约 2.5 词/秒。
     target_words: int = 220
+    #: 这个赛道做**长视频**时的目标口播秒数。留空表示该赛道不做长视频，
+    #: 显式指定 ``content_target_seconds`` 的任务不受此限制。
+    #:
+    #: 短视频频道和长视频频道的节奏要求完全不同：短视频要的是前 3 秒留人，
+    #: 长视频要的是中途不流失。把两者混在同一个 ``target_words`` 里调整，
+    #: 必然顾此失彼，所以长视频长度单独一个字段。
+    longform_target_seconds: int = 0
+    #: 长视频默认落在哪个档位。调用方未显式指定 content_length 时用它。
+    longform_band: str = ""
 
     def brand_instruction(self) -> str:
         return (
@@ -166,6 +176,17 @@ def resolve_niche(channel: object) -> NicheProfile:
     """
     key = str(channel or "").strip().lower().replace(" ", "-").replace("_", "-")
     return NICHES.get(key, _GENERAL)
+
+
+def longform_preference(channel: object) -> tuple[str, int]:
+    """
+    取这个赛道长视频的 ``(档位, 目标秒数)``。
+
+    赛道没配长视频目标时返回 ``("", 0)``，由调用方回退到请求里的
+    ``content_length`` 或档位默认值。
+    """
+    profile = resolve_niche(channel)
+    return profile.longform_band, profile.longform_target_seconds
 
 
 def script_directives(channel: object) -> str:

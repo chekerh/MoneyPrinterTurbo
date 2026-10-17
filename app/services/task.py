@@ -20,9 +20,13 @@ from app.services import bgm as bgm_service
 from app.services import (
     elevenlabs_music,
     llm,
+    longform,
+    longform_pipeline,
     loomloom,
     material,
     posting_package,
+    section_materials,
+    section_render,
     sonilo,
     subtitle,
     task_artifacts,
@@ -609,6 +613,8 @@ def generate_audio(
     voice_preview=None,
     *,
     allow_server_file_input: bool = False,
+    longform_plan=None,
+    on_progress=None,
 ):
     """
     Generate audio for the video script.
@@ -619,6 +625,9 @@ def generate_audio(
         - audio_file: path to the generated or provided audio file
         - audio_duration: duration of the audio in seconds
         - sub_maker: subtitle maker object if TTS is used, None otherwise
+
+    ``longform_plan`` 非空时走分段 TTS。分段只在"脚本由我们自己写出来"时
+    有意义——用户自带脚本或自带音频时，长度不由我们控制，仍按单次调用处理。
     """
     logger.info("\n\n## generating audio")
     # /audio 和 /subtitle 请求模型不包含 custom_audio_file，
@@ -650,6 +659,28 @@ def generate_audio(
 
         logger.info("no custom audio file provided, using TTS to generate audio.")
         audio_file = path.join(utils.task_dir(task_id), "audio.mp3")
+
+        if longform_plan is not None:
+            # 分段合成。返回的 SubMaker 时间轴已覆盖全片，所以阶段 4 的字幕
+            # 链路完全不用改。
+            narration = longform_pipeline.tts_longform_narration(
+                task_id,
+                params,
+                longform_plan,
+                audio_file,
+                on_progress=on_progress,
+            )
+            if narration is None:
+                _mark_task_failed(
+                    task_id,
+                    "audio",
+                    "failed to synthesize long-form narration; verify the "
+                    "selected voice and TTS connectivity",
+                )
+                return None, None, None
+            sub_maker, audio_duration = narration
+            return audio_file, int(math.ceil(audio_duration)), sub_maker
+
         sub_maker = voice.tts(
             text=video_script,
             voice_name=voice.parse_voice_name(params.voice_name),
@@ -917,6 +948,108 @@ def _record_loomloom_run_reference(
         return updated
 
     return None
+
+
+def generate_longform_final_video(
+    task_id,
+    params,
+    longform_plan,
+    downloaded_videos,
+    audio_file,
+    subtitle_path,
+    audio_duration,
+    *,
+    on_progress=None,
+):
+    """
+    长视频的阶段 6：按段渲染 + ffmpeg 拼接。
+
+    返回值形状与 ``generate_final_videos`` 一致（成片路径、拼接中间件路径、
+    警告列表），这样下游的缩略图、归档、发布代码不需要为长视频写第二套。
+    """
+    warnings: list = []
+    final_path = _final_video_output_path(task_id, 1)
+
+    # 素材必须按脚本顺序轮询才有"画面跟着文案走"的效果。长视频下这一点比
+    # 短视频更明显：一旦乱序，观众会在第 3 分钟就发现"这段讲历史，画面却是
+    # 现代城市"。
+    if not params.match_materials_to_script:
+        logger.info(
+            "long-form render is forcing sequential material concat so the "
+            "visuals follow the narration"
+        )
+        params.video_concat_mode = VideoConcatMode.sequential
+
+    buckets = longform_pipeline.assign_materials_to_sections(
+        longform_plan,
+        downloaded_videos,
+        total_seconds=audio_duration,
+        clip_duration=params.video_clip_duration,
+    )
+
+    rendered = section_render.render_sections(
+        task_id=task_id,
+        params=params,
+        sections=longform_plan.outline,
+        section_materials=buckets,
+        audio_file=audio_file,
+        subtitle_path=subtitle_path,
+        on_progress=on_progress,
+    )
+    if not rendered:
+        return [], [], warnings
+
+    # 分段渲染时 BGM 被刻意跳过（见 section_render._render_one_section 的注释：
+    # 每段各叠一次会在拼接处产生相位跳变）。整条成片在这里一次性混音。
+    bgm_file_override = None
+    video_music_provider = _VIDEO_MUSIC_PROVIDERS.get(params.bgm_type)
+    bgm_requested = (
+        video_music_provider is not None
+        and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
+    )
+    if bgm_requested:
+        service = video_music_provider["service"]
+        generated_bgm = path.join(
+            utils.task_dir(task_id), f"{params.bgm_type}-bgm-longform"
+        )
+        try:
+            service.generate_bgm(
+                video_path=rendered,
+                output_path=generated_bgm,
+                video_duration=audio_duration,
+                prompt=_get_video_music_prompt(params),
+            )
+            bgm_file_override = generated_bgm
+        except video_music_provider["error_type"] as exc:
+            logger.warning(
+                f"{video_music_provider['display_name']} BGM generation failed: "
+                f"task_id={task_id}, error={exc}"
+            )
+            bgm_file_override = ""
+            warnings.append(
+                {
+                    "code": video_music_provider["warning_code"],
+                    "video_index": 1,
+                }
+            )
+
+    # 拼接产物只含画面和旁白；字幕已在分段渲染时逐段烧录。因此这里只做
+    # 一次 BGM 混音，不能再走 generate_video（那会重复叠加字幕）。
+    logger.info(f"mixing long-form final video: {final_path}")
+    if not video.mux_audio(
+        video_path=rendered,
+        output_file=final_path,
+        bgm_file=bgm_file_override or "",
+        bgm_volume=params.bgm_volume,
+        voice_volume=params.voice_volume,
+        threads=params.n_threads or 2,
+    ):
+        logger.error("failed to mix the long-form final video")
+        return [], [], warnings
+
+    # 中间拼接件留在任务目录里：它比最终成片小得多，且是排查"某一段画面不对"
+    # 时最快的参照物。归档脚本只搬最终成片，所以不会污染 outputs/。
+    return [final_path], [rendered], warnings
 
 
 def generate_final_videos(
@@ -1480,7 +1613,39 @@ def _run_pipeline(
         )
 
     # 1. Generate script
-    video_script = generate_script(task_id, params)
+    # 长视频走"先大纲再逐段写"的路径；短视频仍是一次性 llm.generate_script。
+    # 两条路径产出的都是同一份脚本文本，下游（音频、字幕、发布）完全一致。
+    channel = resolve_task_channel(task_id, params)
+    longform_band, longform_target = longform_pipeline.resolve_longform_request(
+        params, channel
+    )
+    use_longform = longform_band.sectioned
+    longform_plan = None
+
+    def _report_progress(value: int, message: str) -> None:
+        """长视频各阶段的细粒度进度。长视频单个阶段会跑几十分钟到几小时，
+        只靠阶段级的跳变会让运维以为任务卡死。"""
+        logger.info(f"task {task_id} progress {value}%: {message}")
+        sm.state.update_task(task_id, progress=max(0, min(int(value), 99)))
+
+    if use_longform:
+        result = longform_pipeline.build_longform_script(
+            task_id,
+            params,
+            channel,
+            on_progress=_report_progress,
+        )
+        if result is None:
+            return _mark_task_failed(
+                task_id,
+                "script",
+                "failed to plan or write the long-form script",
+            )
+        longform_plan = result.plan
+        video_script = result.script
+    else:
+        video_script = generate_script(task_id, params)
+
     if not video_script or "Error: " in video_script:
         error = (
             video_script.removeprefix("Error: ").strip()
@@ -1493,13 +1658,31 @@ def _run_pipeline(
 
     if stop_at == "script":
         sm.state.update_task(
-            task_id, state=const.TASK_STATE_COMPLETE, progress=100, script=video_script
+            task_id,
+            state=const.TASK_STATE_COMPLETE,
+            progress=100,
+            script=video_script,
+            **({"longform": longform_plan.to_dict()} if longform_plan else {}),
         )
         return {"script": video_script}
 
     # 2. Generate terms
+    # 长视频的关键词按段生成后压平，顺序即最终时间线上素材出现的顺序。
+    # 用户显式传了 video_terms 时一律尊重，不覆盖——那是显式意图。
     video_terms = ""
-    if params.video_source != "local":
+    if use_longform and not params.video_terms:
+        video_terms = longform_pipeline.terms_for_longform_sections(
+            longform_plan,
+            video_subject=params.video_subject,
+            on_progress=_report_progress,
+        )
+        if not video_terms:
+            return _mark_task_failed(
+                task_id,
+                "terms",
+                "failed to generate section search terms",
+            )
+    elif params.video_source != "local":
         video_terms = generate_terms(task_id, params, video_script)
         if not video_terms:
             return _mark_task_failed(
@@ -1509,6 +1692,8 @@ def _run_pipeline(
             )
 
     save_script_data(task_id, video_script, video_terms, params)
+    if longform_plan is not None:
+        task_artifacts.patch_script_data(task_id, longform=longform_plan.to_dict())
 
     if stop_at == "terms":
         sm.state.update_task(
@@ -1525,6 +1710,8 @@ def _run_pipeline(
         video_script,
         voice_preview=voice_preview,
         allow_server_file_input=allow_server_file_input,
+        longform_plan=longform_plan,
+        on_progress=_report_progress if use_longform else None,
     )
     if not audio_file:
         return _mark_task_failed(
@@ -1592,16 +1779,33 @@ def _run_pipeline(
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
     # 6. Generate final videos
-    final_video_paths, combined_video_paths, generation_warnings = (
-        generate_final_videos(
-            task_id,
-            params,
-            downloaded_videos,
-            audio_file,
-            subtitle_path,
-            audio_duration,
+    if longform_plan is not None:
+        # 分段渲染：逐段出片再拼接，每段落盘可复用。video_count 在这里被
+        # 忽略——分段已经提供了差异化的可能，而长视频做多个版本意味着渲染
+        # 时间翻倍，收益远小于成本。
+        final_video_paths, combined_video_paths, generation_warnings = (
+            generate_longform_final_video(
+                task_id,
+                params,
+                longform_plan,
+                downloaded_videos,
+                audio_file,
+                subtitle_path,
+                audio_duration,
+                on_progress=_report_progress,
+            )
         )
-    )
+    else:
+        final_video_paths, combined_video_paths, generation_warnings = (
+            generate_final_videos(
+                task_id,
+                params,
+                downloaded_videos,
+                audio_file,
+                subtitle_path,
+                audio_duration,
+            )
+        )
 
     if not final_video_paths:
         return _mark_task_failed(
@@ -1639,7 +1843,7 @@ def _run_pipeline(
     # 数分钟，不应阻塞视频结果返回，也不能反向影响已经生成的成片。
     # 发布能力由适配器注册表决定：某个 niche 上哪些平台已完成一次性授权，
     # 就发到哪里。不再依赖全局的 upload_post 开关。
-    channel = resolve_task_channel(task_id, params)
+    # channel 已在流水线开头解析（长视频规划需要用它），直接复用。
     connected = publishing.connected_platforms(channel)
     platforms = [
         platform for platform in connected
