@@ -8704,16 +8704,49 @@ def _page_login():
             config.app.get("youtube_upload_client_secret", "") or ""
         ).strip()
         if not (client_id and client_secret):
+            # 以前这里只有一句提示加一个"去设置页"的按钮，于是"连好频道"被切成
+            # 两段：先离开登录页去设置填凭据，再回来逐个频道登录。凭据是登录页
+            # 自己的前提，就该在这一屏填完——填好后下方卡片立刻变成可登录。
             st.warning(tr("Login Client Missing"))
-            st.caption(tr("Login Client Setup"))
-            if st.button(
-                tr("Settings"),
-                key="login_go_settings_button",
-                type="secondary",
-                icon=":material/settings:",
-            ):
-                st.session_state[_NAV_REQUEST_KEY] = "settings"
-                st.rerun()
+            with st.expander(tr("Login Client Setup Title"), expanded=True):
+                st.caption(tr("Login Client Setup"))
+                st.markdown(
+                    f'<ol class="mpt-steps">'
+                    f"<li>{html.escape(tr('Login Step Project'))}</li>"
+                    f"<li>{html.escape(tr('Login Step EnableApi'))}</li>"
+                    f"<li>{html.escape(tr('Login Step Consent'))}</li>"
+                    f"<li>{html.escape(tr('Login Step Credentials'))}</li>"
+                    f"</ol>",
+                    unsafe_allow_html=True,
+                )
+                st.link_button(
+                    tr("Login Open Google Console"),
+                    url="https://console.cloud.google.com/apis/credentials",
+                    key="login_google_console_link",
+                    icon=":material/open_in_new:",
+                )
+                for field, label_key in (
+                    ("youtube_upload_client_id", "YouTube OAuth Client ID"),
+                    ("youtube_upload_client_secret", "YouTube OAuth Client Secret"),
+                ):
+                    current = str(config.app.get(field, "") or "")
+                    entered = st.text_input(
+                        tr(label_key),
+                        value=current,
+                        type="password",
+                        key=f"login_{field}_input",
+                    ).strip()
+                    if entered != current:
+                        _set_runtime_config("app", field, entered)
+                _save_runtime_config()
+                client_id = str(
+                    config.app.get("youtube_upload_client_id", "") or ""
+                ).strip()
+                client_secret = str(
+                    config.app.get("youtube_upload_client_secret", "") or ""
+                ).strip()
+                if client_id and client_secret:
+                    st.success(tr("Login Client Saved"))
 
         channels = [c for c in plans.list_channels() if c]
         if not channels:
@@ -8722,6 +8755,11 @@ def _page_login():
                 unsafe_allow_html=True,
             )
             return
+
+        if not (client_id and client_secret):
+            # 凭据还没填时，卡片照样画出来（它们是"每个频道"这个概念本身），
+            # 但先说清现在点了不会有反应，免得被当成界面坏了。
+            st.caption(tr("Login Sign In Blocked"))
 
         st.caption(tr("Login Remembered Note"))
         columns = st.columns(3)

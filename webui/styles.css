@@ -1582,7 +1582,20 @@ div[class*="st-key-thumbnail_panel_"] div[data-testid="stCaptionContainer"] p {
     color: var(--vix-muted) !important;
 }
 
-/* ── Pipeline health strip: stack on phones ─────────────────────────
+/* Setup steps list on the login screen: four one-time instructions. */
+.mpt-steps {
+    margin: 0.2rem 0 0.7rem 1.1rem;
+    padding: 0;
+    font-size: 0.85rem;
+    line-height: 1.65;
+    color: color-mix(in srgb, currentColor 82%, transparent);
+}
+
+.mpt-steps li {
+    margin-bottom: 0.15rem;
+}
+
+/* Pipeline health strip: stack on phones.
    Three status columns side-by-side are fine on desktop; on a 390px phone
    each column would be ~90px and the status words wrap into stairs. Same
    wrap trick as the settings grid above. */
