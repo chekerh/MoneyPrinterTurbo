@@ -317,3 +317,47 @@ class TestOAuthFailureIsReadable:
         hint = redirect_uri_hint()
         assert hint.startswith("http://localhost:")
         assert hint.endswith("/"), "缺结尾斜杠就会和 Google 的匹配规则对不上"
+
+
+class TestAccountSelectionIsNeverForced:
+    """多频道工作流里必须能自己选账号，而不是被浏览器记住的账号静默绑定。
+
+    同一台 Mac 上通常只登录了一个 Google 账号。Google 的账号选择器会用
+    SSO cookie 自动选中它，于是"我想换个账号"这件事根本无从表达——用户看到的
+    是自己明明点了另一个账号，token 却绑到了另一个频道上。
+    """
+
+    def test_prompt_forces_the_account_chooser(self):
+        from app.services.youtube_upload import OAUTH_PROMPT
+
+        parts = OAUTH_PROMPT.split()
+        assert "select_account" in parts, (
+            "没有 select_account：Google 会用 SSO cookie 自动选中上次登录的账号"
+        )
+        assert "consent" in parts, (
+            "没有 consent：换个频道时不会重新询问授权，绑不到新的频道"
+        )
+
+    def test_no_login_hint_is_ever_sent(self):
+        """login_hint 会把授权流程钉死在一个账号上，永远不能出现。"""
+        from app.services import youtube_upload as y
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        import urllib.parse as up
+
+        client_config = {
+            "installed": {
+                "client_id": "fake.apps.googleusercontent.com",
+                "client_secret": "fake",
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [y._loopback_uri("localhost", 8765)],
+            }
+        }
+        flow = InstalledAppFlow.from_client_config(client_config, scopes=y.YOUTUBE_SCOPES)
+        flow.redirect_uri = y._loopback_uri("localhost", 8765)
+        url, _ = flow.authorization_url(prompt=y.OAUTH_PROMPT)
+        query = up.parse_qs(up.urlparse(url).query)
+
+        assert "login_hint" not in query, "授权请求里出现了 login_hint"
+        assert "hd" not in query, "授权请求里出现了 hd（会锁死账号域）"
+        assert "select_account" in query["prompt"][0]

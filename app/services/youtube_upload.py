@@ -47,6 +47,12 @@ LOCAL_SERVER_PORT_BASE = 8765
 _LOCAL_SERVER_PORT_CANDIDATES = tuple(
     range(LOCAL_SERVER_PORT_BASE, LOCAL_SERVER_PORT_BASE + 10)
 )
+
+#: 传给 Google 的 ``prompt``。``consent`` 每次重问授权；``select_account``
+#: 强制弹出账号选择页，不让浏览器用 SSO cookie 悄悄选中上次登录的账号。
+#: 多频道工作流里两个都是必需的：前者决定"能不能绑到不同频道"，后者决定
+#: "是不是你以为的那个账号"。
+OAUTH_PROMPT = "consent select_account"
 _UPLOAD_CHUNK_BYTES = 128 * 1024
 #: YouTube 自定义缩略图上限 2 MB。
 _THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024
@@ -218,16 +224,20 @@ def authorize(channel: str, expected_channel_id: str = "") -> dict:
     flow = InstalledAppFlow.from_client_config(
         client_config, scopes=YOUTUBE_SCOPES
     )
-    # prompt="consent" 每次都显示账号/频道选择页，这是能绑到不同频道的前提。
+    # prompt="consent select_account"：
+    #   consent       —— 每次都重新询问授权，这是能绑到不同频道的前提
+    #   select_account—— 强制显示账号选择页，不让浏览器用 SSO cookie 自动选中
+    #                    上次登录的账号。没有它时，同一台机器上默认登录的账号会
+    #                    被静默选中，而真实情况是用户可能想换一个账号登录。
     try:
         credentials = flow.run_local_server(
-            port=_LOCAL_SERVER_PORT_CANDIDATES[0], prompt="consent"
+            port=_LOCAL_SERVER_PORT_CANDIDATES[0], prompt=OAUTH_PROMPT
         )
     except OSError as exc:
         # 端口被占用时顺延到下一个候选再试一次。占用本身不是授权失败。
         for port in _LOCAL_SERVER_PORT_CANDIDATES[1:]:
             try:
-                credentials = flow.run_local_server(port=port, prompt="consent")
+                credentials = flow.run_local_server(port=port, prompt=OAUTH_PROMPT)
                 break
             except OSError:
                 continue
