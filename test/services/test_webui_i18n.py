@@ -190,6 +190,7 @@ ENGLISH_FALLBACK_KEYS = frozenset(
         "Login Client Setup",
         "Login Client Setup Title",
         "Login Client Saved",
+        "Login Redirect Hint",
         "Login Sign In Blocked",
         "Login Open Google Console",
         "Login Step Project",

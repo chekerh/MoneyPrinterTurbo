@@ -34,8 +34,19 @@ YOUTUBE_SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube.readonly",
 ]
-#: 授权时用 0 让系统分配空闲端口，避免连续连接多个频道时端口被占用。
-_LOCAL_SERVER_PORT = 0
+#: 本地回调端口。**固定端口**，而不是让系统随机分配。
+#:
+#: 随机端口只对 Desktop 类型的客户端成立：Google 对"已安装应用"自动放行任意
+#: loopback 端口。但客户端如果建成了 Web 应用，Google 要求 redirect_uri 与
+#: 注册值精确一致——随机端口就永远对不上，用户只会看到 redirect_uri_mismatch，
+#: 而且没法自己修（端口每次都不一样）。
+#:
+#: 固定端口让回调地址变成一条可以照抄的常量，既能提示用户填进 Web 客户端的
+#: "Authorized redirect URIs"，也方便排查。端口被占用时向上顺延。
+LOCAL_SERVER_PORT_BASE = 8765
+_LOCAL_SERVER_PORT_CANDIDATES = tuple(
+    range(LOCAL_SERVER_PORT_BASE, LOCAL_SERVER_PORT_BASE + 10)
+)
 _UPLOAD_CHUNK_BYTES = 128 * 1024
 #: YouTube 自定义缩略图上限 2 MB。
 _THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024
@@ -106,12 +117,81 @@ def _read_token(path: str) -> tuple[Credentials, dict]:
     return Credentials.from_authorized_user_info(data, YOUTUBE_SCOPES), meta
 
 
+#: OAuth 失败时给用户的诊断。键是 Google 错误码，值是 ``(原因, 怎么做)``。
+#:
+#: 这些错误只在**浏览器里**显示——Google 在跳回本地回调之前就把错误页渲染出来
+#: 了，本地回调服务器永远看不到它，``run_local_server`` 只能一直等到超时。所以
+#: 用户看到的是 Google 的错误页，界面这边只能拿到一个超时。不把已知错误码翻译
+#: 成人话，用户就只能自己照着 "redirect_uri_mismatch" 这种词去猜。
+OAUTH_ERROR_HINTS = {
+    "redirect_uri_mismatch": (
+        "This OAuth client cannot receive the reply. Almost always it was created "
+        "as a Web application instead of a Desktop app.",
+        "Open Google Cloud Console -> APIs & Services -> Credentials -> click the "
+        "client -> check Application type. Delete it and create a new one with "
+        "type Desktop app, then paste the new ID and secret.",
+    ),
+    "access_denied": (
+        "Google refused the permission, or this Google account is not allowed to "
+        "use the app yet.",
+        "On the OAuth consent screen, add this Google account under Test users. "
+        "In Testing mode Google only allows accounts listed there.",
+    ),
+    "invalid_client": (
+        "The client ID and client secret do not belong to the same OAuth client.",
+        "Re-copy both values from the same credential in Google Cloud Console.",
+    ),
+}
+
+
+def _loopback_uri(host: str, port: int) -> str:
+    """回调地址。必须和 ``run_local_server`` 生成的完全一致——含结尾斜杠。
+
+    ``InstalledAppFlow.run_local_server`` 默认 ``redirect_uri_trailing_slash=
+    True``，实际发出去的是 ``http://localhost:<port>/``。少一个斜杠就是另一次
+    匹配失败，所以这里跟着它一起带斜杠。
+    """
+    return f"http://{host}:{port}/"
+
+
+def redirect_uri_hint() -> str:
+    """告诉用户 Web 客户端要填的回调地址（Desktop 客户端不需要填）。"""
+    return _loopback_uri("localhost", LOCAL_SERVER_PORT_BASE)
+
+
+def explain_oauth_failure(error: object) -> tuple[str, str]:
+    """把 OAuth 失败翻译成 ``(原因, 怎么做)``；认不出来的就原样返回。
+
+    不猜、不编：只对 :data:`OAUTH_ERROR_HINTS` 里明确列出的错误码给建议，其余
+    原样透出，附上一句"可能是浏览器被关掉了"。
+    """
+    text = str(error or "")
+    for code, (why, how) in OAUTH_ERROR_HINTS.items():
+        if code in text:
+            return why, how
+    if "Timeout" in text or "timed out" in text:
+        return (
+            "The browser never came back with a code — most often the consent "
+            "page showed an error and was closed.",
+            "Read the message Google showed you; if it says redirect_uri_mismatch, "
+            "the OAuth client type is wrong (see hint above).",
+        )
+    return (
+        "The sign-in did not complete.",
+        "Check the browser tab that opened; close it and try again.",
+    )
+
+
 def authorize(channel: str, expected_channel_id: str = "") -> dict:
     """为 ``channel`` 走一次 OAuth 授权，并把 token 存到该频道名下。
 
     这是唯一需要打开浏览器的步骤，每个频道执行一次即可，之后发布全部走 API。
     授权完成后会立刻读出 token 实际绑定的频道；和 ``expected_channel_id``
     不一致时仍然保存，但把 ``channel_mismatch`` 标为 True 让调用方决定。
+
+    失败时**不再抛异常**：本地回调服务器看不到 Google 在浏览器里显示的错误页，
+    异常一路冒到 CLI 会变成一段 traceback，而用户需要的是"错在哪、怎么改"。
+    这里把失败收敛成结构化结果，附带可执行的下一步。
     """
     client_id, client_secret = client_credentials()
     if not client_id or not client_secret:
@@ -127,8 +207,11 @@ def authorize(channel: str, expected_channel_id: str = "") -> dict:
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
             "redirect_uris": [
-                "http://localhost:%d" % _LOCAL_SERVER_PORT,
-                "http://127.0.0.1:%d" % _LOCAL_SERVER_PORT,
+                _loopback_uri("localhost", port)
+                for port in _LOCAL_SERVER_PORT_CANDIDATES
+            ] + [
+                _loopback_uri("127.0.0.1", port)
+                for port in _LOCAL_SERVER_PORT_CANDIDATES
             ],
         }
     }
@@ -136,7 +219,42 @@ def authorize(channel: str, expected_channel_id: str = "") -> dict:
         client_config, scopes=YOUTUBE_SCOPES
     )
     # prompt="consent" 每次都显示账号/频道选择页，这是能绑到不同频道的前提。
-    credentials = flow.run_local_server(port=_LOCAL_SERVER_PORT, prompt="consent")
+    try:
+        credentials = flow.run_local_server(
+            port=_LOCAL_SERVER_PORT_CANDIDATES[0], prompt="consent"
+        )
+    except OSError as exc:
+        # 端口被占用时顺延到下一个候选再试一次。占用本身不是授权失败。
+        for port in _LOCAL_SERVER_PORT_CANDIDATES[1:]:
+            try:
+                credentials = flow.run_local_server(port=port, prompt="consent")
+                break
+            except OSError:
+                continue
+        else:
+            why, how = explain_oauth_failure(exc)
+            return {
+                "success": False,
+                "channel": channel,
+                "error": f"local callback port unavailable: {exc}",
+                "error_hint": why,
+                "error_fix": (
+                    "Ports "
+                    f"{_LOCAL_SERVER_PORT_CANDIDATES[0]}-"
+                    f"{_LOCAL_SERVER_PORT_CANDIDATES[-1]} are all in use. "
+                    "Close whatever is holding them and try again."
+                ),
+            }
+    except Exception as exc:  # noqa: BLE001 - 见 docstring：失败要变成可读结果
+        why, how = explain_oauth_failure(exc)
+        logger.warning(f"youtube authorization failed for {channel!r}: {exc}")
+        return {
+            "success": False,
+            "channel": channel,
+            "error": str(exc)[:300],
+            "error_hint": why,
+            "error_fix": how,
+        }
 
     target = token_path(channel)
     meta: dict = {

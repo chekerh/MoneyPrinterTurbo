@@ -557,6 +557,7 @@
         "Login Client Setup": "创建一个 Google OAuth 客户端，填在下面，然后逐个频道登录。",
         "Login Client Setup Title": "配置 Google API 客户端（只需一次）",
         "Login Client Saved": "凭据已保存——现在可以在下面逐个频道登录。",
+        "Login Redirect Hint": "如果 OAuth 客户端是 Web 应用，请把这条填进「已授权的重定向 URI」：{uri}（Desktop 应用无需填写）。",
         "Login Sign In Blocked": "填好客户端 ID 与密钥之前，登录按钮不会生效。",
         "Login Open Google Console": "打开 Google Cloud 控制台",
         "Login Step Project": "新建一个项目（名字随意）。",

@@ -8058,7 +8058,14 @@ def _render_youtube_connect_button(channel: str, *, button_key: str, result_key:
                 }
                 st.rerun()
             else:
-                st.error(authorization.get("error") or tr("Channel Login Failed"))
+                # 授权失败以前只显示一行原始错误，用户得自己把
+                # redirect_uri_mismatch 这种词翻译成"客户端类型建错了"。这里把
+                # 服务端给出的原因和下一步直接摆出来。
+                if authorization.get("error_fix"):
+                    st.error(authorization.get("error_hint") or tr("Channel Login Failed"))
+                    st.info(authorization["error_fix"])
+                else:
+                    st.error(authorization.get("error") or tr("Channel Login Failed"))
 
 
 def _remembered_youtube_login(channel: str, *, result_key: str):
@@ -8747,6 +8754,15 @@ def _page_login():
                 ).strip()
                 if client_id and client_secret:
                     st.success(tr("Login Client Saved"))
+
+        if client_id and client_secret:
+            # Desktop 客户端不需要填回调地址；Web 客户端必须填这一条。把它摆在
+            # 屏幕上，用户就不必猜 —— redirect_uri_mismatch 的原因九成是这个。
+            st.caption(
+                tr("Login Redirect Hint").format(
+                    uri=youtube_upload.redirect_uri_hint()
+                )
+            )
 
         channels = [c for c in plans.list_channels() if c]
         if not channels:

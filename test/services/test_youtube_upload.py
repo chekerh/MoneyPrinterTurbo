@@ -244,3 +244,76 @@ class TestPublishingRegistry(_CredsBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestOAuthFailureIsReadable:
+    """OAuth 失败必须变成"错在哪、怎么改"，而不是一段 traceback。
+
+    背景：Google 在跳回本地回调之前就把错误页渲染在浏览器里，本地回调服务器
+    永远看不到它，`run_local_server` 只能等到超时。于是异常一路冒到 CLI，
+    用户拿到的是 Python traceback，而 `redirect_uri_mismatch` 这种词没人知道
+    该怎么处理——它其实九成是"OAuth 客户端建成了 Web 应用而不是 Desktop"。
+    """
+
+    def test_each_known_error_gets_a_diagnosis(self):
+        from app.services.youtube_upload import explain_oauth_failure
+
+        for code in (
+            "redirect_uri_mismatch",
+            "access_denied",
+            "invalid_client",
+        ):
+            why, how = explain_oauth_failure(code)
+            assert why.strip(), f"{code} 没有给出原因"
+            assert how.strip(), f"{code} 没有给出下一步"
+
+    def test_redirect_mismatch_names_the_real_cause(self):
+        from app.services.youtube_upload import explain_oauth_failure
+
+        why, how = explain_oauth_failure("Error 400: redirect_uri_mismatch")
+        assert "Desktop app" in why
+        assert "Desktop app" in how
+
+    def test_unknown_error_still_returns_something_readable(self):
+        from app.services.youtube_upload import explain_oauth_failure
+
+        why, how = explain_oauth_failure("some brand new failure")
+        assert why.strip() and how.strip()
+
+    def test_authorize_returns_structured_failure_instead_of_raising(self):
+        """authorize() 失败时返回结构化结果，绝不抛异常。"""
+        from unittest.mock import patch
+
+        from app.services import youtube_upload
+
+        saved_id = youtube_upload.config.app.get("youtube_upload_client_id", "")
+        saved_secret = youtube_upload.config.app.get("youtube_upload_client_secret", "")
+        youtube_upload.config.app["youtube_upload_client_id"] = "fake-id"
+        youtube_upload.config.app["youtube_upload_client_secret"] = "fake-secret"
+        try:
+            with patch.object(
+                youtube_upload.InstalledAppFlow,
+                "run_local_server",
+                side_effect=TimeoutError("timed out waiting for the browser"),
+            ):
+                result = youtube_upload.authorize("some-niche")
+        finally:
+            for key, value in (
+                ("youtube_upload_client_id", saved_id),
+                ("youtube_upload_client_secret", saved_secret),
+            ):
+                if value:
+                    youtube_upload.config.app[key] = value
+                else:
+                    youtube_upload.config.app.pop(key, None)
+
+        assert result["success"] is False
+        assert result["error_hint"], "失败结果必须带可读原因"
+        assert result["error_fix"], "失败结果必须带下一步"
+
+    def test_redirect_uri_hint_matches_what_the_flow_actually_sends(self):
+        """屏幕上的提示必须和真正发出去的回调地址逐字一致（含结尾斜杠）。"""
+        from app.services.youtube_upload import redirect_uri_hint
+
+        hint = redirect_uri_hint()
+        assert hint.startswith("http://localhost:")
+        assert hint.endswith("/"), "缺结尾斜杠就会和 Google 的匹配规则对不上"

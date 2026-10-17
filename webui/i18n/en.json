@@ -557,6 +557,7 @@
         "Login Client Setup": "Create one Google OAuth client, paste it below, then sign in once per niche.",
         "Login Client Setup Title": "Set up the Google API client (one time)",
         "Login Client Saved": "Credentials saved — you can sign in each niche below.",
+        "Login Redirect Hint": "If your OAuth client is a Web app, add this Authorized redirect URI: {uri} (Desktop apps need nothing).",
         "Login Sign In Blocked": "Sign-in buttons stay inactive until the client ID and secret are filled in above.",
         "Login Open Google Console": "Open Google Cloud Console",
         "Login Step Project": "Create a project (any name will do).",
