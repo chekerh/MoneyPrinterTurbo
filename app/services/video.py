@@ -463,7 +463,6 @@ def mux_audio(
     bgm_volume: float = 0.2,
     voice_volume: float = 1.0,
     threads: int = 2,
-    codec: str | None = None,
 ) -> bool:
     """
     在已有画音的视频上混一层背景音乐，输出成片。
@@ -471,8 +470,11 @@ def mux_audio(
     输入视频自带旁白音轨（分段渲染时逐段混入、拼接时 ``-c:a copy`` 保留），
     因此这里只处理 BGM：
 
-    - 没有 BGM 时是纯重封装，画面不重编码；
+    - 没有 BGM 时是纯重封装；
     - 有 BGM 时用 ``amix`` 混合，BGM 用 ``-stream_loop`` 循环到视频时长。
+
+    画面在两种情况下都直接 ``-c:v copy``：混音只改音频，重编码既没必要，
+    也会让一条 10 分钟的成片白白多花十几分钟并损失一次画质。
 
     刻意走 ffmpeg 而不是 MoviePy：MoviePy 的 ``CompositeAudioClip`` 对几十分钟
     的音频会解码成 numpy 数组驻留内存，而这里只是两条音轨按权重相加，
@@ -481,11 +483,9 @@ def mux_audio(
     Returns:
         True 表示成片已写入；False 表示失败，此时不删除输入文件。
     """
-    effective_codec = codec or _get_effective_video_codec()
-
     command = [utils.get_ffmpeg_binary(), "-y", "-hide_banner", "-loglevel", "error", "-i", video_path]
 
-    if bgm_file and path.exists(bgm_file):
+    if bgm_file and os.path.exists(bgm_file):
         try:
             volume = max(float(bgm_volume or 0.0), 0.0)
         except (TypeError, ValueError):
@@ -513,7 +513,7 @@ def mux_audio(
             "-map",
             "[mix]",
             "-c:v",
-            effective_codec,
+            "copy",
             "-c:a",
             "aac",
             "-shortest",
@@ -542,7 +542,7 @@ def mux_audio(
         )
         return False
 
-    if not path.exists(output_file):
+    if not os.path.exists(output_file):
         logger.error(f"audio mux reported success but {output_file} is missing")
         return False
     return True

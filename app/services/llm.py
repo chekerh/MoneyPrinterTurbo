@@ -30,6 +30,14 @@ _transient_error_markers = (
     "resource_exhausted",
     "unavailable",
     "temporarily",
+    "nodename nor servname",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "connection reset",
+    "connection aborted",
+    "broken pipe",
+    "timed out",
+    "timeout",
 )
 # 429 with these markers is a permanent billing/exhaustion state, not a throttle:
 # retrying it only burns backoff time. Anything else on 429 stays transient.
@@ -370,6 +378,7 @@ def _generate_response_once(prompt: str, app_config=None) -> str:
             # 不再调用 Workers AI 的 /ai/run/{model} 专用接口。
             client = OpenAI(
                 api_key=api_key,
+                max_retries=_max_retries,
                 base_url=(
                     f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
                 ),
@@ -410,6 +419,7 @@ def _generate_response_once(prompt: str, app_config=None) -> str:
             logger.info(f"requesting azure chat completion, model: {model_name}")
             client = AzureOpenAI(
                 api_key=api_key,
+                max_retries=_max_retries,
                 api_version=api_version,
                 azure_endpoint=base_url,
             )
@@ -433,6 +443,7 @@ def _generate_response_once(prompt: str, app_config=None) -> str:
             content = ""
             client = OpenAI(
                 api_key=api_key,
+                max_retries=_max_retries,
                 base_url=base_url,
             )
             response = client.chat.completions.create(
@@ -488,6 +499,19 @@ def _is_transient_llm_error(error) -> bool:
     a plain-text message inside the exception. Anything else (bad key, invalid
     model, network refuse) is permanent and must fail immediately.
     """
+    import socket
+
+    # DNS / socket / timeout failures are transport-level and often transient.
+    if isinstance(error, (socket.gaierror, ConnectionError, TimeoutError)):
+        return True
+    # Some SDKs wrap the original cause; unwrap one level.
+    for attr in ("__cause__", "__context__"):
+        cause = getattr(error, attr, None)
+        if cause is not None and cause is not error:
+            if _is_transient_llm_error(cause):
+                return True
+            break
+
     status = getattr(error, "status_code", None)
     if status is None:
         status = getattr(error, "code", None)
@@ -1043,9 +1067,13 @@ Write section {section_index} of {section_count} of a long-form narrated video.
             if len(cleaned) < 40:
                 last_error = f"section text was suspiciously short ({len(cleaned)} chars)"
                 continue
-            if attempt < _max_retries - 1:
+            # 只有**之前**真的失败过才值得告警。成功时这里直接返回；若在
+            # last_error 仍为空时打印 "rejected"，每一段都会声称自己被拒，
+            # 运维会去追一个根本不存在的质量问题。
+            if last_error:
                 logger.warning(
-                    f"section {section_index} rejected ({last_error}), retrying..."
+                    f"section {section_index} recovered after "
+                    f"attempt {attempt + 1} ({last_error})"
                 )
             return cleaned
         except Exception as exc:  # noqa: BLE001 - 单段失败只应重试本段
@@ -1171,10 +1199,10 @@ def longform_parse_json(response: str):
 #: 幻灯片 JSON 的 schema。这几种变体是刻意的：一张通篇只有标题的卡片看起来
 #: 就是"PPT 模板"，而数字卡和引语卡能提供视觉节奏上的对比。
 _SLIDE_SCHEMA = """[
-  {"kind": "section", "kicker": "short label or empty", "title": "headline", "bullets": ["point", "point"]},
-  {"kind": "stat", "stat": "the number or short phrase", "stat_caption": "what the number means"},
-  {"kind": "quote", "quote": "the quoted claim", "attribution": "who said it"},
-  {"kind": "compare", "left": "one side", "right": "the other side"}
+  {"section": 1, "kind": "section", "kicker": "short label or empty", "title": "headline", "bullets": ["point", "point"]},
+  {"section": 1, "kind": "stat", "stat": "the number or short phrase", "stat_caption": "what the number means"},
+  {"section": 2, "kind": "quote", "quote": "the quoted claim", "attribution": "who said it"},
+  {"section": 2, "kind": "compare", "left": "one side", "right": "the other side"}
 ]"""
 
 
@@ -1193,6 +1221,8 @@ def generate_slide_plan(
     roster = "\n".join(
         f"{entry.get('index')}. {entry.get('title') or ''} — "
         f"{entry.get('intent') or ''}\n"
+        f"   target cards: {int(entry.get('cards') or 1)} "
+        f"(covers {entry.get('duration') or 0}s of narration)\n"
         f"   narration starts: {(entry.get('preview') or '')[:260]}"
         for entry in section_summaries
     )
@@ -1206,21 +1236,30 @@ def generate_slide_plan(
 Plan the on-screen cards for a long-form explainer video. Each card replaces the
 stock footage for the stretch of narration it covers, so the card must actually
 say something useful — a viewer should be able to read the card and still follow
-the narration.
+the narration. A card that stays on screen for a minute makes the video look
+frozen, so sections are split into several cards.
 
 ## Constraints:
 1. Return ONLY a JSON array matching this schema:
 {_SLIDE_SCHEMA}
-2. Produce exactly one "section" card per section listed below, in the same
-   order. You may insert "stat", "quote" or "compare" cards between them.
-3. 2 to 5 bullets per section card. Each bullet is one line, under 140
+2. Every entry carries "section": the section number it belongs to. Produce
+   exactly the "target cards" count for each section, in section order.
+3. Each section's first card is its chapter title card ("kind": "section" with
+   that section's title). Prefer drawing the remaining cards as "stat", "quote",
+   "compare" or additional "section" cards that cover different moments of the
+   narration — never repeat the same fact twice.
+4. 1 to 3 bullets per section card. Each bullet is one line, under 140
    characters. Never repeat the title as a bullet.
-4. Never write a card that just restates the title. If a section has nothing
+5. Never write a card that just restates the title. If a section has nothing
    concrete to put on screen, use its title and the single strongest fact.
-5. Use "stat" only when the narration states a real number, share or
-   magnitude. Never invent a figure to fill the layout.
-6. No slide numbers, no page furniture, no "thank you" or "subscribe" cards.
-7. Card text is display copy: short, concrete, no sentences longer than one line.
+6. Use "stat" only when the narration states a real number, share or
+   magnitude. A stat card must fill both "stat" and "stat_caption". Never
+   invent a figure to fill the layout.
+7. A "compare" card must fill both "left" and "right", one side each. Do not
+   put comparison content in "bullets".
+8. A "quote" card must fill both "quote" and "attribution".
+9. No slide numbers, no page furniture, no "thank you" or "subscribe" cards.
+10. Card text is display copy: short, concrete, no sentences longer than one line.
 {language_rule}
 
 ## Context:

@@ -25,11 +25,11 @@ from app.services import (
     loomloom,
     material,
     posting_package,
-    section_materials,
     section_render,
     slide_source,
     sonilo,
     subtitle,
+    subtitle_normalize,
     task_artifacts,
     twelvelabs,
     video,
@@ -649,6 +649,28 @@ def generate_audio(
         return None, None, None
 
     if not custom_audio_file:
+        # 空 voice_name 不是"无配音"（那是 voice.NO_VOICE_NAME 的语义），
+        # 只代表调用方没有指定。直调 task.start 的接口、定时任务和脚本经常
+        # 省略该字段；原样下传时 azure_tts_v1 会收到 '' 并抛 Invalid voice，
+        # 分段 TTS 还会因此放弃整条旁白。回落到 [ui].voice_name（WebUI 与
+        # CLI 保存的是同一份配置），两者都空才失败，并给出可执行的提示。
+        if not str(params.voice_name or "").strip():
+            configured_voice = str((config.ui or {}).get("voice_name") or "").strip()
+            if not configured_voice:
+                _mark_task_failed(
+                    task_id,
+                    "audio",
+                    "no TTS voice configured: pass voice_name or set "
+                    "[ui].voice_name in config.toml "
+                    "(use 'no-voice' for a silent video)",
+                )
+                return None, None, None
+            logger.warning(
+                "voice_name missing from the request, falling back to the "
+                f"configured voice: {configured_voice}"
+            )
+            params.voice_name = configured_voice
+
         reusable_preview = _resolve_reusable_voice_preview(
             task_id,
             params,
@@ -723,6 +745,18 @@ def generate_audio(
         return custom_audio_file, audio_duration, None
 
 
+def _uses_sectioned_longform(task_id, params) -> bool:
+    """这条任务是否走分段长视频路径。判定失败一律当短视频。"""
+    try:
+        channel = resolve_task_channel(task_id, params)
+        band, _ = longform_pipeline.resolve_longform_request(params, channel)
+        return bool(band.sectioned)
+    except Exception:  # noqa: BLE001 - 判定失败不能影响字幕产出
+        return longform.resolve_band(
+            getattr(params, "content_length", "short")
+        ).sectioned
+
+
 def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     """
     Generate subtitle for the video script.
@@ -778,6 +812,12 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         logger.warning(f"subtitle file is invalid: {subtitle_path}")
         return ""
 
+    # 长视频的逐词时间轴会产生零长碎片和多秒长句，成片里表现为字幕闪烁。
+    # 只在分段长视频路径上归一化，短视频字幕保持原样。
+    if _uses_sectioned_longform(task_id, params) and os.path.exists(subtitle_path):
+        if subtitle_normalize.normalize_srt_file(subtitle_path):
+            logger.info("normalized long-form subtitle timing")
+
     return subtitle_path
 
 
@@ -792,8 +832,10 @@ def get_slide_materials(
     """
     ``video_source="slides"`` 的素材阶段：渲染幻灯片并转成素材列表。
 
-    返回的是**图片路径列表**，与 ``video_source="local"`` 分支保持同一种返回
-    形状，因此下游的渲染阶段不需要区分素材是库存视频还是幻灯片截图。
+    返回的是**视频片段路径列表**（幻灯片先渲成 PNG，再转成固定时长的 mp4），
+    与 ``video_source="local"`` 分支保持同一种返回形状，因此下游的渲染阶段
+    不需要区分素材是库存视频还是幻灯片截图。转换这一步不能省：拼接阶段只
+    接受视频文件，图片路径会让 MoviePy 直接报错。
 
     幻灯片的停留时长由各段口播时长决定（一张幻灯片覆盖一段），所以段数
     不会远多于幻灯片数；这里不做等分，而是把每段的实际时长挂到对应幻灯片上，
@@ -825,16 +867,76 @@ def get_slide_materials(
         return None
 
     logger.info(f"slide materials ready: {len(rendered)} images")
-    return rendered
+
+    # 下游的 combine_videos 只认视频片段。这里必须完成图片→视频的转换，否则
+    # MoviePy 会把 PNG 当视频探测，任务在最后一步报
+    # "Error passing `ffmpeg -i` command output" 然后整条失败。
+    slides = list(getattr(rendered, "slides", []))
+    clips = slide_source.slides_to_video_clips(
+        rendered,
+        output_dir=utils.task_dir(task_id),
+        video_aspect=params.video_aspect,
+        clip_seconds=float(getattr(params, "video_clip_duration", 0) or 0),
+        durations=[slide.duration for slide in slides] if slides else None,
+        section_indices=(
+            [slide.section_index for slide in slides] if slides else None
+        ),
+    )
+    if not clips:
+        _mark_task_failed(
+            task_id,
+            "materials",
+            "failed to convert rendered slides into video clips",
+        )
+        return None
+
+    logger.info(f"slide materials ready: {len(clips)} video clips")
+    return clips
 
 
 def _plan_slide_content(task_id, params, video_script, longform_plan):
-    """产出幻灯片列表：优先让模型规划，失败或过少时用兜底规划补齐。"""
+    """产出幻灯片列表，按每段口播时长决定卡片密度。
+
+    长视频的观感瓶颈不在"有没有卡"，而在**一张卡停多久**。旧实现一段一张，
+    一张静态图顶一百秒，观众看到的是静止画面加一条在变的字幕。这里按约 15
+    秒一张算出每段的目标张数，让模型按张数填内容，不足的用兜底规划补齐，
+    最后把该段时长均分回它的每张卡——卡片的 ``duration`` 因此就是它在成片
+    里应占的时长，拼接阶段不再循环播放同一张图。
+    """
     sections = list(longform_plan.outline) if longform_plan else []
     target_seconds = int(longform_plan.target_seconds) if longform_plan else 0
+    long_path = longform_plan is not None and bool(sections)
 
-    slides: list = []
-    if sections:
+    if not sections:
+        # 没有分段（短视频配幻灯片源）：整篇脚本当一段处理，维持原来
+        # "一张卡铺满"的行为，短片路径不因这次改动而变形。
+        from app.services.longform import Section
+
+        estimated = max(
+            len(video_script.split()) / max(longform.WORDS_PER_SECOND_EN, 0.1),
+            60.0,
+        )
+        sections = [
+            Section(
+                index=1,
+                title=params.video_subject,
+                text=video_script,
+            )
+        ]
+        target_seconds = int(estimated)
+
+    # 每段的目标张数。短视频路径固定 1 张。
+    counts: dict[int, int] = {}
+    for section in sections:
+        if long_path:
+            counts[int(section.index)] = slide_source.cards_for_duration(
+                float(section.duration or 0.0)
+            )
+        else:
+            counts[int(section.index)] = 1
+
+    planned: list = []
+    if long_path:
         summaries = [
             {
                 "index": section.index,
@@ -842,6 +944,7 @@ def _plan_slide_content(task_id, params, video_script, longform_plan):
                 "intent": section.intent,
                 "preview": section.text,
                 "duration": round(section.duration, 1),
+                "cards": counts[int(section.index)],
             }
             for section in sections
         ]
@@ -851,47 +954,58 @@ def _plan_slide_content(task_id, params, video_script, longform_plan):
                 video_subject=params.video_subject,
                 video_language=str(getattr(params, "video_language", "") or ""),
             )
-            slides = slide_source.coerce_slides(payload)
+            planned = slide_source.coerce_slides(payload)
         except Exception as exc:  # noqa: BLE001 - 降级到兜底规划
             logger.warning(f"slide planning failed, using fallback: {exc}")
 
-    if not slides:
-        if not sections:
-            # 没有分段（短视频配幻灯片源）：整篇脚本当一段处理。
-            from app.services.longform import Section
+    # 把模型给的卡片按 ``section_index`` 分组。模型偶尔会省略归属，这时按
+    # 顺序摊回各段——总比把所有卡塞进第一段、让后面的段没画面好。
+    by_section: dict[int, list] = {int(section.index): [] for section in sections}
+    loose: list = []
+    for slide in planned:
+        owner = int(getattr(slide, "section_index", 0) or 0)
+        if owner in by_section:
+            by_section[owner].append(slide)
+        else:
+            loose.append(slide)
+    if loose:
+        order = [int(section.index) for section in sections]
+        for offset, slide in enumerate(loose):
+            by_section[order[offset % len(order)]].append(slide)
 
-            sections = [Section(index=1, title=params.video_subject, text=video_script)]
-            target_seconds = max(
-                longform.words_for_target(
-                    len(video_script.split()), cjk=False
-                )
-                // max(longform.WORDS_PER_SECOND_EN, 1),
-                60,
-            )
-        slides = slide_source.plan_slides(
-            sections,
-            target_seconds=target_seconds or 60,
-            per_section=1,
-        )
-
-    # 幻灯片数量不该少于分段数：一张都没有对应段落的分段会被渲染成素材空档。
-    if sections and len(slides) < len(sections):
-        logger.info(
-            f"slide plan has {len(slides)} slides for {len(sections)} sections; "
-            "padding with fallback slides"
-        )
-        padded = slide_source.plan_slides(
-            sections, target_seconds=target_seconds or 60, per_section=1
-        )
-        slides = (slides + padded)[: len(sections)]
-
-    # 把每段的实际时长挂到对应幻灯片上，供素材轨按真实口播时长取用。
-    cursor = 0.0
+    slides: list = []
     for section in sections:
-        if cursor >= len(slides):
-            break
-        slides[cursor].duration = max(float(section.duration or 0.0), 0.0)
-        cursor += 1
+        index = int(section.index)
+        count = max(int(counts.get(index, 1)), 1)
+        cards = by_section[index][:count]
+
+        missing = count - len(cards)
+        if missing > 0:
+            filler = slide_source.plan_slides(
+                [section],
+                target_seconds=target_seconds or 60,
+                per_section=count,
+            )
+            # 兜底规划的第一张是章节标题页。模型已经给了卡片时跳过它，
+            # 否则同一段会出现两张标题卡。
+            pool = filler[1:] if cards else filler
+            cards.extend(pool[:missing])
+
+        total = max(float(section.duration or 0.0), 0.0)
+        share = total / len(cards) if cards else 0.0
+        for offset, card in enumerate(cards):
+            card.section_index = index
+            card.duration = share
+            if offset == 0 and not str(card.title or "").strip():
+                card.title = str(section.title or "")
+            elif offset > 0 and not str(card.kicker or "").strip():
+                card.kicker = str(section.title or "")
+        slides.extend(cards)
+
+    logger.info(
+        f"slide plan: {len(slides)} cards across {len(sections)} sections "
+        f"(target {sum(counts.values())} cards)"
+    )
     return slides
 
 
@@ -1111,6 +1225,7 @@ def generate_longform_final_video(
         downloaded_videos,
         total_seconds=audio_duration,
         clip_duration=params.video_clip_duration,
+        section_owners=getattr(downloaded_videos, "section_owners", None),
     )
 
     rendered = section_render.render_sections(
@@ -1158,6 +1273,20 @@ def generate_longform_final_video(
                     "video_index": 1,
                 }
             )
+
+    # 随机 / Blast Off / 用户上传的 BGM 在短视频路径里由 generate_video 解析。
+    # 长视频最终只做一次 mux，不经过 generate_video，所以这里必须显式解析，
+    # 否则 bgm_type=random 这类最常见的配置会被静默丢掉——成片有声音，没有音乐。
+    if bgm_file_override is None and bgm_service.should_use_bgm(
+        params.bgm_type, params.bgm_volume
+    ):
+        bgm_file_override = (
+            video.get_bgm_file(
+                bgm_type=params.bgm_type,
+                bgm_file=params.bgm_file,
+            )
+            or ""
+        )
 
     # 拼接产物只含画面和旁白；字幕已在分段渲染时逐段烧录。因此这里只做
     # 一次 BGM 混音，不能再走 generate_video（那会重复叠加字幕）。
@@ -1856,6 +1985,12 @@ def _run_pipeline(
             "audio",
             "failed to prepare narration audio",
         )
+
+    if longform_plan is not None:
+        # TTS 完成后 ``section.duration`` 才被回填。这里再写一次清单，否则
+        # 从 script.json 恢复的任务拿到的是全 0 时长，分段渲染会直接判成
+        # "zero duration" 而中止整条片子。
+        task_artifacts.patch_script_data(task_id, longform=longform_plan.to_dict())
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=30)
 

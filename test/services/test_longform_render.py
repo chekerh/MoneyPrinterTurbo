@@ -8,7 +8,6 @@
 
 import os
 import subprocess
-import tempfile
 
 import pytest
 
@@ -68,15 +67,26 @@ def _make_srt(path, entries):
     return path
 
 
-class _Params:
-    """只提供 ``_render_one_section`` 会读到的字段。"""
+def _params(**overrides):
+    """用真实的 ``VideoParams``，而不是手搓的桩对象。
 
-    video_aspect = "16:9"
-    video_concat_mode = None
-    video_transition_mode = None
-    video_clip_duration = 3
-    video_clip_speed = 1.0
-    n_threads = 2
+    手搓桩会漏掉 ``generate_video`` 读到的字段，测试变成"跟着报错逐个补字段"，
+    既慢又测不到真实参数组合。
+    """
+    from app.models.schema import VideoParams
+
+    base = dict(
+        video_subject="long-form smoke test",
+        video_aspect="16:9",
+        video_concat_mode="sequential",
+        video_clip_duration=3,
+        n_threads=2,
+        subtitle_enabled=False,
+        bgm_type="",
+        bgm_volume=0,
+    )
+    base.update(overrides)
+    return VideoParams(**base)
 
 
 class TestSectionRenderEndToEnd:
@@ -109,7 +119,7 @@ class TestSectionRenderEndToEnd:
 
         output = section_render.render_sections(
             task_id="longform-smoke",
-            params=_Params(),
+            params=_params(),
             sections=sections,
             section_materials=buckets,
             audio_file=audio,
@@ -145,7 +155,7 @@ class TestSectionRenderEndToEnd:
 
         output = section_render.render_sections(
             task_id="longform-smoke-gap",
-            params=_Params(),
+            params=_params(),
             sections=sections,
             section_materials=buckets,
             audio_file=audio,
@@ -155,8 +165,8 @@ class TestSectionRenderEndToEnd:
 
     def test_completed_sections_are_reused_on_rerun(self, tmp_path):
         """分段渲染的存在理由就是可中断：重跑时不该把已完成的段重渲一遍。"""
-        task_dir = str(tmp_path / "task3")
-        os.makedirs(task_dir, exist_ok=True)
+        task_id = "longform-smoke-resume"
+        from app.utils import utils
 
         materials = [_make_clip(str(tmp_path / f"r{i}.mp4"), "green", seconds=4) for i in range(4)]
         audio = _make_audio(str(tmp_path / "r.mp3"), seconds=6)
@@ -168,8 +178,8 @@ class TestSectionRenderEndToEnd:
         buckets = [materials[0:2], materials[2:4]]
 
         kwargs = dict(
-            task_id="longform-smoke-resume",
-            params=_Params(),
+            task_id=task_id,
+            params=_params(),
             sections=sections,
             section_materials=buckets,
             audio_file=audio,
@@ -177,9 +187,9 @@ class TestSectionRenderEndToEnd:
         )
         assert section_render.render_sections(**kwargs)
 
-        render_dir = os.path.join(str(tmp_path / "task3"), "sections")
+        # 真实落盘路径是由 task_id 决定的，不是测试临时目录。
+        render_dir = os.path.join(utils.task_dir(task_id), "sections")
         first = os.path.join(render_dir, "section-001.mp4")
-        stamp = os.path.getmtime(first)
 
         # 记录内容指纹，确认重跑后仍然是同一个文件（没有被重写）。
         before = open(first, "rb").read()
@@ -207,13 +217,38 @@ class TestSectionRenderEndToEnd:
         audio = _make_audio(str(tmp_path / "z.mp3"), seconds=3)
         output = section_render.render_sections(
             task_id="longform-smoke-zero",
-            params=_Params(),
+            params=_params(),
             sections=[Section(index=1, title="一", duration=0.0)],
             section_materials=[[]],
             audio_file=audio,
             subtitle_path="",
         )
         assert output is None
+
+
+class TestSubtitleRoundTrip:
+    def test_moviepy_parses_every_written_block(self, tmp_path):
+        """用 MoviePy 自己的解析器验收。
+
+        MoviePy 的 ``file_to_subtitles`` 只在读到空行时才收尾一个字幕块，
+        末尾少一个空行就会静默丢掉最后一条——不报错，只是字幕悄悄少一句。
+        用项目自己的 parse_srt 验收抓不到这个 bug，必须用下游那个解析器。
+        """
+        from moviepy.video.tools.subtitles import file_to_subtitles
+
+        target = str(tmp_path / "roundtrip.srt")
+        entries = [
+            section_render.SrtEntry(0.0, 2.0, "第一条"),
+            section_render.SrtEntry(2.0, 4.0, "第二条"),
+            section_render.SrtEntry(4.0, 6.0, "第三条"),
+        ]
+        assert section_render.write_srt(entries, target)
+
+        parsed = file_to_subtitles(target, encoding="utf-8")
+        assert len(parsed) == len(entries), (
+            f"moviepy only recovered {len(parsed)}/{len(entries)} blocks"
+        )
+        assert [text.strip() for _, text in parsed] == ["第一条", "第二条", "第三条"]
 
 
 class TestSubtitleWindowing:

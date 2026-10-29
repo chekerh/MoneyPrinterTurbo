@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Iterable
@@ -32,6 +33,9 @@ from app.utils import utils
 __all__ = [
     "MAX_CHUNK_CHARS",
     "MIN_CHUNK_CHARS",
+    "CHUNK_RETRY_ROUNDS",
+    "CHUNK_RETRY_DELAYS",
+    "CONSECUTIVE_CHUNK_FAILURE_LIMIT",
     "split_for_tts",
     "tts_chunked",
     "merge_sub_makers",
@@ -43,6 +47,16 @@ __all__ = [
 MAX_CHUNK_CHARS = 1500
 #: 单段下限。一句话被硬切成两半会破坏 TTS 的韵律，宁可和相邻句子合并。
 MIN_CHUNK_CHARS = 120
+
+#: 最多尝试几轮。第一轮跑完全部分段，之后每轮只重试失败的那些。edge-tts
+#: 偶发 30 秒不吐字节，隔几秒再试通常就好了；而一篇十几分钟的旁白里任何
+#: 单点失败都会让已合成的部分全部作废，所以值得多给几次机会。
+CHUNK_RETRY_ROUNDS = 3
+#: 第 n 轮重试前的等待秒数（退避）。轮数多于这里的长度时沿用最后一个值。
+CHUNK_RETRY_DELAYS = (2.0, 10.0)
+#: 连续这么多段都失败就认为不是抖动而是服务不可用，立刻收手，别把剩下的
+#: 轮次和等待时间浪费掉。
+CONSECUTIVE_CHUNK_FAILURE_LIMIT = 3
 
 #: 100 纳秒单位。项目里 edge_tts SubMaker 和 legacy offset 都用这个单位。
 HUNDRED_NANOS_PER_SECOND = 10_000_000
@@ -311,11 +325,14 @@ def tts_chunked(
     与 ``voice.tts()`` 的契约保持一致：成功返回 ``(sub_maker, voice_file)``，
     失败返回 ``None``，调用方只需判空。
 
-    ``on_chunk_done(index, total, duration)`` 用于进度回报——长视频合成十几分钟
-    没有任何日志会让运维以为任务卡死。
+    ``on_chunk_done(completed, total, duration)`` 用于进度回报——长视频合成
+    十几分钟没有任何日志会让运维以为任务卡死。第一个参数是**已完成**的分段
+    数，不是当前分段序号：重试会让分段乱序完成，传序号会让进度条倒退。
 
     分段音频先落在 ``chunk_dir``（默认音频文件同级目录），全部成功后才拼接。
-    任何一段失败就整体放弃并返回 None：半条旁白配半条素材比整条失败更难排查。
+    第一轮跑完全部分段，失败的那些在后续轮次里单独重试；只有重试轮次用尽
+    仍凑不齐、或服务明显不可用（连续多段失败 / 第一轮全灭）时才整体放弃。
+    半条旁白配半条素材比整条失败更难排查。
     """
     chunks = split_for_tts(text, max_chars=max_chars)
     if not chunks:
@@ -339,50 +356,98 @@ def tts_chunked(
         f"({sum(len(chunk) for chunk in chunks)} chars total)"
     )
 
-    parts: list[tuple[Any, float]] = []
-    chunk_files: list[Path] = []
+    parts: dict[int, tuple[Any, float]] = {}
+    chunk_files: dict[int, Path] = {}
+    pending = list(range(len(chunks)))
+    consecutive_failures = 0
 
-    for position, chunk in enumerate(chunks, start=1):
-        chunk_file = Path(chunk_dir) / f"narration-{position:03d}.mp3"
-        sub_maker = voice.tts(
-            text=chunk,
-            voice_name=voice_name,
-            voice_rate=voice_rate,
-            voice_file=str(chunk_file),
+    for round_index in range(CHUNK_RETRY_ROUNDS):
+        if not pending:
+            break
+        if round_index:
+            delay = CHUNK_RETRY_DELAYS[
+                min(round_index - 1, len(CHUNK_RETRY_DELAYS) - 1)
+            ]
+            logger.warning(
+                f"retrying {len(pending)} failed narration chunk(s) in round "
+                f"{round_index + 1}/{CHUNK_RETRY_ROUNDS} after {delay:g}s"
+            )
+            time.sleep(delay)
+
+        failed_this_round: list[int] = []
+        for offset in pending:
+            position = offset + 1
+            chunk_file = Path(chunk_dir) / f"narration-{position:03d}.mp3"
+            sub_maker = voice.tts(
+                text=chunks[offset],
+                voice_name=voice_name,
+                voice_rate=voice_rate,
+                voice_file=str(chunk_file),
+            )
+
+            # 用真实落盘文件测时长，不信 SubMaker 的最后一个词边界：TTS 在词边界
+            # 之后还会留一段固定尾巴（Edge TTS 约 0.88 秒），用错时长会让下一段
+            # 的字幕整体前移或后移。理由与 task.generate_audio 里的注释一致。
+            seconds = (
+                voice.get_audio_duration(str(chunk_file))
+                if sub_maker is not None
+                else 0.0
+            )
+            if sub_maker is None or seconds <= 0:
+                reason = "failed" if sub_maker is None else "produced zero-length audio"
+                failed_this_round.append(offset)
+                consecutive_failures += 1
+                logger.warning(
+                    f"narration chunk {position}/{len(chunks)} {reason} "
+                    f"(round {round_index + 1}/{CHUNK_RETRY_ROUNDS})"
+                )
+                if consecutive_failures >= CONSECUTIVE_CHUNK_FAILURE_LIMIT:
+                    logger.error(
+                        f"{consecutive_failures} narration chunks in a row failed; "
+                        "the TTS service looks unavailable, abandoning the whole "
+                        "narration"
+                    )
+                    return None
+                continue
+
+            consecutive_failures = 0
+            parts[offset] = (sub_maker, seconds)
+            chunk_files[offset] = chunk_file
+            if callable(on_chunk_done):
+                on_chunk_done(len(parts), len(chunks), seconds)
+
+        pending = failed_this_round
+        # 一段都没成功，说明不是抖动而是服务不可用；继续等下一轮只是浪费
+        # 时间，而且下一轮几乎必然也全灭。
+        if pending and not parts:
+            logger.error(
+                f"every narration chunk failed in round "
+                f"{round_index + 1}/{CHUNK_RETRY_ROUNDS}; abandoning the whole "
+                "narration"
+            )
+            return None
+
+    if pending:
+        failed = ", ".join(str(offset + 1) for offset in sorted(pending))
+        logger.error(
+            f"narration chunks still failing after {CHUNK_RETRY_ROUNDS} rounds: "
+            f"{failed}; abandoning the whole narration"
         )
-        if sub_maker is None:
-            logger.error(
-                f"narration chunk {position}/{len(chunks)} failed; "
-                "abandoning the whole narration"
-            )
-            return None
-
-        # 用真实落盘文件测时长，不信 SubMaker 的最后一个词边界：TTS 在词边界
-        # 之后还会留一段固定尾巴（Edge TTS 约 0.88 秒），用错时长会让下一段
-        # 的字幕整体前移或后移。理由与 task.generate_audio 里的注释一致。
-        seconds = voice.get_audio_duration(str(chunk_file))
-        if seconds <= 0:
-            logger.error(
-                f"narration chunk {position}/{len(chunks)} produced zero-length "
-                "audio; abandoning the whole narration"
-            )
-            return None
-
-        parts.append((sub_maker, seconds))
-        chunk_files.append(chunk_file)
-        if callable(on_chunk_done):
-            on_chunk_done(position, len(chunks), seconds)
-
-    if not _concat_audio_files(chunk_files, voice_file):
         return None
 
-    merged = merge_sub_makers(parts)
+    ordered_parts = [parts[offset] for offset in range(len(chunks))]
+    ordered_files = [chunk_files[offset] for offset in range(len(chunks))]
+
+    if not _concat_audio_files(ordered_files, voice_file):
+        return None
+
+    merged = merge_sub_makers(ordered_parts)
     if merged is None:
         return None
 
     # 分段音频是中间产物。删掉它们，但保留最后一份——某些 TTS 路径在返回的
     # SubMaker 里不携带完整文本，排查字幕问题时需要能重听。
-    for chunk_file in chunk_files:
+    for chunk_file in ordered_files:
         try:
             chunk_file.unlink(missing_ok=True)
         except OSError:

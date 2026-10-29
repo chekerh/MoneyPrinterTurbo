@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, List, Literal, Optional, Union
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.config import config
 
@@ -95,7 +95,7 @@ class VideoParams(BaseModel):
     content_length: str = Field(default="short", max_length=16)
     # 显式目标秒数，会被夹到 content_length 对应档位的区间内。留空则用赛道
     # 画像的长视频目标，再退到档位默认值。
-    content_target_seconds: Optional[int] = Field(default=None, ge=60, le=7200)
+    content_target_seconds: Optional[int] = Field(default=None, ge=60)
     video_script: str = ""  # Script used to generate the video
     video_terms: Optional[str | list] = None  # Keywords used to generate the video
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
@@ -147,6 +147,20 @@ class VideoParams(BaseModel):
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+
+    @model_validator(mode="after")
+    def _clamp_target_seconds_to_band(self) -> "VideoParams":
+        try:
+            from app.services import longform
+            band = longform.resolve_band(self.content_length)
+            if self.content_target_seconds is not None:
+                self.content_target_seconds = max(
+                    band.min_seconds, min(self.content_target_seconds, band.max_seconds)
+                )
+        except Exception:
+            pass
+        return self
+
 
 
 class SubtitleRequest(BaseModel):
@@ -201,10 +215,24 @@ class VideoScriptParams:
     # 脚本生成也要知道目标时长：medium/long 时 generate_script 会改走
     # "先大纲再逐段写"的路径。
     content_length: str = Field(default="short", max_length=16)
-    content_target_seconds: Optional[int] = Field(default=None, ge=60, le=7200)
+    content_target_seconds: Optional[int] = Field(default=None, ge=60)
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+
+    @model_validator(mode="after")
+    def _clamp_target_seconds_to_band(self) -> "VideoParams":
+        try:
+            from app.services import longform
+            band = longform.resolve_band(self.content_length)
+            if self.content_target_seconds is not None:
+                self.content_target_seconds = max(
+                    band.min_seconds, min(self.content_target_seconds, band.max_seconds)
+                )
+        except Exception:
+            pass
+        return self
+
 
 
 class VideoTermsParams:

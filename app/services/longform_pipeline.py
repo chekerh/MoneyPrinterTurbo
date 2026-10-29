@@ -23,7 +23,6 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any, Callable, Sequence
 
 from loguru import logger
@@ -399,11 +398,11 @@ def tts_longform_narration(
     def _chunk_done(index: int, total: int, _seconds: float) -> None:
         if not on_progress:
             return
-        # 音频阶段在总进度里占 20%→30%。
+        # 音频阶段在总进度里占 20%→30%。index 是已完成的分段数。
         span = 10 / max(total, 1)
         on_progress(
             20 + int(span * index),
-            f"narrating chunk {index}/{total}",
+            f"narrated {index}/{total} chunks",
         )
 
     result = tts_chunking.tts_chunked(
@@ -450,8 +449,9 @@ def _record_section_durations(
 
     try:
         cursor = 0
+        section_start = 0.0
         for section in sections:
-            section_end = cursor
+            section_end = section_start
             # 逐条消费 cue，直到文本长度覆盖本段文案。
             consumed = 0
             target_length = len(section.text.strip())
@@ -460,16 +460,30 @@ def _record_section_durations(
                 consumed += len(content)
                 section_end = cues[cursor].end.total_seconds()
                 cursor += 1
-            section.duration = max(section_end, 0.0)
+            # ``duration`` 是"本段时长"，不是"本段结束时间"。cue 的 end 是整条
+            # 旁白上的绝对时间，直接写进去会让分段渲染的切片游标每段多加上前面
+            # 所有段的时长：593 秒的旁白被切成 2125 秒的分段视频，后面每段的
+            # 素材轨和字幕全部错位。
+            section.duration = max(section_end - section_start, 0.0)
+            section_start = section_end
     except Exception as exc:  # noqa: BLE001 - 时长只是配额优化，不是必需项
         logger.warning(f"failed to attribute section durations: {exc}")
         _distribute_durations_by_weight(sections, script, total_seconds)
         return
 
+    # 某段文案没被念出来时 cue 会提前耗尽，后面的段全拿到 0 时长——而 0 时长
+    # 会让渲染直接中止整条片子。把还没分配的时间均分给这些段。
+    remaining = total_seconds - sum(section.duration for section in sections)
+    starved = [section for section in sections if section.duration <= 0]
+    if starved and remaining > 0:
+        share = remaining / len(starved)
+        for section in starved:
+            section.duration = share
+
     # 逐词 cue 可能因为断句对齐而略有出入，把最后一段兜底到总时长，
     # 避免累计时长比音频短，最后一段的素材因此被少分配。
     if sections and total_seconds > 0:
-        tail = total_seconds - sections[-1].duration
+        tail = total_seconds - sum(section.duration for section in sections)
         if tail > 0:
             sections[-1].duration += tail
 
@@ -496,6 +510,7 @@ def assign_materials_to_sections(
     downloaded_videos: Sequence[str],
     total_seconds: float,
     clip_duration: int,
+    section_owners: Sequence[int] | None = None,
 ) -> list[list[str]]:
     """
     把已下载的素材按段额度切分。
@@ -503,6 +518,10 @@ def assign_materials_to_sections(
     切分必须保持 ``downloaded_videos`` 的原始顺序——那个顺序就是
     ``download_videos`` 在 ``match_materials_to_script=True`` 时按关键词轮询
     建立的叙事顺序，打乱它等于把"画面跟着文案走"这个特性弄丢。
+
+    ``section_owners`` 与素材等长，给出每个素材属于第几段。幻灯片源会给出
+    这个归属（每张卡知道自己覆盖哪一段），此时不再按"前 N 段拿前 N 个素材"
+    切分——那会把几十张卡里的前 6 张分给前 6 段、其余全塞给最后一段。
     """
     from app.services import section_materials
 
@@ -510,31 +529,110 @@ def assign_materials_to_sections(
     if not sections:
         return []
 
+    available = list(downloaded_videos)
+    if not available:
+        # 没有素材时返回等长空列表：调用方按"这一段没画面"处理，而不是
+        # 在这里抛异常或返回长度不符的列表。
+        return [[] for _ in sections]
+
+    owners = [int(owner or 0) for owner in (section_owners or [])]
+    if len(owners) == len(available) and any(owners):
+        return _assign_by_owner(sections, available, owners)
+
     budget = section_materials.clip_budget(
         sections=sections,
         total_seconds=total_seconds,
         clip_duration=clip_duration,
     )
 
+    # 预算里的数字是"该下载多少镜头"，不是"现在手上一定有多少"。素材少于
+    # 预算时按预算切片会把后面的段直接切空——幻灯片源就是这种情况：6 段只能
+    # 拿到 7 张图，而预算是 119 个镜头，于是第 3 段起全空，渲染在
+    # "section 3 has no materials assigned" 处中止。
+    if len(available) < sum(budget):
+        if len(available) >= len(sections):
+            # 一段一张，多余素材并入最后一段（幻灯片源常见：6 段 7 张，
+            # 最后一张是收尾页）。放在前面会让后续每段的画面整体错位到上一段
+            # 的主题上。
+            assigned = [[available[position]] for position in range(len(sections))]
+            assigned[-1].extend(available[len(sections) :])
+        else:
+            # 素材比段数还少时必须复用，否则仍然会有段拿不到画面。宁可重复
+            # 也不能让某一段空着。
+            assigned = [
+                [available[position % len(available)]]
+                for position in range(len(sections))
+            ]
+        logger.info(
+            f"material split: only {len(available)} clips for {len(sections)} "
+            f"sections (budget {sum(budget)}); redistributed as "
+            f"{[len(window) for window in assigned]}"
+        )
+        return assigned
+
     assigned: list[list[str]] = []
     cursor = 0
     for position, count in enumerate(budget):
-        window = list(downloaded_videos[cursor : cursor + count])
+        window = available[cursor : cursor + count]
         cursor += count
         assigned.append(window)
         if position == 0:
             logger.info(
                 f"material split: {len(budget)} sections, "
-                f"{len(downloaded_videos)} clips available, "
+                f"{len(available)} clips available, "
                 f"first section gets {len(window)}"
             )
 
     # 素材多于额度时，把多出来的并入最后一段，而不是丢弃——丢弃会让
     # combine_videos 的素材池变小，长视频末尾更容易出现重复画面。
-    leftover = list(downloaded_videos[cursor:])
+    leftover = available[cursor:]
     if leftover and assigned:
         assigned[-1].extend(leftover)
     elif leftover and not assigned:
         assigned = [leftover]
 
+    return assigned
+
+
+def _assign_by_owner(
+    sections: Sequence[Section],
+    available: Sequence[str],
+    owners: Sequence[int],
+) -> list[list[str]]:
+    """按素材自带的段归属分组，而不是按顺序切片。
+
+    幻灯片每张卡都精确覆盖一段里的若干秒口播，所以它知道自己属于哪一段。
+    按归属分组后，一段拿到的正好是它自己的那几张卡，播放顺序也和讲述顺序
+    一致；按顺序切片则会让第 3 段之后拿不到卡。
+    """
+    buckets: dict[int, list[str]] = {int(section.index): [] for section in sections}
+    orphaned: list[str] = []
+    for path, owner in zip(available, owners):
+        bucket = buckets.get(owner)
+        if bucket is None:
+            orphaned.append(path)
+        else:
+            bucket.append(path)
+
+    assigned = [buckets[int(section.index)] for section in sections]
+
+    # 任何一段没有素材都要补上：宁可复用相邻段的卡，也不能让这一段空着，
+    # 那会在成片里留下一段纯字幕画面。
+    fallback = max((window for window in assigned if window), key=len, default=[])
+    for position, window in enumerate(assigned):
+        if window or not fallback:
+            continue
+        logger.warning(
+            f"section {position + 1} has no owned clips; reusing "
+            f"{len(fallback)} from the largest section"
+        )
+        assigned[position] = list(fallback)
+
+    if orphaned:
+        assigned[-1].extend(orphaned)
+
+    logger.info(
+        "material split by slide ownership: "
+        f"{[len(window) for window in assigned]}"
+    )
     return assigned

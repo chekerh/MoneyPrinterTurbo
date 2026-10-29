@@ -70,7 +70,7 @@ class NicheProfile:
 
 #: 四个赛道的画像。品牌句刻意写成同一副骨架：频道名 + 每天做什么 + 为什么值得听。
 #: 骨架一致是识别度的一部分，改一处要四处一起改。
-NICHES: dict[str, NicheProfile] = {
+_BUILTIN_NICHES: dict[str, NicheProfile] = {
     "history-mysteries": NicheProfile(
         channel="history-mysteries",
         display_name="History and Mysteries",
@@ -167,6 +167,18 @@ def known_channels() -> tuple[str, ...]:
     return tuple(sorted(NICHES))
 
 
+def refresh_niches() -> None:
+    """从注册表重新加载赛道画像，更新进程内 ``NICHES`` 视图。"""
+    try:
+        from app.services import niche_registry
+
+        profiles = niche_registry.load_profiles()
+    except Exception:  # noqa: BLE001 - 注册表不可用时回退到内置
+        profiles = dict(_BUILTIN_NICHES)
+    NICHES.clear()
+    NICHES.update(profiles)
+
+
 def resolve_niche(channel: object) -> NicheProfile:
     """
     按频道名取画像；认不出来就退回通用画像。
@@ -246,3 +258,8 @@ def script_directives(channel: object) -> str:
         "repeats itself.",
     ]
     return "\n".join(lines)
+
+
+# 进程内视图：启动时从注册表加载（含内置种子）。
+NICHES: dict[str, NicheProfile] = {}
+refresh_niches()

@@ -45,6 +45,59 @@ class TestCli(unittest.TestCase):
 
         self.assertEqual(cm.exception.code, 2)
 
+    def test_content_length_defaults_to_short(self):
+        args = cli.parse_args(["--video-subject", "测试主题"])
+        params = cli.build_video_params(args)
+
+        self.assertEqual(params.content_length, "short")
+        self.assertIsNone(params.content_target_seconds)
+
+    def test_content_length_and_target_reach_params(self):
+        args = cli.parse_args(
+            [
+                "--video-subject",
+                "A long story",
+                "--content-length",
+                "long",
+                "--content-target-seconds",
+                "1500",
+            ]
+        )
+        params = cli.build_video_params(args)
+
+        self.assertEqual(params.content_length, "long")
+        self.assertEqual(params.content_target_seconds, 1500)
+
+    def test_content_length_rejects_unknown_band(self):
+        with self.assertRaises(SystemExit) as cm:
+            cli.parse_args(
+                ["--video-subject", "x", "--content-length", "epic"]
+            )
+
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_content_target_outside_band_is_rejected(self):
+        args = cli.parse_args(
+            [
+                "--video-subject",
+                "x",
+                "--content-length",
+                "long",
+                "--content-target-seconds",
+                "600",
+            ]
+        )
+
+        with self.assertRaises(ValueError):
+            cli.build_video_params(args)
+
+    def test_channel_reaches_video_params(self):
+        args = cli.parse_args(
+            ["--video-subject", "x", "--channel", "money-finance"]
+        )
+
+        self.assertEqual(cli.build_video_params(args).channel, "money-finance")
+
     def test_build_video_params_with_local_materials(self):
         args = cli.parse_args(
             [

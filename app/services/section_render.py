@@ -89,7 +89,7 @@ def _format_srt_time(seconds: float) -> str:
     )
 
 
-def parse_srt(srt_file: str) -> list[SrtEntry]:
+def parse_srt(srt_file: str, *, allow_zero: bool = False) -> list[SrtEntry]:
     """
     读入 SRT。解析不了就返回空列表。
 
@@ -99,6 +99,10 @@ def parse_srt(srt_file: str) -> list[SrtEntry]:
 
     顺带容忍若干真实世界里的脏格式：序号行缺失、BOM、多余空行、
     时间码行后带定位参数。
+
+    ``allow_zero=True`` 时保留起止相同的 cue。默认丢弃它们，因为渲染阶段
+    这种 cue 什么都不显示；但字幕归一化需要先读进来才能把它的文字并回相邻
+    句子，否则那个词会被静默丢掉。
 
     返回空列表而不是抛异常：字幕是附加能力，解析失败时应该退化成无字幕成片，
     而不是让整条视频失败。
@@ -117,7 +121,13 @@ def parse_srt(srt_file: str) -> list[SrtEntry]:
     def flush() -> None:
         nonlocal start, end, buffer
         text = "\n".join(line for line in buffer if line.strip()).strip()
-        if text and start is not None and end is not None and end > start:
+        if not text or start is None or end is None:
+            start = end = None
+            buffer = []
+            return
+        if end > start or allow_zero:
+            # allow_zero 只给字幕归一化用：起止相同的 cue 在渲染阶段不可见，
+            # 但它的文字要先读进来才能并回相邻句子。
             entries.append(SrtEntry(start, end, text))
         start = end = None
         buffer = []
@@ -152,9 +162,16 @@ def parse_srt(srt_file: str) -> list[SrtEntry]:
         logger.warning(f"subtitle file {srt_file} contained no parsable entries")
     return entries
 
-
 def write_srt(entries: Sequence[SrtEntry], output_file: str) -> bool:
-    """写出 SRT，序号从 1 连续编号。"""
+    """
+    写出 SRT，序号从 1 连续编号。
+
+    **末尾必须留一个空行。** MoviePy 的 ``file_to_subtitles`` 只在读到空行时
+    才把已累积的字幕块收尾（``elif line.strip() == "": times_texts.append(...)``），
+    最后一块如果后面没有空行就会被整条丢掉。这不会报错，只会安静地少一条字幕
+    ——分段渲染时表现为每一段的最后一句没有字幕。写法和
+    ``voice._write_subtitle_items`` 保持一致。
+    """
     try:
         Path(output_file).parent.mkdir(parents=True, exist_ok=True)
         blocks = [
@@ -163,7 +180,7 @@ def write_srt(entries: Sequence[SrtEntry], output_file: str) -> bool:
             f"{entry.text}\n"
             for index, entry in enumerate(entries, start=1)
         ]
-        Path(output_file).write_text("\n".join(blocks), encoding="utf-8")
+        Path(output_file).write_text("\n".join(blocks) + "\n", encoding="utf-8")
         return True
     except (OSError, ValueError) as exc:
         logger.warning(f"failed to write section subtitle {output_file}: {exc}")
@@ -415,9 +432,14 @@ def render_sections(
                 section_file=section_file,
             )
         except Exception as exc:  # noqa: BLE001 - 编排层统一转任务失败
+            # 带 traceback：只报异常消息的话，运维拿到
+            # "max() arg is an empty sequence" 根本无从判断是本模块还是
+            # combine_videos / generate_video 里的哪一层抛的。
             logger.error(
-                f"section {position}/{len(sections)} render failed: {exc}"
+                f"section {position}/{len(sections)} render failed: "
+                f"{type(exc).__name__}: {exc}"
             )
+            logger.debug(f"section {position} traceback:", exc_info=True)
             return None
 
         if not rendered:
@@ -480,6 +502,22 @@ def _is_complete(section_file: str, expected_duration: float) -> bool:
 
     # 容忍 1 秒误差：分段视频的末帧时长受容器时间基影响会略有出入。
     return meta.duration >= max(expected_duration - 1.0, 0.5)
+
+
+def _max_clip_seconds(params: Any) -> int:
+    """combine_videos 的单个素材切片上限。
+
+    幻灯片片段本身已经按卡片应覆盖的口播时长渲染好（约 15 秒一张）。如果
+    仍按 ``video_clip_duration``（默认 5 秒）去切，一张 15 秒的卡只会显示
+    前 5 秒，然后整批卡片被循环重播——画面顺序和讲述顺序就此错位。幻灯片
+    源需要让每张卡完整播一次，所以把上限抬到卡片的最大可能时长。
+    """
+    from app.services import slide_source
+
+    configured = int(getattr(params, "video_clip_duration", 5) or 5)
+    if slide_source.is_slide_source(getattr(params, "video_source", "")):
+        return max(configured, int(slide_source.MAX_CARD_SECONDS))
+    return configured
 
 
 def _resolve_concat_mode(params: Any) -> Any:
@@ -547,9 +585,9 @@ def _render_one_section(
         video_paths=materials,
         audio_file=section_audio,
         video_aspect=params.video_aspect,
-        video_concat_mode=params.video_concat_mode,
+        video_concat_mode=_resolve_concat_mode(params),
         video_transition_mode=params.video_transition_mode,
-        max_clip_duration=params.video_clip_duration,
+        max_clip_duration=_max_clip_seconds(params),
         threads=params.n_threads,
         clip_speed=params.video_clip_speed,
     )

@@ -62,6 +62,7 @@ from app.models.llm_provider import (
     normalize_provider_override,
 )
 from app.models.schema import (
+    ContentLength,
     MaterialInfo,
     VideoAspect,
     VideoConcatMode,
@@ -70,6 +71,7 @@ from app.models.schema import (
 )
 from app.services.plan_meta import plan_meta_path
 from app.services import bgm as bgm_service
+from app.services import niche_registry
 from app.services import (
     cache_manager,
     campaign as campaign_service,
@@ -2185,6 +2187,16 @@ def _apply_restored_params(params):
     # 视频设置。素材上传控件不能由服务端写入，因此本地素材需要用户重新选择。
     video_source = params.get("video_source") or "pexels"
     _set_stable_widget_value("video_source_select", video_source)
+    # 时长档位要一起恢复，否则打开历史长视频任务时界面回到 short，用户以为
+    # 当初生成的是短视频。目标秒数只有在非 short 档位才存在控件。
+    restored_content_length = str(params.get("content_length") or "")
+    if restored_content_length in {band.value for band in ContentLength}:
+        _set_stable_widget_value("content_length_select", restored_content_length)
+        if restored_content_length != ContentLength.short.value:
+            _set_stable_widget_value(
+                "content_target_seconds_input",
+                params.get("content_target_seconds"),
+            )
     _set_stable_widget_value(
         "video_concat_mode_select", params.get("video_concat_mode") or "random"
     )
@@ -3100,6 +3112,62 @@ def stable_pills(label, options, default_value, key, format_func=None, selection
         options=options,
         format_func=format_func,
         selection_mode=selection_mode,
+        key=widget_key,
+        **kwargs,
+    )
+
+
+def stable_number_input(
+    label,
+    min_value,
+    max_value,
+    value,
+    key,
+    step=1,
+    number_type=int,
+    **kwargs,
+):
+    """渲染一个带稳定 key 的数值输入，并把 session_state 限幅到合法区间。
+
+    Streamlit 在 ``session_state`` 里存了越界数值时会直接抛异常（例如先选
+    中视频 12 分钟，再切回短视频档位，旧的 720 就落在新档位之外）。这里在
+    控件创建前统一归一化，既保留合法的旧选择，也保证控件永远收到区间内的值。
+
+    另外要把四个数值参数统一成同一种类型：``_saved_ui_number`` 默认返回浮点
+    数，而区间与步进是整数，混用会让 Streamlit 直接抛
+    ``StreamlitMixedNumericTypesError``——用户一切到中/长视频就白屏。
+    """
+    min_value = number_type(min_value)
+    max_value = number_type(max_value)
+    value = number_type(value)
+    step = number_type(step)
+    widget_key = localized_widget_key(key)
+
+    if widget_key in st.session_state:
+        try:
+            current = number_type(st.session_state[widget_key])
+            if isinstance(current, float) and not math.isfinite(current):
+                raise ValueError("non-finite value")
+        except (TypeError, ValueError, OverflowError):
+            current = value
+        st.session_state[widget_key] = min(max_value, max(min_value, current))
+        # 已经在 session_state 里存了值，就不要再传 value，否则 Streamlit 会
+        # 警告"默认值与 session_state 冲突"，且行为随版本变化。
+        return st.number_input(
+            label,
+            min_value=min_value,
+            max_value=max_value,
+            step=step,
+            key=widget_key,
+            **kwargs,
+        )
+
+    return st.number_input(
+        label,
+        min_value=min_value,
+        max_value=max_value,
+        value=value,
+        step=step,
         key=widget_key,
         **kwargs,
     )
@@ -5036,6 +5104,9 @@ def _render_video_settings(panel, params):
                 (tr("Volcano Engine Seedance"), "volcengine_seedance"),
                 (tr("Shengsuan Cloud AI Video"), "loomloom"),
                 (tr("Local file"), "local"),
+                # 幻灯片是长视频/解说类内容的默认画面来源：不依赖素材库，
+                # 也不存在版权风险，由本机 Playwright 渲染成 PNG。
+                (tr("Slides"), "slides"),
             ]
 
             saved_video_source_name = config.app.get("video_source", "pexels")
@@ -5176,6 +5247,48 @@ def _render_video_settings(panel, params):
             _set_runtime_config(
                 "ui", video_aspect_config_key, params.video_aspect.value
             )
+
+            # 内容时长档位：short/medium/long。short 走原有单次流水线，
+            # medium/long 启用分段流水线（大纲→逐段文案→分段TTS→分段渲染→拼接）。
+            content_length_options = [
+                (tr("Content Length Short"), ContentLength.short.value),
+                (tr("Content Length Medium"), ContentLength.medium.value),
+                (tr("Content Length Long"), ContentLength.long.value),
+            ]
+            content_length_values = [v for _, v in content_length_options]
+            params.content_length = stable_pills(
+                tr("Content Length"),
+                options=content_length_values,
+                default_value=_saved_ui_choice(
+                    "content_length", content_length_values, ContentLength.short.value
+                ),
+                key="content_length_select",
+                format_func=lambda value: dict(
+                    (v, label) for label, v in content_length_options
+                )[value],
+            )
+            # 显式目标秒数（可选）。只有 medium/long 时才显示且生效。
+            if params.content_length != ContentLength.short.value:
+                # 档位边界：short 60-300, medium 480-900, long 1200-1800
+                band_min = 480 if params.content_length == ContentLength.medium.value else 1200
+                band_max = 900 if params.content_length == ContentLength.medium.value else 1800
+                default_seconds = 720 if params.content_length == ContentLength.medium.value else 1500
+                params.content_target_seconds = stable_number_input(
+                    tr("Content Target Seconds"),
+                    min_value=band_min,
+                    max_value=band_max,
+                    value=_saved_ui_number(
+                        "content_target_seconds", default_seconds, band_min, band_max
+                    ),
+                    step=30,
+                    key="content_target_seconds_input",
+                    help=tr("Content Target Seconds Help"),
+                )
+                _set_runtime_config(
+                    "ui", "content_target_seconds", params.content_target_seconds
+                )
+            else:
+                params.content_target_seconds = None
 
             video_clip_durations = [2, 3, 4, 5, 6, 7, 8, 9, 10]
             params.video_clip_duration = stable_selectbox(
@@ -7006,7 +7119,6 @@ def _render_generation_controls(
     if st.session_state.pop("campaign_auto_generate", False):
         _prepare_generation_task()
         start_button = True
-    render_onboarding_tour()
     if start_button:
         _save_runtime_config()
         task_id = st.session_state.get("pending_generation_task_id") or str(uuid4())
@@ -7027,6 +7139,7 @@ def _render_generation_controls(
             "volcengine_seedance",
             "loomloom",
             "local",
+            "slides",
         ]:
             _remove_active_generation_task(task_id)
             st.error(tr("Please Select a Valid Video Source"))
@@ -7293,6 +7406,11 @@ def _render_generation_controls(
         st.session_state["current_generation_task_id"] = task_id
         logger.info(f"WebUI generation task submitted: task_id={task_id}")
 
+    # 引导必须在提交之后启动：``Tour.start()`` 会调用 ``st.rerun()``，如果放在
+    # 上面，用户第一次进生成页的那一次渲染（手动点"生成视频"，或活动/赛道面板
+    # 的"载入即出片"）会在提交前被这次 rerun 打断，``start_button`` 随本次渲染
+    # 一起作废——表现就是"点了生成，什么都没发生"。
+    render_onboarding_tour()
     _render_current_generation_task()
     return start_button
 
@@ -7391,6 +7509,9 @@ _PLAN_ENV_FIELD_MAP: dict[str, str] = {
     "STROKE_WIDTH": "stroke_width",
     "CAPTION_WORD_HIGHLIGHT": "caption_word_highlight",
     "MATCH_MATERIALS_TO_SCRIPT": "match_materials_to_script",
+    # 频道形态策略：让某个频道整体切到长视频时，不必每次在界面上重选档位。
+    "CONTENT_LENGTH": "content_length",
+    "CONTENT_TARGET_SECONDS": "content_target_seconds",
 }
 
 #: 上面这张表里需要按数字解析的键。写错类型时跳过该键并留日志，而不是让
@@ -7402,6 +7523,7 @@ _PLAN_ENV_INT_FIELDS = frozenset(
         "video_count",
         "font_size",
         "stroke_width",
+        "content_target_seconds",
     }
 )
 _PLAN_ENV_FLOAT_FIELDS = frozenset(
@@ -7505,6 +7627,20 @@ def _render_effective_parameters_readout(channel: str, env: dict) -> None:
         st.caption(tr("Plan Unknown Env Keys").format(count=len(unknown)))
         st.write(", ".join(f"`{key}`" for key in sorted(unknown)))
 
+    # 赛道画像本身也会定长度档位。这是覆盖表单的又一处来源，不说出来，用户会以为
+    # "计划页按天出的片"和界面上的档位一致。频道文件显式写了 CONTENT_LENGTH 时
+    # 上一条摘要已经说清楚了，这里就不再重复。
+    from app.services.niche_brand import longform_preference
+
+    band, band_target = longform_preference(channel)
+    if band and "CONTENT_LENGTH" not in known:
+        st.caption(
+            tr("Plan Niche Band").format(
+                band=tr(f"Content Length {band.capitalize()}"),
+                seconds=band_target or 0,
+            )
+        )
+
 
 def _build_plan_params(channel, topic, base_params=None) -> VideoParams:
     """
@@ -7530,6 +7666,18 @@ def _build_plan_params(channel, topic, base_params=None) -> VideoParams:
     # 就把用户正在编辑的表单改掉了。
     params = base_params.model_copy(deep=True)
     params.video_subject = topic
+
+    # 赛道自己的形态设定必须先于频道文件生效，否则"给这个频道加一条长视频赛道"
+    # 只对赛道页的"立刻出片"有效，计划页按天出片依然是短视频——同一个赛道在两条
+    # 路径上产出不同时长的东西，用户没法理解。频道文件里显式写了
+    # CONTENT_LENGTH / CONTENT_TARGET_SECONDS 时仍然优先，留给单频道临时覆盖。
+    from app.services.niche_brand import longform_preference
+
+    band, band_target = longform_preference(channel)
+    if band:
+        params.content_length = band
+    if band_target:
+        params.content_target_seconds = band_target
 
     env = plans.read_automation_env(channel)
     _applied, _covered, _skipped = _apply_plan_env(params, env)
@@ -7863,7 +8011,7 @@ def _expected_schedule_labels() -> list:
     """期望存在的定时任务：基础任务 + 其余每个频道一个。"""
     labels = [_PIPELINE_SCHEDULE_BASE_LABEL]
     try:
-        channels = plans.list_channels()
+        channels = sorted(set(plans.list_channels() or []) | set(niche_registry.load_profiles().keys()))
     except Exception:  # noqa: BLE001 - 读不到频道列表就只查基础任务
         return labels
     for channel in channels or []:
@@ -8118,11 +8266,18 @@ def _render_youtube_login_detail(channel: str, *, result_key: str):
 
 def _render_plan_panel():
     """渲染计划面板：频道、待办主题、覆盖摘要、草稿预览与本月记录。"""
-    channels = [c for c in plans.list_channels() if c]
+    # 计划页同时认两类频道：``plans/`` 里有目录的，以及注册表里刚建、但作品集根
+    # 尚未配置好因而没能同步出目录的赛道。后者只会出现在下拉里（没有主题、没有
+    # 覆盖摘要），所以默认项要优先落在**真的有计划文件**的频道上——否则默认项会
+    # 选中一个空频道，打开计划页先看到"全部主题已录完"。
+    plan_channels = [c for c in (plans.list_channels() or []) if c]
+    channels = sorted(set(plan_channels) | set(niche_registry.load_profiles().keys()))
     if not channels:
         return None
     default_channel = (
-        "history-mysteries" if "history-mysteries" in channels else channels[0]
+        "history-mysteries"
+        if "history-mysteries" in plan_channels
+        else (plan_channels or channels)[0]
     )
     channel = st.selectbox(
         tr("Plan Channel"),
@@ -8321,7 +8476,7 @@ _MEDIA_LIBRARY_TABLE_LIMIT = 200
 
 
 def _render_media_library():
-    channels = [c for c in plans.list_channels() if c]
+    channels = [c for c in sorted(set(plans.list_channels() or []) | set(niche_registry.load_profiles().keys())) if c]
     if not channels:
         return
     tabs = st.tabs([f"{channel}" for channel in channels])
@@ -8779,7 +8934,7 @@ def _page_login():
                 )
             )
 
-        channels = [c for c in plans.list_channels() if c]
+        channels = [c for c in sorted(set(plans.list_channels() or []) | set(niche_registry.load_profiles().keys())) if c]
         if not channels:
             st.markdown(
                 f"<p class='mpt-empty-state'>{html.escape(tr('Login No Channels'))}</p>",
@@ -8977,6 +9132,360 @@ def _page_campaign():
         _render_campaign_panel()
 
 
+def _page_channels():
+    """左侧导航「赛道」：在应用内增删改赛道，不再需要改代码或动 plans/ 目录。"""
+    with st.container(key="page_channels"):
+        st.markdown(
+            f'<div class="mpt-hero">'
+            f'<p class="mpt-hero-badge">{html.escape(tr("Channels Hero Badge"))}</p>'
+            f'<p class="mpt-hero-title">{html.escape(tr("Channels Hero Title"))}</p>'
+            f'<p class="mpt-hero-sub">{html.escape(tr("Channels Hero Sub"))}</p>'
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        from app.services import niche_registry
+        from app.services.niche_brand import NicheProfile, refresh_niches
+
+        profiles = niche_registry.load_profiles()
+        channel_names = sorted(profiles.keys())
+
+        # 选项直接放"展示文案"，不再把 ``__new__`` 这种哨兵塞进选项再靠
+        # ``format_func`` 翻译。Streamlit 的 selectbox 在 rerun 时会拿**展示文案**
+        # 回查下标，哨兵不在展示列表里就抛
+        # ``ValueError: '__new__' is not in list``——页面第一次能打开、第二次直接
+        # 白屏，AppTest 也因此完全覆盖不了这一屏。展示文案作真实选项既绕开这个
+        # 坑，用户看到的也就是可以点的东西。
+        label_to_slug: dict[str, str] = {}
+        for name in channel_names:
+            label = profiles[name].display_name or name
+            if label in label_to_slug:
+                label = f"{label} ({name})"
+            label_to_slug[label] = name
+        new_label = tr("New Channel")
+        while new_label in label_to_slug:
+            new_label = f"{new_label} +"
+        label_to_slug = {new_label: "__new__", **label_to_slug}
+
+        # 单独记住 slug。切换界面语言会换掉展示文案，只凭 session 里的旧文案
+        # 回查会让控件退回第一项（"新赛道"），用户会以为刚选的赛道丢了。
+        previous_slug = st.session_state.get("channels_selected_slug", "")
+        previous_label = next(
+            (label for label, slug in label_to_slug.items() if slug == previous_slug),
+            None,
+        )
+        if (
+            previous_label is not None
+            and st.session_state.get("channels_selected") not in label_to_slug
+        ):
+            st.session_state["channels_selected"] = previous_label
+        elif st.session_state.get("channels_selected") not in label_to_slug:
+            st.session_state.pop("channels_selected", None)
+
+        selected_label = st.selectbox(
+            tr("Channel Select"),
+            options=list(label_to_slug),
+            key="channels_selected",
+        )
+        selected = label_to_slug[selected_label]
+        st.session_state["channels_selected_slug"] = selected
+
+        if selected == "__new__":
+            existing_record = {}
+            default_channel = ""
+        else:
+            existing_record = niche_registry.get_record(selected) or {}
+            default_channel = selected
+
+        def _lines(value):
+            if isinstance(value, (list, tuple)):
+                return "\n".join(str(x) for x in value)
+            return str(value or "")
+
+        with st.form("channel_form", clear_on_submit=False):
+            channel_slug = st.text_input(
+                tr("Channel Slug"),
+                value=default_channel,
+                disabled=(selected != "__new__"),
+                help=tr("Channel Slug Help"),
+            ).strip().lower()
+            display_name = st.text_input(
+                tr("Channel Display Name"),
+                value=str(existing_record.get("display_name") or (profiles.get(selected).display_name if selected in profiles else "")),
+            ).strip()
+            brand_line = st.text_area(
+                tr("Channel Brand Line"),
+                value=str(existing_record.get("brand_line") or (profiles.get(selected).brand_line if selected in profiles else "")),
+                height=80,
+            ).strip()
+            teaser_shapes = st.text_area(
+                tr("Channel Teaser Shapes"),
+                value=_lines(existing_record.get("teaser_shapes") or (list(profiles[selected].teaser_shapes) if selected in profiles else [])),
+                height=100,
+            )
+            avoid = st.text_area(
+                tr("Channel Avoid"),
+                value=_lines(existing_record.get("avoid") or (list(profiles[selected].avoid) if selected in profiles else [])),
+                height=100,
+            )
+            col_a, col_b = st.columns(2)
+            with col_a:
+                min_seconds = st.number_input(
+                    tr("Channel Min Seconds"),
+                    min_value=1,
+                    value=int(existing_record.get("min_seconds") or (profiles[selected].min_seconds if selected in profiles else 60)),
+                )
+                target_words = st.number_input(
+                    tr("Channel Target Words"),
+                    min_value=1,
+                    value=int(existing_record.get("target_words") or (profiles[selected].target_words if selected in profiles else 220)),
+                )
+            with col_b:
+                longform_band = st.selectbox(
+                    tr("Channel Longform Band"),
+                    options=["", "short", "medium", "long"],
+                    index=["", "short", "medium", "long"].index(str(existing_record.get("longform_band") or (profiles[selected].longform_band if selected in profiles else ""))),
+                )
+                longform_target = st.number_input(
+                    tr("Channel Longform Target Seconds"),
+                    min_value=0,
+                    value=int(existing_record.get("longform_target_seconds") or (profiles[selected].longform_target_seconds if selected in profiles else 0)),
+                )
+            topics = st.text_area(
+                tr("Channel Topics"),
+                value=_lines(existing_record.get("topics") or niche_registry.topics_for(selected)),
+                height=160,
+                help=tr("Channel Topics Help"),
+            )
+            automation_text = st.text_area(
+                tr("Channel Automation Env"),
+                value=str(existing_record.get("automation_env_text") or _render_automation_text(existing_record.get("automation"))),
+                height=120,
+            )
+            system_prompt = st.text_area(
+                tr("Channel System Prompt"),
+                value=str(existing_record.get("system_prompt") or ""),
+                height=160,
+            )
+            content_style = st.text_area(
+                tr("Channel Content Style"),
+                value=str(existing_record.get("content_style") or ""),
+                height=160,
+            )
+            channel_description = st.text_area(
+                tr("Channel Description"),
+                value=str(existing_record.get("channel_description") or ""),
+                height=120,
+            )
+
+            submitted = st.form_submit_button(tr("Save Channel"), type="primary")
+            if submitted:
+                try:
+                    slug = channel_slug or (selected if selected != "__new__" else "")
+                    slug = niche_registry.validate_channel(slug)
+                    profile = NicheProfile(
+                        channel=slug,
+                        display_name=display_name or slug,
+                        brand_line=brand_line or "every day we look at one story worth retelling",
+                        teaser_shapes=tuple(x.strip() for x in teaser_shapes.splitlines() if x.strip()) or ("open on the most surprising concrete fact in the topic",),
+                        avoid=tuple(x.strip() for x in avoid.splitlines() if x.strip()),
+                        min_seconds=int(min_seconds),
+                        target_words=int(target_words),
+                        longform_target_seconds=int(longform_target),
+                        longform_band=longform_band,
+                    )
+                    automation = _parse_automation_text(automation_text)
+                    niche_registry.upsert_niche(
+                        profile,
+                        topics=[x.strip() for x in topics.splitlines() if x.strip()],
+                        automation=automation,
+                        system_prompt=system_prompt,
+                        content_style=content_style,
+                        channel_description=channel_description,
+                    )
+                    refresh_niches()
+                    st.success(tr("Channel Saved"))
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"{tr('Channel Save Failed')}: {exc}")
+
+        # 从赛道直接开一条片子。赛道页原本只负责"定义"，于是用户新增赛道后还得
+        # 切到生成页、重选赛道、再把主题抄一遍——"在应用里自己做完"要消掉的正是
+        # 这段手工搬运。
+        if selected != "__new__":
+            st.divider()
+            st.markdown(f"**{tr('Channel Create Video')}**")
+            st.caption(tr("Channel Create Video Hint"))
+            profile = profiles[selected]
+            topics = niche_registry.topics_for(selected)
+            # 依旧用展示文案当真实选项：主题本身就是文案，再套一层 format_func
+            # 只会把上面那个 rerun 崩溃重新引回来。
+            topic_choices: dict[str, str] = {
+                tr("Channel Create Video Custom Topic"): ""
+            }
+            for index, topic in enumerate(topics, start=1):
+                label = topic if topic not in topic_choices else f"{topic} ({index})"
+                topic_choices[label] = topic
+            picked_label = st.selectbox(
+                tr("Channel Create Video Pick Topic"),
+                options=list(topic_choices),
+                key=localized_widget_key("channel_create_topic", selected),
+            )
+            picked_topic = topic_choices[picked_label]
+            custom_subject = st.text_input(
+                tr("Channel Create Video Subject"),
+                help=tr("Channel Create Video Subject Help"),
+                key=localized_widget_key("channel_create_subject", selected),
+            ).strip()
+
+            band_options = [
+                ContentLength.short.value,
+                ContentLength.medium.value,
+                ContentLength.long.value,
+            ]
+            default_band = str(profile.longform_band or ContentLength.short.value)
+            if default_band not in band_options:
+                default_band = ContentLength.short.value
+            band = stable_pills(
+                tr("Channel Create Video Length"),
+                options=band_options,
+                default_value=default_band,
+                key=f"channel_create_band_{selected}",
+                format_func=lambda value: {
+                    ContentLength.short.value: tr("Content Length Short"),
+                    ContentLength.medium.value: tr("Content Length Medium"),
+                    ContentLength.long.value: tr("Content Length Long"),
+                }[value],
+            )
+            target_seconds = None
+            if band != ContentLength.short.value:
+                band_min = 480 if band == ContentLength.medium.value else 1200
+                band_max = 900 if band == ContentLength.medium.value else 1800
+                default_seconds = 720 if band == ContentLength.medium.value else 1500
+                saved_seconds = int(profile.longform_target_seconds or 0)
+                if not band_min <= saved_seconds <= band_max:
+                    saved_seconds = default_seconds
+                target_seconds = stable_number_input(
+                    tr("Content Target Seconds"),
+                    min_value=band_min,
+                    max_value=band_max,
+                    value=saved_seconds,
+                    step=30,
+                    key=f"channel_create_target_{selected}",
+                    help=tr("Content Target Seconds Help"),
+                )
+
+            if st.button(
+                tr("Channel Create Video Submit"),
+                type="primary",
+                width="stretch",
+                key=f"channel_create_video_{selected}",
+            ):
+                subject = custom_subject or picked_topic
+                if not subject:
+                    st.error(tr("Channel Create Video Subject Required"))
+                else:
+                    st.session_state["video_subject"] = subject
+                    # 旧文案必须清掉，否则生成会拿上一条视频的脚本去配音。
+                    st.session_state.pop("video_script", None)
+                    st.session_state[localized_widget_key("channel")] = selected
+                    st.session_state[localized_widget_key("content_length_select")] = band
+                    if target_seconds:
+                        st.session_state[
+                            localized_widget_key("content_target_seconds_input")
+                        ] = int(target_seconds)
+                    # 复用活动面板那条"载入即出片"的通道：生成页会用与手动点击
+                    # "生成视频"完全相同的校验与提交逻辑，而不是第二条提交路径。
+                    st.session_state["campaign_auto_generate"] = True
+                    st.session_state[_NAV_REQUEST_KEY] = "generate"
+                    st.toast(tr("Channel Create Video Started"))
+                    st.rerun()
+
+        # 删除：删赛道会连带归档 plans/<channel>/，误点一次就得从归档目录捞回来，
+        # 所以先问一句再动手。
+        if selected != "__new__":
+            st.divider()
+            confirm_delete = st.session_state.get("channel_delete_confirm") == selected
+            if not confirm_delete:
+                if st.button(
+                    tr("Delete Channel"),
+                    type="secondary",
+                    key=f"channel_delete_start_{selected}",
+                ):
+                    st.session_state["channel_delete_confirm"] = selected
+                    st.rerun()
+            else:
+                st.warning(tr("Channel Delete Confirm").format(channel=selected))
+                confirm_cols = st.columns(2)
+                with confirm_cols[0]:
+                    if st.button(
+                        tr("Channel Delete Confirm Button"),
+                        type="primary",
+                        width="stretch",
+                        key=f"channel_delete_yes_{selected}",
+                    ):
+                        try:
+                            niche_registry.delete_niche(selected)
+                            refresh_niches()
+                            st.session_state.pop("channel_delete_confirm", None)
+                            st.session_state.pop("channels_selected_slug", None)
+                            st.session_state.pop("channels_selected", None)
+                            st.success(tr("Channel Deleted"))
+                            st.rerun()
+                        except Exception as exc:  # noqa: BLE001
+                            st.error(f"{tr('Channel Delete Failed')}: {exc}")
+                with confirm_cols[1]:
+                    if st.button(
+                        tr("Cancel"),
+                        width="stretch",
+                        key=f"channel_delete_no_{selected}",
+                    ):
+                        st.session_state.pop("channel_delete_confirm", None)
+                        st.rerun()
+
+        # YouTube 连接状态
+        if selected != "__new__":
+            st.divider()
+            st.caption(tr("Channel Connection Status"))
+            try:
+                from app.services import youtube_upload
+
+                info = youtube_upload.channel_info(selected)
+                if info.get("success"):
+                    st.success(tr("Pipeline Publish Connected").format(name=html.escape(str(info.get("channel_name") or selected))))
+                elif info.get("needs_reauth"):
+                    st.error(tr("Pipeline Publish Expired"))
+                elif youtube_upload.has_saved_token(selected):
+                    st.info(tr("Pipeline Publish Unverified"))
+                else:
+                    st.warning(tr("Pipeline Publish Missing"))
+            except Exception as exc:  # noqa: BLE001
+                st.caption(str(exc))
+
+
+def _render_automation_text(automation):
+    if not isinstance(automation, dict):
+        return ""
+    lines = []
+    for key, value in automation.items():
+        lines.append(f"{key}={value}")
+    return "\n".join(lines)
+
+
+def _parse_automation_text(text):
+    out = {}
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key:
+            out[key] = value
+    return out
+
+
 def _page_settings():
     """左侧导航「设置」：模型、素材源、语音、接口与缓存。
 
@@ -9137,6 +9646,7 @@ _MEDIA_SOURCE_LABELS = {
     "volcengine_seedance": "Seedance",
     "loomloom": "LoomLoom",
     "local": "Local files",
+    "slides": "Slides",
 }
 
 
@@ -9200,7 +9710,11 @@ def _selected_media_state() -> tuple[str, str]:
         # 选文件的地方。
         return "waiting", tr("Bench Needs Local Files")
     try:
-        if source == "loomloom":
+        if source == "slides":
+            # 幻灯片由本机 Playwright 渲染，不需要任何外部凭据；真正的前置
+            # 条件是 chromium，缺失时渲染阶段会明确报错。
+            ok = True
+        elif source == "loomloom":
             ok = _has_cred(config.app.get("loomloom_api_token"))
         elif source == "wavespeed":
             ok = _has_cred(config.app.get("wavespeed_api_keys"))
@@ -9578,6 +10092,7 @@ _NAV_GROUPS = [
         ("copyright", "Nav Copyright", ":material/shield:", "Nav Copyright Hint"),
     ]),
     ("Nav Group System", [
+        ("channels", "Nav Channels", ":material/hub:", "Nav Channels Hint"),
         ("settings", "Nav Settings", ":material/settings:", "Nav Settings Hint"),
     ]),
 ]
@@ -9606,6 +10121,7 @@ _VIEW_RENDERERS = {
     "library": _page_library,
     "copyright": _page_copyright,
     "campaign": _page_campaign,
+    "channels": _page_channels,
     "settings": _page_settings,
 }
 

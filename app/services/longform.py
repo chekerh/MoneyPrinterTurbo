@@ -151,6 +151,20 @@ class SectionPlan:
     def total_duration(self) -> float:
         return sum(section.duration for section in self.sections)
 
+    def to_dict(self) -> dict[str, Any]:
+        """可持久化的规划结构。
+
+        ``task.py`` 在脚本阶段和 ``script.json`` 里都要落这份数据：前者用于
+        ``stop_at=script`` 的中间结果，后者用于任务失败后人工接手。没有它，
+        长视频任务会在脚本刚写完时因为 ``AttributeError`` 整体失败。
+        """
+        return {
+            "content_length": self.band.key,
+            "target_seconds": self.target_seconds,
+            "language": self.language,
+            "sections": [section.to_dict() for section in self.outline],
+        }
+
 
 def is_longform(content_length: object) -> bool:
     """该时长是否走分段路径。"""

@@ -69,6 +69,28 @@ def _paragraph_count(value: str) -> int:
     return parsed
 
 
+_CONTENT_LENGTHS = ("short", "medium", "long")
+
+
+def _content_length(value: str) -> str:
+    normalized = str(value).strip().lower()
+    if normalized not in _CONTENT_LENGTHS:
+        raise argparse.ArgumentTypeError(
+            f"content-length must be one of {', '.join(_CONTENT_LENGTHS)}, "
+            f"got {value!r}"
+        )
+    return normalized
+
+
+def _content_target_seconds(value: str) -> int:
+    parsed = int(value)
+    if parsed < 60:
+        raise argparse.ArgumentTypeError(
+            f"content-target-seconds must be >= 60, got {parsed}"
+        )
+    return parsed
+
+
 def _non_negative_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed < 0:
@@ -257,6 +279,26 @@ Batch manifests:
         type=_paragraph_count,
         default=None,
         help="number of generated script paragraphs, from 1 to 10 (default: 1)",
+    )
+    content_group.add_argument(
+        "--content-length",
+        type=_content_length,
+        default=None,
+        choices=_CONTENT_LENGTHS,
+        help=(
+            "video length band: short (60-300s, one-shot script), "
+            "medium (8-15 min, sectioned), long (20-30 min, sectioned); "
+            "default: short"
+        ),
+    )
+    content_group.add_argument(
+        "--content-target-seconds",
+        type=_content_target_seconds,
+        default=None,
+        help=(
+            "explicit target duration in seconds, clamped to the band; "
+            "requires a compatible --content-length (default: band default)"
+        ),
     )
     content_group.add_argument(
         "--video-script-prompt",
@@ -799,6 +841,7 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
 
     params_kwargs = {
         "video_subject": args.video_subject.strip(),
+        "channel": (args.channel or "").strip(),
         "video_script": args.video_script,
         "video_terms": video_terms,
         "video_source": args.video_source,
@@ -810,6 +853,8 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
     }
 
     optional_arg_names = [
+        "content_length",
+        "content_target_seconds",
         "video_language",
         "paragraph_number",
         "video_script_prompt",
@@ -909,7 +954,42 @@ def build_video_params(args: argparse.Namespace) -> VideoParams:
         elif ui_enabled is True:
             params_kwargs["text_background_color"] = True
 
-    return VideoParams(**params_kwargs)
+    _validate_content_request(
+        args.content_length or "short", args.content_target_seconds
+    )
+    params = VideoParams(**params_kwargs)
+    return params
+
+
+def _validate_content_request(
+    content_length: str, target_seconds: int | None
+) -> None:
+    """Reject an impossible length band/target pair before any work starts.
+
+    ``VideoParams`` clamps a target into the band (see
+    ``models.schema._clamp_target_seconds_to_band``), which is right for
+    historical API payloads but hides a typo on the command line:
+    ``--content-length long --content-target-seconds 600`` would quietly
+    produce a 20-minute video. The CLI validates the *requested* values before
+    the model clamps them.
+    """
+    from app.services import longform
+
+    normalized = str(content_length or "short").strip().lower()
+    band = longform.resolve_band(normalized)
+    if band.key != normalized:
+        raise ValueError(
+            "content_length must be one of: short, medium, long "
+            f"(got {content_length!r})"
+        )
+    if target_seconds is None:
+        return
+    if not (band.min_seconds <= int(target_seconds) <= band.max_seconds):
+        raise ValueError(
+            f"content_target_seconds={target_seconds} is outside the {band.key} "
+            f"band ({band.min_seconds}-{band.max_seconds}s); pick a compatible "
+            "--content-length or adjust the target"
+        )
 
 
 def _load_batch_manifest(raw_path: str) -> tuple[str, list[dict[str, Any]]]:
@@ -1171,6 +1251,10 @@ def _build_batch_tasks(args: argparse.Namespace) -> list[VideoParams]:
             allowed_fields=allowed_fields,
         )
         try:
+            _validate_content_request(
+                entry.get("content_length", args.content_length or "short"),
+                entry.get("content_target_seconds", args.content_target_seconds),
+            )
             params = VideoParams.model_validate(
                 {**copy.deepcopy(base_values), **entry}
             )

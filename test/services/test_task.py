@@ -729,6 +729,54 @@ class TestTaskService(unittest.TestCase):
         self.assertIsNone(sub_maker)
         tts.assert_not_called()
 
+    def test_generate_audio_falls_back_to_configured_voice(self):
+        """接口直调常省略 voice_name；空值不是"无配音"，必须回落到
+        [ui].voice_name，否则真实任务会在音频阶段被 Invalid voice '' 打断。"""
+        task_id = "test-generate-audio-voice-fallback"
+        configured = "en-US-AvaMultilingualNeural-Female"
+        params = VideoParams(video_subject="voice fallback", voice_name="")
+
+        try:
+            with (
+                patch.dict(tm.config.ui, {"voice_name": configured}),
+                patch.object(tm.voice, "tts", return_value=object()) as tts,
+                patch.object(tm.voice, "get_audio_duration", return_value=5),
+            ):
+                audio_file, audio_duration, sub_maker = tm.generate_audio(
+                    task_id, params, "script"
+                )
+        finally:
+            shutil.rmtree(utils.task_dir(task_id), ignore_errors=True)
+
+        self.assertIsNotNone(audio_file)
+        self.assertEqual(audio_duration, 5)
+        self.assertIsNotNone(sub_maker)
+        # 下传给 TTS 的是去掉性别后缀的真实音色名。
+        self.assertEqual(
+            tts.call_args.kwargs["voice_name"], tm.voice.parse_voice_name(configured)
+        )
+        self.assertEqual(params.voice_name, configured)
+
+    def test_generate_audio_fails_clearly_when_no_voice_configured(self):
+        """请求和配置都没有音色时必须明确失败，不能把空音色丢给 TTS
+        去猜，也不能静默产出无声视频。"""
+        task_id = "test-generate-audio-no-voice"
+        state = MemoryState()
+        params = VideoParams(video_subject="no voice configured", voice_name="")
+
+        with (
+            patch.dict(tm.config.ui, {"voice_name": ""}),
+            patch.object(tm.sm, "state", state),
+            patch.object(tm.voice, "tts") as tts,
+        ):
+            result = tm.generate_audio(task_id, params, "script")
+
+        self.assertEqual(result, (None, None, None))
+        tts.assert_not_called()
+        failed_task = state.get_task(task_id)
+        self.assertEqual(failed_task["failed_stage"], "audio")
+        self.assertIn("[ui].voice_name", failed_task["error"])
+
     def test_generate_audio_rejects_server_side_custom_file_by_default(self):
         task_id = "test-custom-audio-untrusted-server-side"
         task_dir = utils.task_dir(task_id)
@@ -1251,6 +1299,81 @@ class TestTaskService(unittest.TestCase):
             progress=100,
             **result,
         )
+
+    def test_start_runs_longform_pipeline_end_to_end(self):
+        """
+        content_length != short 时必须改走分段流水线：脚本由大纲+逐段文案
+        生成，关键词按段展开，音频/素材/渲染三个阶段都拿到 longform_plan，
+        而短视频的单次渲染路径完全不被调用。
+
+        这里只替换模型与媒体产出，``longform_pipeline.build_longform_script``
+        和真实的段落计算照常执行，因此分支、参数传递和失败语义都被覆盖。
+        """
+        params = VideoParams(
+            video_subject="The fall of Rome",
+            video_language="en-US",
+            content_length="medium",
+            content_target_seconds=600,
+        )
+        outline = [
+            {"title": "Opening", "intent": "hook the viewer"},
+            {"title": "Crisis", "intent": "explain the pressure"},
+            {"title": "Aftermath", "intent": "close the loop"},
+        ]
+
+        def _section_text(**kwargs):
+            return f"{kwargs['section_title']} narration for the viewer. " * 3
+
+        with (
+            patch.object(tm.llm, "generate_outline", return_value=outline),
+            patch.object(
+                tm.llm, "generate_section_text", side_effect=_section_text
+            ) as section_text,
+            patch.object(
+                tm.llm,
+                "generate_section_terms",
+                return_value=[["rome"], ["crisis"], ["aftermath"]],
+            ),
+            patch.object(tm, "save_script_data"),
+            patch.object(tm.task_artifacts, "patch_script_data") as patch_script,
+            patch.object(
+                tm, "generate_audio", return_value=("audio.mp3", 600, object())
+            ) as audio,
+            patch.object(tm, "generate_subtitle", return_value="subtitle.srt"),
+            patch.object(
+                tm, "get_video_materials", return_value=["clip.mp4"]
+            ) as materials,
+            patch.object(
+                tm,
+                "generate_longform_final_video",
+                return_value=(["long.mp4"], [], []),
+            ) as render_long,
+            patch.object(tm, "generate_final_videos") as render_short,
+            patch.object(
+                tm.upload_post.upload_post_service,
+                "is_configured",
+                return_value=False,
+            ),
+            patch.object(tm.publishing, "publish"),
+            patch.object(tm.sm.state, "update_task"),
+        ):
+            result = tm.start("longform-end-to-end", params)
+
+        self.assertEqual(result["videos"], ["long.mp4"])
+        # 大纲一次、正文至少一次；正文是按段调用而不是整篇一次。
+        self.assertGreaterEqual(section_text.call_count, len(outline))
+        # 音频、素材、渲染都必须收到规划；只看"有没有调用"无法发现参数丢失。
+        self.assertIsNotNone(audio.call_args.kwargs.get("longform_plan"))
+        self.assertIsNotNone(materials.call_args.kwargs.get("longform_plan"))
+        self.assertIsNotNone(render_long.call_args.args[2])
+        render_short.assert_not_called()
+        # 规划结构要落进 script.json，失败后才能人工接手。
+        longform_payload = patch_script.call_args.kwargs.get("longform")
+        self.assertEqual(longform_payload["content_length"], "medium")
+        self.assertGreaterEqual(len(longform_payload["sections"]), len(outline))
+        # 段落在 TTS 之后才回填时长，所以清单必须再写一次：只写第一次的话，
+        # 从 script.json 恢复的任务拿到全 0 时长，渲染会当场中止。
+        self.assertEqual(patch_script.call_count, 2)
 
     def test_start_marks_pipeline_failures(self):
         """
@@ -2243,6 +2366,53 @@ class TestTaskService(unittest.TestCase):
         )
         result = tm.start(task_id=task_id, params=params)
         print(result)
+
+
+class TestLongformFinalAudio(unittest.TestCase):
+    """长视频收尾混音不能把本地 BGM 静默丢掉。
+
+    真实失败：``bgm_type=random`` 走的是本地曲库（``video.get_bgm_file``），
+    而长视频不经过 ``generate_video``，所以只有显式解析才能拿到音乐；否则
+    成片有旁白、没有背景音乐，且没有任何报错。
+    """
+
+    def _render(self, params, resolved_bgm):
+        plan = MagicMock()
+        plan.outline = []
+        with (
+            patch.object(
+                tm.section_render, "render_sections", return_value="sections.mp4"
+            ),
+            patch.object(tm.video, "get_bgm_file", return_value=resolved_bgm) as get_bgm,
+            patch.object(tm.video, "mux_audio", return_value=True) as mux,
+            patch.object(tm, "_final_video_output_path", return_value="/tmp/final.mp4"),
+        ):
+            result = tm.generate_longform_final_video(
+                "task-id", params, plan, ["clip.mp4"], "audio.mp3", "sub.srt", 60
+            )
+        return result, get_bgm, mux
+
+    def test_local_random_bgm_is_resolved_before_muxing(self):
+        params = VideoParams(
+            video_subject="x",
+            content_length="medium",
+            bgm_type="random",
+            bgm_volume=0.2,
+        )
+
+        result, get_bgm, mux = self._render(params, "/music/track.mp3")
+
+        get_bgm.assert_called_once()
+        self.assertEqual(mux.call_args.kwargs["bgm_file"], "/music/track.mp3")
+        self.assertEqual(result[0], ["/tmp/final.mp4"])
+
+    def test_no_bgm_type_skips_resolution(self):
+        params = VideoParams(video_subject="x", content_length="medium", bgm_type="")
+
+        _, get_bgm, mux = self._render(params, "")
+
+        get_bgm.assert_not_called()
+        self.assertEqual(mux.call_args.kwargs["bgm_file"], "")
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +48,8 @@ _SAFE_TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 #: ffprobe 单次调用的超时。探测应当是毫秒级的，超时即视为坏文件。
 _PROBE_TIMEOUT_SECONDS = 20
+_PROBE_ATTEMPTS = 2
+_PROBE_RETRY_DELAY_SECONDS = 1.0
 
 _DESCRIPTOR_FILENAME = "result_descriptor.json"
 
@@ -212,25 +215,68 @@ def _canonical_json(payload: dict) -> bytes:
     ).encode("utf-8")
 
 
-def _ffprobe_stream(path: Path, ffprobe: Path) -> dict:
-    """读取第一条视频流的几何信息。"""
+def _probe_timeout_seconds() -> float:
+    """单次 ffprobe 的超时秒数。可通过环境变量或 config 覆盖。"""
+    raw = os.environ.get("MPT_FFPROBE_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
     try:
-        completed = subprocess.run(
-            [
-                str(ffprobe),
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,duration:stream_tags=rotate:side_data=rotation",
-                "-of", "json",
-                str(path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=_PROBE_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ResultDescriptorError(f"ffprobe 无法读取 {path}：{exc}") from exc
+        from app.config import config
+
+        value = float(config.app.get("result_descriptor_probe_timeout_seconds", _PROBE_TIMEOUT_SECONDS))
+        if value > 0:
+            return value
+    except Exception:  # noqa: BLE001 - 配置读不到就用默认
+        pass
+    return float(_PROBE_TIMEOUT_SECONDS)
+
+
+def _ffprobe_stream(path: Path, ffprobe: Path) -> dict:
+    """读取第一条视频流的几何信息。
+
+    ffprobe 偶尔会在成片刚落盘时卡住（文件句柄/缓存未刷完），单次超时
+    不代表文件真的坏。这里做一次短间隔重试，两次都失败才把错误抛给调用方。
+    """
+    last_timeout: subprocess.TimeoutExpired | None = None
+    completed: subprocess.CompletedProcess | None = None
+    for attempt in range(_PROBE_ATTEMPTS):
+        try:
+            completed = subprocess.run(
+                [
+                    str(ffprobe),
+                    "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height,duration:stream_tags=rotate:side_data=rotation",
+                    "-of", "json",
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_probe_timeout_seconds(),
+                check=False,
+            )
+            last_timeout = None
+            break
+        except subprocess.TimeoutExpired as exc:
+            last_timeout = exc
+            if attempt + 1 < _PROBE_ATTEMPTS:
+                time.sleep(_PROBE_RETRY_DELAY_SECONDS)
+                continue
+            raise ResultDescriptorError(
+                f"ffprobe 无法读取 {path}：timed out after "
+                f"{_probe_timeout_seconds()} seconds (attempts={_PROBE_ATTEMPTS})"
+            ) from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ResultDescriptorError(f"ffprobe 无法读取 {path}：{exc}") from exc
+
+    if completed is None:
+        # 理论上不会走到这里；兜底。
+        raise ResultDescriptorError(f"ffprobe 无法读取 {path}：{last_timeout}")
 
     if completed.returncode != 0:
         raise ResultDescriptorError(

@@ -10,7 +10,6 @@ import re
 import subprocess
 import tempfile
 import threading
-import time
 import unicodedata
 from datetime import datetime
 from typing import Union
@@ -706,8 +705,12 @@ def get_edge_tts_timeout_seconds() -> Union[float, None]:
     可能长时间卡在 `stream_sync()` 内部，日志只停留在 `start`。这里提供一个
     默认超时，避免 WebUI 任务长期无反馈。
 
+    注意这里给的是**停滞时限**：超过这么久没有收到任何数据才算失败。它不再是
+    整条流的总时限——那样会把"合成慢"误判成"连接卡死"（见
+    ``_stream_edge_tts_sync_with_timeout``）。
+
     使用方式：
-    - 默认 30 秒，覆盖常见短视频脚本的首包等待时间；
+    - 默认 30 秒没数据就重试，足以覆盖首包与中途抖动；
     - 如用户处于慢网络或代理环境，可在 `config.toml` 里设置
       `edge_tts_timeout = 60`；
     - 设置为 0 或负数表示显式禁用超时，保留完全向后兼容。
@@ -734,12 +737,20 @@ def _stream_edge_tts_sync_with_timeout(
     communicate, on_chunk, timeout_seconds: float
 ) -> None:
     """
-    带总超时地消费 edge_tts 7.x 的同步流。
+    带**停滞**超时地消费 edge_tts 7.x 的同步流。
 
     实现原因：
     `stream_sync()` 本身是阻塞迭代器，网络层卡住时主线程无法及时恢复。
-    这里把阻塞迭代放到 daemon 线程中，主线程通过 Queue 获取 chunk，
-    到达超时时间后直接抛出 TimeoutError，让外层重试和错误日志继续工作。
+    这里把阻塞迭代放到 daemon 线程中，主线程通过 Queue 获取 chunk；
+    ``timeout_seconds`` 内拿不到任何 chunk 就抛 TimeoutError，让外层重试
+    和错误日志继续工作。
+
+    这里刻意**不用**整条流的总时限：超时值本来是用来发现"连接卡死"的，
+    但按总时长计算时，它同时限制了"合成速度"——一段 800 字符的旁白实测要
+    24 秒左右，只要配置值是 30 秒，正常的慢一点就会被判成故障，日志里成片
+    出现 `stream timed out after 30s`，全靠分块重试捞回来。改成按"两次数据
+    之间最长等待"计时后，只有真的不再来数据才失败；合成慢但持续推进的流
+    一定会跑完。
 
     注意：
     daemon 线程只作为兜底保护使用，最多随 Azure TTS V1 的 3 次重试产生
@@ -760,20 +771,13 @@ def _stream_edge_tts_sync_with_timeout(
     thread = threading.Thread(target=_produce_chunks, daemon=True)
     thread.start()
 
-    deadline = time.monotonic() + timeout_seconds
     while True:
-        remaining_seconds = deadline - time.monotonic()
-        if remaining_seconds <= 0:
-            raise TimeoutError(
-                f"edge_tts stream timed out after {timeout_seconds:g}s"
-            )
-
         try:
-            item_type, payload = stream_queue.get(
-                timeout=min(0.5, remaining_seconds)
-            )
+            item_type, payload = stream_queue.get(timeout=timeout_seconds)
         except queue.Empty:
-            continue
+            raise TimeoutError(
+                f"edge_tts stream stalled for {timeout_seconds:g}s"
+            )
 
         if item_type == "chunk":
             on_chunk(payload)
@@ -813,19 +817,28 @@ def stream_edge_tts_chunks(
         raise AttributeError("edge_tts communicate object has no stream method")
 
     async def _consume_async_stream():
-        async for chunk in communicate.stream():
+        # 与同步分支同一条规则：超时看的是"两次数据之间等了多久"，不是整条流
+        # 用了多久。旧版依赖没有 ``stream_sync``，走的就是这里。
+        iterator = communicate.stream().__aiter__()
+        while True:
+            try:
+                if timeout_seconds:
+                    chunk = await asyncio.wait_for(
+                        iterator.__anext__(), timeout=timeout_seconds
+                    )
+                else:
+                    chunk = await iterator.__anext__()
+            except StopAsyncIteration:
+                return
             on_chunk(chunk)
 
     # 这里显式创建独立事件循环，而不是复用外部上下文，目的是避免
     # 在同步调用栈里遇到“当前线程没有事件循环”或跨线程复用循环的问题。
+    # 超时已经由 ``_consume_async_stream`` 按"两次数据之间"逐次计时，外层
+    # 不能再套一个总时限，否则长文本还是会被整条流的时长掐断。
     loop = asyncio.new_event_loop()
     try:
-        if timeout_seconds:
-            loop.run_until_complete(
-                asyncio.wait_for(_consume_async_stream(), timeout=timeout_seconds)
-            )
-        else:
-            loop.run_until_complete(_consume_async_stream())
+        loop.run_until_complete(_consume_async_stream())
     finally:
         loop.close()
 
@@ -2008,6 +2021,11 @@ def _write_subtitle_items(sub_items: list[str], subtitle_file: str) -> bool:
         return False
 
 
+def _normalize_subtitle_text(text: str) -> str:
+    """字幕聚合时用于比对的规范化：去掉空白、标点与阿拉伯语变音符号。"""
+    return re.sub(r"[_\W]+", "", _normalize_arabic(unescape(text or "")))
+
+
 def _build_subtitle_items_from_edge_cues(
     sub_maker: SubMaker, script_lines: list[str]
 ) -> list[str]:
@@ -2020,44 +2038,82 @@ def _build_subtitle_items_from_edge_cues(
     “金钱 / 是 / 一种 / 社会 / 工具” 这种阅读体验很差的效果。
 
     实现策略：
-    1. 逐个消费 cues 中的 `content`；
-    2. 累积成一段候选文本；
-    3. 当候选文本与脚本里当前目标断句匹配时，收敛为一个完整字幕段；
-    4. 使用第一条 cue 的开始时间和最后一条 cue 的结束时间，保证时间轴连续。
+    1. 逐个消费 cues 中的 `content`，按**规范化后的前缀**对齐脚本断句；
+    2. 一条 cue 恰好覆盖一行时收敛为该行字幕；
+    3. 一条 cue 越过行尾时（实测里 Azure 会返回 "materialdestined" 这种
+       跨词、跨句的 WordBoundary），把多出来的字留到下一行继续匹配；
+    4. 时间轴取该行第一条 cue 的开始与最后一条 cue 的结束。
+
+    第 3 点是长视频字幕曾经整条丢失的原因：旧实现要求累积文本与脚本行
+    **完全相等**，一旦服务端把两个词并在一条 cue 里，累加文本就永远比目标
+    长，之后的每一行都对不上，最终 ``sub_items`` 为 0。
     """
     formatter = _build_subtitle_formatter()
-    sub_items = []
+    sub_items: list[str] = []
+    if not script_lines:
+        return sub_items
+
     sub_index = 0
-    current_text = ""
-    current_start_time = None
+    pending = ""
+    start_time = None
+    #: 规范化后超出目标这么多字符仍对不上，就认定 TTS 念的字与脚本不同
+    #: （典型例子：脚本写 "1,000"，TTS 念 "one thousand"）。这种情况下照常
+    #: 产出这一行，并丢弃已累积但无法归属的文本，避免时间轴永远卡住。
+    resync_slack = 60
 
-    for cue in sub_maker.cues:
-        cue_text = unescape(cue.content)
-        if current_start_time is None:
-            current_start_time = int(cue.start.total_seconds() * 10000000)
-
-        current_end_time = int(cue.end.total_seconds() * 10000000)
-        current_text += cue_text
-
-        matched_text = _match_script_line(script_lines, current_text, sub_index)
-        if not matched_text:
-            continue
-
+    def _emit(end_time: int) -> None:
+        nonlocal sub_index, pending, start_time
         sub_index += 1
         sub_items.append(
             formatter(
                 idx=sub_index,
-                start_time=current_start_time,
-                end_time=current_end_time,
-                sub_text=matched_text,
+                start_time=start_time,
+                end_time=end_time,
+                sub_text=script_lines[sub_index - 1].strip(),
             )
         )
-        current_text = ""
-        current_start_time = None
+        pending = ""
+        start_time = None
 
-    if current_text.strip():
+    for cue in sub_maker.cues:
+        cue_start = int(cue.start.total_seconds() * 10000000)
+        cue_end = int(cue.end.total_seconds() * 10000000)
+        if start_time is None:
+            start_time = cue_start
+        pending += _normalize_subtitle_text(cue.content)
+
+        # 一条 cue 可能跨越多行脚本，所以这里循环消费，直到不再命中。
+        while sub_index < len(script_lines):
+            target = _normalize_subtitle_text(script_lines[sub_index])
+            if not target:
+                # 只有标点、没有可读文字的行不产出字幕，否则 SRT 会出现空条。
+                sub_index += 1
+                continue
+            if pending == target:
+                _emit(cue_end)
+                break
+            if len(pending) > len(target) and pending.startswith(target):
+                leftover = pending[len(target):]
+                _emit(cue_end)
+                pending = leftover
+                # 多出来的字属于下一行，时间从这条 cue 之后算，避免两行字幕重叠。
+                start_time = cue_end
+                continue
+            if len(pending) > len(target) + resync_slack:
+                logger.warning(
+                    "edge cues diverged from the script line "
+                    f"{sub_index + 1}; emitting it with the current cue timing"
+                )
+                _emit(cue_end)
+                break
+            break
+
+        if sub_index >= len(script_lines):
+            break
+
+    if pending.strip():
         logger.warning(
-            f"edge cues still have unmatched text after aggregation: {current_text}"
+            f"edge cues still have unmatched text after aggregation: {pending}"
         )
 
     return sub_items
@@ -2131,7 +2187,12 @@ def create_subtitle(sub_maker: SubMaker, text: str, subtitle_file: str):
             logger.warning(
                 f"failed, sub_items len: {len(sub_items)}, script_lines len: {len(script_lines)}"
             )
-            return
+            if not sub_items:
+                return
+            # 部分匹配也照常落盘：少几行字幕远好过整条长视频没有字幕。此前这里
+            # 一律 return，长视频只要有一行对不上（例如 TTS 把 "1,000" 念成
+            # "one thousand"）就整条字幕一起丢弃，用户看到的是"没有字幕"。
+            logger.warning("writing partial subtitle track from the matched lines")
 
         _write_subtitle_items(sub_items, subtitle_file)
     except Exception as e:

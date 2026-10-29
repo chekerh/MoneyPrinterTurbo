@@ -449,6 +449,51 @@ def test_bad_env_value_is_skipped_rather_than_killing_the_run():
     assert result.font_size == 44, "写坏的键不该覆盖表单里的有效值"
 
 
+def test_plan_path_takes_the_length_band_from_the_niche():
+    """
+    赛道设了长视频档位，计划页按天出片就必须出长视频。
+
+    否则同一个赛道有两条互不相干的形态："在赛道页点立刻出片"是中视频，"计划页点
+    生成今日视频"是短视频——原因是计划页用的是表单快照里的档位，赛道画像根本没参与。
+    用户没法理解为什么同一个频道长的长短的短。
+    """
+    from unittest.mock import patch as _patch
+
+    from app.models.schema import VideoParams
+    from app.services import niche_brand
+
+    ns = _load_plan_param_namespace()
+    form = VideoParams(video_subject="", content_length="short")
+    with _patch.object(
+        niche_brand, "longform_preference", return_value=("medium", 600)
+    ), patch.dict(plans.__dict__, {"read_automation_env": lambda ch: {},
+                                   "read_file_text": lambda ch, *a: ""}):
+        result = ns["_build_plan_params"]("longch", "A topic", form)
+
+    assert result.content_length == "medium"
+    assert result.content_target_seconds == 600
+
+
+def test_channel_env_can_still_override_the_niche_band():
+    """频道文件显式写的档位优先于赛道画像，留给单频道临时覆盖。"""
+    from unittest.mock import patch as _patch
+
+    from app.models.schema import VideoParams
+    from app.services import niche_brand
+
+    ns = _load_plan_param_namespace()
+    form = VideoParams(video_subject="", content_length="short")
+    env = {"CONTENT_LENGTH": "long", "CONTENT_TARGET_SECONDS": "1500"}
+    with _patch.object(
+        niche_brand, "longform_preference", return_value=("medium", 600)
+    ), patch.dict(plans.__dict__, {"read_automation_env": lambda ch: env,
+                                   "read_file_text": lambda ch, *a: ""}):
+        result = ns["_build_plan_params"]("longch", "A topic", form)
+
+    assert result.content_length == "long"
+    assert result.content_target_seconds == 1500
+
+
 def test_plan_params_do_not_mutate_the_form_snapshot():
     """
     计划渲染不能改到用户正在编辑的那份参数。

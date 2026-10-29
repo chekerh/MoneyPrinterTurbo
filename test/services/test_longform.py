@@ -330,6 +330,129 @@ class TestClipBudget:
         assert section_materials.clip_budget([], 300, clip_duration=5) == []
 
 
+class TestMaterialBuckets:
+    """素材分桶：预算 ≠ 手上素材数时必须保证每一段都有画面。
+
+    真实失败：6 段长视频用幻灯片源只有 7 张图，而预算是 119 个镜头，按预算
+    切片把第 3 段起全切空，渲染在 ``section 3 has no materials assigned``
+    处中止。
+    """
+
+    def _plan(self, durations):
+        sections = [
+            Section(index=index + 1, text="段", duration=seconds)
+            for index, seconds in enumerate(durations)
+        ]
+        return longform.SectionPlan(
+            band=longform.LENGTH_BANDS["medium"],
+            target_seconds=int(sum(durations)),
+            language="en",
+            outline=sections,
+        )
+
+    def test_fewer_clips_than_budget_still_covers_every_section(self):
+        from app.services import longform_pipeline
+
+        plan = self._plan([97, 201, 60, 60, 60, 60])
+        clips = [f"clip-{index}" for index in range(7)]
+
+        buckets = longform_pipeline.assign_materials_to_sections(
+            plan, clips, total_seconds=538, clip_duration=5
+        )
+
+        assert len(buckets) == 6
+        assert all(buckets), buckets
+        # 顺序即叙事顺序：一段一张，收尾页留在最后一段。
+        assert buckets[0] == ["clip-0"]
+        assert buckets[-1] == ["clip-5", "clip-6"]
+
+    def test_fewer_clips_than_sections_repeats_instead_of_leaving_gaps(self):
+        from app.services import longform_pipeline
+
+        plan = self._plan([60, 60, 60, 60])
+
+        buckets = longform_pipeline.assign_materials_to_sections(
+            plan, ["a", "b"], total_seconds=240, clip_duration=5
+        )
+
+        assert all(buckets), buckets
+        assert buckets == [["a"], ["b"], ["a"], ["b"]]
+
+    def test_enough_clips_keeps_budget_split_and_tail_leftovers(self):
+        from app.services import longform_pipeline
+
+        plan = self._plan([10, 10])
+        clips = [f"c{index}" for index in range(200)]
+
+        buckets = longform_pipeline.assign_materials_to_sections(
+            plan, clips, total_seconds=20, clip_duration=5
+        )
+
+        assert buckets[0] == clips[:3]
+        # 多余素材并入最后一段，不丢弃。
+        assert len(buckets[1]) == 197
+        assert buckets[1][0] == "c3"
+
+
+class TestSectionDurations:
+    """``Section.duration`` 必须是"本段时长"，不是 cue 的累计结束时间。
+
+    真实失败：回填时直接写 cue 的绝对结束时间，分段渲染的切片游标于是每段
+    多加上前面所有段的时长——593 秒的旁白切成 2125 秒的分段视频，第 2 段起
+    音画和字幕全部错位。
+    """
+
+    def _plan(self, texts, target_seconds=100):
+        sections = [
+            Section(index=index + 1, text=text) for index, text in enumerate(texts)
+        ]
+        return longform.SectionPlan(
+            band=longform.LENGTH_BANDS["medium"],
+            target_seconds=target_seconds,
+            language="en",
+            outline=sections,
+        )
+
+    @staticmethod
+    def _maker(ends):
+        maker = SubMaker()
+        maker.subs = []
+        maker.offset = []
+        maker.cues = [
+            Subtitle(
+                index + 1,
+                datetime.timedelta(seconds=0 if index == 0 else ends[index - 1]),
+                datetime.timedelta(seconds=end),
+                "x" * 10,
+            )
+            for index, end in enumerate(ends)
+        ]
+        return maker
+
+    def test_cue_ends_are_converted_to_per_section_spans(self):
+        from app.services import longform_pipeline
+
+        plan = self._plan(["a" * 10, "b" * 10, "c" * 20])
+        maker = self._maker([30.0, 60.0, 100.0])
+
+        longform_pipeline._record_section_durations(plan, "abc", maker, 100.0)
+
+        assert [round(item.duration, 3) for item in plan.outline] == [30.0, 30.0, 40.0]
+        assert round(sum(item.duration for item in plan.outline), 3) == 100.0
+
+    def test_starved_sections_get_time_instead_of_zero(self):
+        """cue 提前耗尽时剩下的段不能是 0 时长——渲染会因此中止整条片子。"""
+        from app.services import longform_pipeline
+
+        plan = self._plan(["a" * 10, "b" * 10, "c" * 10], target_seconds=120)
+        maker = self._maker([40.0, 80.0])
+
+        longform_pipeline._record_section_durations(plan, "abc", maker, 120.0)
+
+        assert all(item.duration > 0 for item in plan.outline)
+        assert round(sum(item.duration for item in plan.outline), 3) == 120.0
+
+
 class TestScriptAssembly:
     def test_sections_joined_with_blank_lines(self):
         """段落分隔必须和短视频路径一致，否则字幕逐段匹配会整段失败。"""

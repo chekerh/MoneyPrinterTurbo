@@ -9,6 +9,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import threading
+import time
 from typing import Optional
 import logging
 
@@ -136,7 +137,26 @@ class SessionManager:
         """Make a request using the pooled session."""
         session = self.get_session(base_url)
         timeout = kwargs.pop("timeout", self._timeout)
-        return session.request(method, url, timeout=timeout, **kwargs)
+        last_exc: Exception | None = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                return session.request(method, url, timeout=timeout, **kwargs)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                last_exc = exc
+                if attempt >= self._max_retries:
+                    break
+                delay = self._backoff_factor * (2 ** attempt)
+                logger.warning(
+                    "http transient error on attempt %d/%d for %s: %s; retrying in %.1fs",
+                    attempt + 1,
+                    self._max_retries + 1,
+                    url,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
 
     def get(self, url: str, base_url: str = None, **kwargs) -> requests.Response:
         return self.request("GET", url, base_url=base_url, **kwargs)

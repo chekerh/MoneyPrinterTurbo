@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -2490,6 +2491,87 @@ class TestPreprocessVideoBranches(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 vd.preprocess_video([material], clip_duration=4)
         self.assertGreaterEqual(close_clip.call_count, 2)
+
+
+class TestMuxAudio(unittest.TestCase):
+    """长视频最终混音：无 BGM 重封装、有 BGM amix、画面始终原样复制。
+
+    真实失败：``mux_audio`` 里两处 ``path.exists`` 少了 import，ffmpeg 已经把
+    成片写完，检查却抛 ``NameError`` —— 9 分钟的渲染成果被判失败。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not utils.check_ffmpeg_ready():
+            raise unittest.SkipTest("ffmpeg is not available")
+        cls.workdir = tempfile.mkdtemp(prefix="mux-audio-")
+        cls.video = os.path.join(cls.workdir, "source.mp4")
+        cls.bgm = os.path.join(cls.workdir, "bgm.mp3")
+        cls._ffmpeg(
+            "-f", "lavfi", "-i", "color=c=navy:s=320x180:r=10:d=2",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            "-shortest", cls.video,
+        )
+        cls._ffmpeg(
+            "-f", "lavfi", "-i", "sine=frequency=220:duration=3",
+            "-c:a", "libmp3lame", cls.bgm,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.workdir, ignore_errors=True)
+
+    @staticmethod
+    def _ffmpeg(*args):
+        result = subprocess.run(
+            [utils.get_ffmpeg_binary(), "-y", "-hide_banner", "-loglevel", "error", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {result.stderr[-300:]}")
+
+    def _mux(self, name, **kwargs):
+        output = os.path.join(self.workdir, name)
+        ok = vd.mux_audio(video_path=self.video, output_file=output, threads=1, **kwargs)
+        self.assertTrue(ok)
+        self.assertTrue(os.path.exists(output))
+        return output
+
+    def test_remux_without_bgm_keeps_video_bitstream(self):
+        output = self._mux("plain.mp4")
+
+        def stream_md5(path):
+            result = subprocess.run(
+                [
+                    utils.get_ffmpeg_binary(), "-v", "error", "-i", path,
+                    "-map", "0:v", "-c", "copy", "-f", "md5", "-",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return result.stdout.strip()
+
+        self.assertEqual(stream_md5(self.video), stream_md5(output))
+
+    def test_mixes_bgm_and_still_returns_success(self):
+        output = self._mux(
+            "with-bgm.mp4", bgm_file=self.bgm, bgm_volume=0.3, voice_volume=1.0
+        )
+        probe = subprocess.run(
+            [utils.get_ffmpeg_binary(), "-hide_banner", "-i", output],
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("Video:", probe.stderr)
+        self.assertIn("Audio:", probe.stderr)
+
+    def test_missing_bgm_file_falls_back_to_remux(self):
+        output = self._mux("missing-bgm.mp4", bgm_file="/nonexistent/bgm.mp3")
+        self.assertTrue(os.path.exists(output))
 
 
 if __name__ == "__main__":

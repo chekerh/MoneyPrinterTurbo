@@ -316,6 +316,52 @@ class TestVoiceService(unittest.TestCase):
             self.assertEqual(len(sub_maker.events), 1)
             self.assertEqual(sub_maker.events[0]["type"], "WordBoundary")
 
+    def test_edge_tts_timeout_measures_stall_not_total_duration(self):
+        """
+        超时必须按"多久没数据"计时，不能按整条流的总时长。
+
+        真实数据：长视频按 ~800 字符分块，每块实测约 24 秒，而配置值是 30 秒。
+        按总时长计时时，只要网络慢一点，正常合成就会被判超时，日志里成片地出现
+        "stream timed out after 30s"，全靠分块重试兜回来。下面这条流一共耗时
+        约 0.6 秒（> 0.2 秒超时值），但每 0.05 秒就有数据——它必须成功。
+        """
+
+        class _SteadyCommunicate:
+            def __init__(self, text, voice, rate="+0%", boundary=None):
+                self.text = text
+                self.voice = voice
+                self.rate = rate
+                self.boundary = boundary
+
+            def stream_sync(self):
+                for index in range(12):
+                    time.sleep(0.05)
+                    yield {"type": "audio", "data": bytes([index])}
+
+        class _FakeSubMaker:
+            def feed(self, chunk):
+                return None
+
+            def get_srt(self):
+                return "1\n00:00:00,000 --> 00:00:01,000\nsteady\n"
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.edge_tts, "Communicate", _SteadyCommunicate
+        ), patch.object(vs.edge_tts, "SubMaker", _FakeSubMaker), patch.object(
+            vs.config,
+            "app",
+            dict(vs.config.app, edge_tts_timeout=0.2),
+        ):
+            voice_file = Path(tmp_dir) / "steady-edge-tts.mp3"
+            sub_maker = vs.azure_tts_v1(
+                text="a steady stream must not be treated as stalled",
+                voice_name="en-AU-NatashaNeural-Female",
+                voice_file=str(voice_file),
+                voice_rate=1.0,
+            )
+            self.assertIsNotNone(sub_maker)
+            self.assertEqual(len(voice_file.read_bytes()), 12)
+
     def test_azure_tts_v1_times_out_hanging_stream_sync(self):
         """
         验证 Azure TTS V1 在 edge_tts 同步流卡住时能够快速失败。
@@ -1207,6 +1253,53 @@ class TestVoiceService(unittest.TestCase):
         self.assertEqual(len(sub_items), len(script_lines))
         self.assertIn("أهلاً وسهلاً بك في المدرسة", sub_items[0])
         self.assertIn("شكراً لك", sub_items[-1])
+
+    def test_edge_cue_aggregation_handles_merged_word_boundaries(self):
+        """一条 cue 跨越行边界时，多出来的字必须留给下一行。
+
+        实测中 Azure 会返回 "materialdestined" 这种把两个词、甚至两句话
+        并在一条 WordBoundary 里的 cue。旧实现要求累加文本与脚本行完全
+        相等，遇到这种 cue 之后每一行都对不上，``sub_items`` 直接为 0，
+        整条视频没有任何字幕。
+        """
+        script_lines = [
+            "Modern concrete is a fragile material",
+            "destined to decay",
+            "Within fifty years the steel begins to oxidize",
+        ]
+        cue_texts = [
+            "Modern",
+            "concrete",
+            "is",
+            "a",
+            "fragile",
+            "materialdestined",
+            "todecayWithin",
+            "fifty",
+            "years",
+            "the",
+            "steel",
+            "begins",
+            "to",
+            "oxidize",
+        ]
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content=content,
+                    start=timedelta(seconds=index),
+                    end=timedelta(seconds=index + 0.8),
+                )
+                for index, content in enumerate(cue_texts)
+            ]
+        )
+
+        sub_items = vs._build_subtitle_items_from_edge_cues(sub_maker, script_lines)
+
+        self.assertEqual(len(sub_items), len(script_lines))
+        self.assertIn("Modern concrete is a fragile material", sub_items[0])
+        self.assertIn("destined to decay", sub_items[1])
+        self.assertIn("Within fifty years the steel begins to oxidize", sub_items[2])
 
     def test_create_subtitle_ignores_markdown_separator_lines(self):
         """

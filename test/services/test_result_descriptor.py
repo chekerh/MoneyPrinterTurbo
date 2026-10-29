@@ -521,6 +521,14 @@ class TestFfprobeFailureHandling(unittest.TestCase):
             with self.assertRaises(ResultDescriptorError):
                 _ffprobe_stream(self.video, Path("/bin/true"))
 
+    def test_retries_timeout_once_and_succeeds(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout='{"streams": [{"width": 10, "height": 20, "duration": "1.0"}]}', stderr=""
+        )
+        with patch("subprocess.run", side_effect=[subprocess.TimeoutExpired("ffprobe", 20), completed]):
+            stream = _ffprobe_stream(self.video, Path("/bin/true"))
+        self.assertEqual(stream.get("width"), 10)
+
     def test_rejects_non_json_output(self):
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="not json at all", stderr=""
