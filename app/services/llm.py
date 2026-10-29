@@ -12,6 +12,7 @@ from openai.types.chat import ChatCompletion
 
 from app.config import config
 from app.models.llm_provider import DEFAULT_LLM_PROVIDER_ID, get_llm_provider
+from app.services.humanize import HUMANIZER_RULES
 
 _max_retries = max(1, int(config.app.get("llm_max_retries", 8)))
 MIN_SCRIPT_PARAGRAPH_NUMBER = 1
@@ -62,7 +63,7 @@ _SENSITIVE_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 
-DEFAULT_SCRIPT_SYSTEM_PROMPT = """
+DEFAULT_SCRIPT_SYSTEM_PROMPT = f"""
 # Role: Video Script Generator
 
 ## Goals:
@@ -95,34 +96,7 @@ everyone. choices should be uneven and specific, not the most average phrasing.
 vary sentence length: alternate short and long sentences. read each line aloud;
 it must be comfortable to speak and must add something the viewer did not already know.
 
-## Banned AI patterns (humanizer):
-- no "not X but Y" contrasts, no one-line closers ("that is the real win", "let that
-  sink in"), and no arguing with no one ("this isn't about X", "to be clear").
-- no forced triads ("innovation, inspiration, insights") unless the meaning truly
-  has three parts.
-- no em dashes or en dashes; use periods, commas, or parentheses instead.
-- no inflated words: actually, additionally, enhance, fostering, pivotal, showcase,
-  testament, underscore, vibrant, delve, robust, rich.
-- no inflated significance ("stands as a testament", "the future looks bright").
-- no sales language: boasts, nestled, stunning, breathtaking, must-visit.
-- no chatbot residue ("I hope this helps", "let me know", "great question").
-- no bold labels, headings, emojis, bullets, or decorative formatting.
-- no sayings that pose as depth: "the real question is", "at its core", "what
-  really matters", "the deeper issue", "the heart of the matter", "X is the Y
-  of Z". state the specific claim instead.
-- no arguing with nobody: "to be clear", "don't get me wrong", "this isn't
-  mainly about", "I'm not saying", "one might be tempted to". delete the
-  objection nobody made.
-- no knowledge-limit hedging: "as of", "up to my last update", "it is believed
-  that", "not publicly available". either state what is known or leave it out.
-  never present a guess as fact.
-- use "is", "are", "has" rather than "serves as", "stands as", "functions as",
-  "boasts", "features", "offers", "maintains", "refers to".
-- no "-ing" rider bolted onto a plain fact (highlighting, underscoring,
-  showcasing, fostering, ensuring) unless it carries real meaning.
-- no unnamed authority: "experts argue", "studies show" without naming who.
-  if no source exists, do not invent one.
-- vary sentence openings. do not start three sentences the same way.
+{HUMANIZER_RULES}
 """.strip()
 
 
@@ -644,6 +618,13 @@ def build_script_prompt(
     if directives:
         prompt += "\n\n" + directives
 
+    # humanizer 规则必须跟着**每一条**生成路径走。默认 prompt 已经内嵌了它，
+    # 但频道自带 system_prompt.txt（``history-mysteries`` 就是）或高级用户自定义
+    # system prompt 时，整个默认 prompt 被替换——规则也跟着消失，而那个频道恰恰
+    # 是 AI 腔最重的。这里按内容判断，重复拼接不会发生。
+    if HUMANIZER_RULES not in prompt:
+        prompt += "\n\n" + HUMANIZER_RULES
+
     prompt += f"""
 
 # Initialization:
@@ -660,6 +641,51 @@ def build_script_prompt(
 """.rstrip()
 
     return prompt
+
+
+def _humanizer_enabled(app_config=None) -> bool:
+    """默认开启。用户可以在 ``[app] humanize_scripts = false`` 关掉它。"""
+    source = app_config if isinstance(app_config, dict) else config.app
+    value = source.get("humanize_scripts", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(value)
+
+
+def _humanized(script: str, app_config=None) -> str:
+    """检出 AI 痕迹，必要时让模型按证据重写一次。
+
+    失败一律返回原文：这一步是增强，不该成为脚本生成的新故障点。日志里保留
+    分数变化，定时任务的日志才能回答"humanizer 到底有没有跑"。
+    """
+    from app.services.humanize import humanize_script, needs_rewrite, score
+
+    def generate(prompt: str) -> str:
+        if app_config is None:
+            return _generate_response(prompt=prompt)
+        return _generate_response(prompt=prompt, app_config=app_config)
+
+    try:
+        result = humanize_script(script, generate=generate)
+    except Exception as exc:  # noqa: BLE001 - 增强步骤不能拖垮脚本生成
+        logger.warning(f"humanizer skipped: {_sanitize_error_message(exc)}")
+        return script
+
+    before_score = score(result.before)
+    after_score = score(result.after)
+    if result.rewrote:
+        logger.info(
+            f"humanizer: rewrote script, {len(result.before)} pattern(s) "
+            f"score {before_score} -> {after_score}"
+        )
+    elif needs_rewrite(result.before):
+        logger.warning(
+            f"humanizer: kept original script, rewrite did not improve it "
+            f"(score {before_score})"
+        )
+    else:
+        logger.info(f"humanizer: clean, {len(result.before)} pattern(s)")
+    return result.script
 
 
 def generate_script(
@@ -748,6 +774,9 @@ def generate_script(
             logger.warning(f"failed to generate video script, trying again... {i + 1}")
     if not final_script and last_error:
         final_script = last_error
+    if final_script and "Error: " not in final_script and _humanizer_enabled(app_config):
+        # 重写回来的文本可能又带 markdown，再过一次 format_response。
+        final_script = format_response(_humanized(final_script, app_config))
     if "Error: " in final_script:
         logger.error(f"failed to generate video script: {final_script}")
     else:

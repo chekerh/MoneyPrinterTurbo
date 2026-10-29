@@ -72,6 +72,16 @@ hide_config = false
 # independently generated script candidates. The WebUI integration is optional.
 script_generation_backend = "local"
 
+# Run the humanizer pass over generated scripts. The writing rules are always in
+# the prompt; this switch controls the second layer, which detects AI tells in
+# the returned script and asks the model to rewrite it once. Set to false only
+# when you want raw model output (it costs one extra LLM call only when tells
+# are found).
+# 是否对生成的脚本执行 humanizer 检查。写作规则始终在 prompt 里；这个开关控制
+# 第二层——检出 AI 腔后让模型按证据重写一次。只在需要原始模型输出时关掉
+# （只有检到痕迹时才会多花一次调用）。
+humanize_scripts = true
+
 # LoomLoom Public API settings. The WebUI supports the public MoneyPrinterTurbo
 # SkillBot below out of the box. Configure the key in the WebUI or a private
 # config.toml, and never commit a real key. The fixed SkillBot accepts subject,

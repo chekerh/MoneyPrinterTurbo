@@ -211,6 +211,64 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertIn("A beautiful day at the", result)
         self.assertIn("10% of your income", result)
 
+    def test_humanizer_rules_survive_a_channel_system_prompt(self):
+        """频道自带 system_prompt.txt 会整体替换默认 prompt，规则不能跟着丢。
+
+        ``history-mysteries`` 就是这么跑的：``plans/<channel>/system_prompt.txt``
+        非空即替换 ``DEFAULT_SCRIPT_SYSTEM_PROMPT``，而 humanizer 规则原本只写在
+        默认 prompt 里，于是唯一有独立 prompt 的频道反而完全没有约束。
+        """
+        prompt = llm.build_script_prompt(
+            video_subject="the Antikythera mechanism",
+            custom_system_prompt="Return one paragraph of 90-130 words.",
+        )
+        self.assertIn(llm.HUMANIZER_RULES, prompt)
+        self.assertEqual(prompt.count(llm.HUMANIZER_RULES), 1)
+
+    def test_humanizer_rules_are_not_duplicated_for_the_default_prompt(self):
+        prompt = llm.build_script_prompt(video_subject="coffee", language="en")
+        self.assertEqual(prompt.count(llm.HUMANIZER_RULES), 1)
+
+    def test_generate_script_rewrites_when_humanizer_finds_tells(self):
+        ai_script = (
+            "It's not just a wall, it's a promise. The town stands as a testament "
+            "to trade."
+        )
+        clean_script = "The wall was a promise. The town traded and the harbour filled."
+
+        with patch.object(
+            llm, "_generate_response", side_effect=[ai_script, clean_script]
+        ) as generate:
+            result = llm.generate_script(video_subject="Roman walls", language="en")
+
+        self.assertEqual(result, clean_script)
+        self.assertEqual(generate.call_count, 2)
+
+    def test_generate_script_can_disable_the_humanizer(self):
+        ai_script = "It's not just a wall, it's a promise."
+        app_config = {"humanize_scripts": False}
+
+        with patch.object(
+            llm, "_generate_response", side_effect=lambda prompt, app_config=None: ai_script
+        ) as generate:
+            result = llm.generate_script(
+                video_subject="Roman walls", language="en", app_config=app_config
+            )
+
+        self.assertEqual(result, ai_script)
+        self.assertEqual(generate.call_count, 1)
+
+    def test_generate_script_keeps_the_script_when_the_rewrite_fails(self):
+        """重写是增强步骤：模型第二次调用报错时，不能让整条脚本生成失败。"""
+        ai_script = "Great question! The bridge opened in 1883."
+
+        with patch.object(
+            llm, "_generate_response", side_effect=[ai_script, "Error: rate limited"]
+        ):
+            result = llm.generate_script(video_subject="bridges", language="en")
+
+        self.assertEqual(result, ai_script)
+
     def test_generate_terms_can_request_script_ordered_keywords(self):
         """
         按文案顺序匹配素材依赖 LLM 返回有序关键词。这里不调用真实模型，

@@ -464,3 +464,125 @@ class TestTopicCursorSurvivesMonthRollover(unittest.TestCase):
                 self._archive_through(plan_dir, last, month)
                 seen.append(plans.first_pending_topic("rollch")[0])
         self.assertEqual(seen, [11, 15, 21])
+
+
+class TestMarkPostedPlanDir(unittest.TestCase):
+    """``mark-posted --plan-dir`` 让跨月回填把发布记录写回**成片所属**的月份。
+
+    定时任务发布的是当天的成片，"今天"就是那个月；回填工具处理的是两个月前的
+    片子，按今天取月份会把 9 月的 URL 写进 10 月的计划行（行号碰巧对得上），
+    9 月的计划仍然是 pending——下次回填又把它挑出来重发一次。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+        self.channel = "backfillch"
+        self.old_dir = Path(self._tmp) / self.channel / "2026-09"
+        self.new_dir = Path(self._tmp) / self.channel / "2026-10"
+        for directory in (self.old_dir, self.new_dir):
+            (directory / "videos").mkdir(parents=True, exist_ok=True)
+        self.patcher = mock.patch.object(plans, "OUTPUTS_DIR", self._tmp)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def _write(self, directory, rows):
+        lines = ["| # | topic | status |", "|---|---|---|"]
+        lines += [f"| {i} | {topic} | {status} |" for i, topic, status in rows]
+        (Path(directory) / "monthly-plan.md").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+
+    def test_mark_posted_writes_into_the_requested_month(self):
+        self._write(self.old_dir, [(1, "September topic", "pending")])
+        self._write(self.new_dir, [(1, "October topic", "pending")])
+
+        changed = plans.mark_posted(
+            self.channel, 1, "https://youtu.be/SEP", str(self.old_dir)
+        )
+
+        self.assertTrue(changed)
+        old_text = (self.old_dir / "monthly-plan.md").read_text(encoding="utf-8")
+        new_text = (self.new_dir / "monthly-plan.md").read_text(encoding="utf-8")
+        self.assertIn("https://youtu.be/SEP", old_text)
+        self.assertNotIn("https://youtu.be/SEP", new_text)
+
+    def test_cli_accepts_plan_dir(self):
+        self._write(self.old_dir, [(2, "September topic", "pending")])
+
+        code = plans.main(
+            [
+                "mark-posted",
+                self.channel,
+                "2",
+                "https://youtu.be/CLI",
+                "--plan-dir",
+                str(self.old_dir),
+            ]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "https://youtu.be/CLI",
+            (self.old_dir / "monthly-plan.md").read_text(encoding="utf-8"),
+        )
+
+    def test_nothing_changed_returns_1(self):
+        """行号对不上时必须报错退出：以前返回 0，流水线打印"已更新"而计划没变。"""
+        self._write(self.old_dir, [(1, "September topic", "pending")])
+
+        code = plans.main(
+            [
+                "mark-posted",
+                self.channel,
+                "9",
+                "https://youtu.be/GHOST",
+                "--plan-dir",
+                str(self.old_dir),
+            ]
+        )
+
+        self.assertEqual(code, 1)
+
+    def test_missing_month_directory_returns_1(self):
+        code = plans.main(
+            [
+                "mark-posted",
+                self.channel,
+                "1",
+                "https://youtu.be/X",
+                "--plan-dir",
+                str(Path(self._tmp) / "2026-01"),
+            ]
+        )
+
+        self.assertEqual(code, 1)
+
+    def test_existing_posted_url_is_replaced_not_appended(self):
+        self._write(
+            self.old_dir, [(1, "September topic", "posted: https://youtu.be/OLD")]
+        )
+
+        plans.mark_posted(self.channel, 1, "https://youtu.be/NEW", str(self.old_dir))
+
+        text = (self.old_dir / "monthly-plan.md").read_text(encoding="utf-8")
+        self.assertIn("https://youtu.be/NEW", text)
+        self.assertNotIn("https://youtu.be/OLD", text)
+
+    def test_empty_url_is_refused(self):
+        self._write(self.old_dir, [(1, "September topic", "pending")])
+        self.assertFalse(plans.mark_posted(self.channel, 1, "", str(self.old_dir)))
+
+    def test_unknown_option_exits_2(self):
+        self._write(self.old_dir, [(1, "September topic", "pending")])
+        code = plans.main(
+            [
+                "mark-posted",
+                self.channel,
+                "1",
+                "https://youtu.be/X",
+                "--bogus",
+                "y",
+            ]
+        )
+        self.assertEqual(code, 2)

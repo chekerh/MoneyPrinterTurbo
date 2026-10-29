@@ -575,9 +575,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if command == "mark-posted":
         if len(args) < 4 or not args[2].isdigit():
-            print("usage: plans.py mark-posted <channel> <index> <url>", file=sys.stderr)
+            print(
+                "usage: plans.py mark-posted <channel> <index> <url> [--plan-dir DIR]",
+                file=sys.stderr,
+            )
             return 2
-        mark_posted(channel, int(args[2]), args[3])
+        # ``--plan-dir`` 让回填工具把“9 月的成片”标记在 9 月的计划里。默认仍按
+        # 今天取月份：定时任务发布的是当天的成片，跨月回填才是那个例外。
+        plan_dir = None
+        rest = args[4:]
+        if rest:
+            if rest[0] != "--plan-dir" or len(rest) < 2:
+                print(f"unknown option: {' '.join(rest)}", file=sys.stderr)
+                return 2
+            plan_dir = rest[1]
+        if not mark_posted(channel, int(args[2]), args[3], plan_dir):
+            # 以前无论是否写入都返回 0，于是流水线会打印 "plan updated" 而计划
+            # 文件其实没变（行号对不上、URL 为空、月份目录不存在都会静默失败）。
+            print("mark-posted: nothing changed", file=sys.stderr)
+            return 1
         return 0
     if command in ("check-duplicates", "--check-duplicates"):
         duplicates = find_recent_duplicates(channel)

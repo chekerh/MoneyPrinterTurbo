@@ -26,7 +26,25 @@ import urllib.parse as urlparse
 import urllib.request
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+def _app_root() -> Path:
+    """找到真正含有 ``app/`` 包的那一层目录。
+
+    这个脚本有两份副本：``MoneyPrinterTurbo/tools/``（app 内）与仓库根的
+    ``tools/``。写死 ``parent.parent`` 只对前者成立——从仓库根运行时它会插入
+    仓库根，于是 ``from app...`` 直接抛 ``ModuleNotFoundError``，而这两份副本
+    曾经是逐字节相同的，所以漂移检查也发现不了。改为向上找 ``app/`` 包。
+    """
+    here = Path(__file__).resolve()
+    for ancestor in here.parents:
+        # app 根自己（vendored 副本），以及仓库根下的 ``MoneyPrinterTurbo/``
+        # （根副本），两种布局都要认。
+        for candidate in (ancestor, ancestor / "MoneyPrinterTurbo"):
+            if (candidate / "app" / "services" / "youtube_upload.py").is_file():
+                return candidate
+    return here.parent.parent
+
+
+REPO_ROOT = _app_root()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

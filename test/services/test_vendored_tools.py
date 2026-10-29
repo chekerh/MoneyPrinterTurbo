@@ -50,6 +50,10 @@ ROOT_ONLY_TOOLS = frozenset(
         "check_skills_contract.py",
         "linear_sync.py",
         "subagent_prompt.py",
+        # 定时流水线的失败判定与发布回填：两者都按仓库根的 ``outputs/``、
+        # ``plans/`` 布局工作，app 侧从不调用它们。
+        "classify_run_failure.py",
+        "publish_backfill.py",
     }
 )
 
@@ -61,7 +65,7 @@ ROOT_ONLY_TOOLS = frozenset(
 #: ``first_pending_topic`` 曾经只读"磁盘上最新的月份"，而 WebUI 读跨月已录制
 #: 主题，于是同一天定时任务选 #5（9 月已录过），WebUI 选 #13——渲染两小时，
 #: 成片被归档端按重复丢弃，且没有任何报错。
-IDENTICAL_TOOLS = ("plans.py", "archive_video.py")
+IDENTICAL_TOOLS = ("plans.py", "archive_video.py", "check_youtube_oauth.py")
 
 
 def _load_module(path: Path):
@@ -154,6 +158,30 @@ class TestVendoredTools(unittest.TestCase):
                     vendored_bytes,
                     f"{name} 的两份副本已经分叉：同一份数据会被两个入口读出两种答案",
                 )
+
+    def test_check_youtube_oauth_runs_from_both_locations(self):
+        """两份副本都要能从**各自的**当前目录找到 ``app`` 包。
+
+        根副本写死了 ``parent.parent``，从仓库根运行时插入的是仓库根，而 ``app/``
+        在 ``MoneyPrinterTurbo/`` 里——诊断脚本自己先崩在 ``ModuleNotFoundError``。
+        两份副本逐字节相同，所以漂移检查抓不到，只能靠真跑一次。
+
+        ``--help`` 就够：``app.services.youtube_upload`` 是模块级导入，argparse
+        退出发生在它之后，且不会请求 Google。
+        """
+        if not ROOT_TOOLS.is_dir():
+            self.skipTest("没有上一级 tools/ 目录（干净克隆）")
+        for base in (VENDORED_TOOLS, ROOT_TOOLS):
+            with self.subTest(location="app" if base == VENDORED_TOOLS else "repo-root"):
+                proc = subprocess.run(
+                    [sys.executable, str(base / "check_youtube_oauth.py"), "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                combined = proc.stdout + proc.stderr
+                self.assertNotIn("ModuleNotFoundError", combined, combined[-400:])
+                self.assertEqual(proc.returncode, 0, combined[-400:])
 
     def test_publish_video_tool_is_runnable(self):
         """真正跑一次发布调用：语法错、import 错、参数拼错都会在这里暴露。
