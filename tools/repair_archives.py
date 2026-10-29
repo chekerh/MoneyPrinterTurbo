@@ -131,8 +131,12 @@ def main():
         )
 
     # Record the repair next to the plan so the provenance stays inspectable.
+    # 放在 outputs/_logs/ 而不是 outputs/ 顶层：顶层只留四个频道目录、README
+    # 和三个下划线目录，人一眼能扫完；点文件混进去只会显得脏。
     if repaired:
-        marker = os.path.join(OUTPUTS, ".archive_repair_log.jsonl")
+        log_dir = os.path.join(OUTPUTS, "_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        marker = os.path.join(log_dir, "archive_repair_log.jsonl")
         with open(marker, "a", encoding="utf-8") as handle:
             for f in findings:
                 if f["source"] is None:

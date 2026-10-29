@@ -8069,7 +8069,13 @@ def _pipeline_last_run(channel: str):
     """该频道最近一次定时运行的 ``{mtime, ok, name}``；没有返回 ``None``。只读。"""
     log_dir = Path(root_dir).parent / "logs"
     try:
-        candidates = sorted(log_dir.glob(f"daily_{channel}_*.log"))
+        # 定时日志按月分目录（``logs/YYYY-MM/``），早期文件是平铺的；两种都认。
+        # 必须按 mtime 排序，不能按路径：两种布局混在一起时，``daily_*`` 的路径
+        # 排在 ``2026-10/`` 之后（字母大于数字），一个遗留的平铺旧文件就会被
+        # 当成"最近一次运行"。迁移期间两种文件确实会同时存在。
+        candidates = list(log_dir.glob(f"daily_{channel}_*.log"))
+        candidates += list(log_dir.glob(f"*/daily_{channel}_*.log"))
+        candidates.sort(key=lambda path: path.stat().st_mtime)
     except Exception:  # noqa: BLE001
         return None
     if not candidates:

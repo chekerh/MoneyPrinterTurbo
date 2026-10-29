@@ -187,6 +187,67 @@ class TestArchiveChannelVideo(unittest.TestCase):
             "归档成功后工作副本仍在，outputs/ 会重新开始堆积 UUID 目录",
         )
 
+    def test_copy_media_removes_the_sidecars_and_the_empty_task_output_dir(self):
+        """工作副本目录必须整个消失，而不是只剩 posting 边车。
+
+        ``outputs/<task_id>/`` 属于 ``PERSISTENT_SUBDIRS``，没有任何清扫会碰它。
+        只删 ``final-1.mp4`` 的话，``posting_package`` 写下的 ``.posting.json`` /
+        ``.posting.txt`` 会把目录永久钉在 ``outputs/`` 顶层——那里曾攒出 24 个
+        只有两个边车、对人毫无意义的 UUID 目录。
+        """
+        from app.services import posting_package
+
+        self._write_script()
+        work_dir = self.tmp / "outputs" / "task-abc"
+        work_dir.mkdir(parents=True)
+        source = work_dir / "final-1.mp4"
+        source.write_bytes(b"payload")
+        package = posting_package.fallback(
+            "Topic One", "Specific description", self.channel, "task-abc"
+        )
+        posting_package.save_for_video(source, package)
+
+        base = archive_video.archive_channel_video(
+            channel=self.channel,
+            task_dir=str(self.task_dir),
+            topic="Topic One",
+            out_dir=str(self.out_dir),
+            plans_root=str(self.plans_root),
+            copy_media=True,
+            final_video_dir=str(work_dir),
+        )
+
+        self.assertFalse(
+            work_dir.exists(),
+            "归档后 outputs/<task_id>/ 还在，边车会一直堆在 outputs/ 顶层",
+        )
+        archived = self.out_dir / "videos" / f"{base}.mp4"
+        self.assertTrue(archived.is_file())
+        # 删的是工作副本，不是唯一一份 posting 内容：档案里那份必须完好。
+        self.assertEqual(posting_package.load_for_video(archived), package)
+
+    def test_copy_media_keeps_the_task_output_dir_when_other_files_remain(self):
+        """目录里还有别的东西时必须留下，绝不静默删掉未归档的产物。"""
+        self._write_script()
+        work_dir = self.tmp / "outputs" / "task-abc"
+        work_dir.mkdir(parents=True)
+        (work_dir / "final-1.mp4").write_bytes(b"payload")
+        keep = work_dir / "notes.txt"
+        keep.write_text("unarchived", encoding="utf-8")
+
+        archive_video.archive_channel_video(
+            channel=self.channel,
+            task_dir=str(self.task_dir),
+            topic="Topic One",
+            out_dir=str(self.out_dir),
+            plans_root=str(self.plans_root),
+            copy_media=True,
+            final_video_dir=str(work_dir),
+        )
+
+        self.assertTrue(keep.is_file(), "非归档产物被连带删掉了")
+        self.assertFalse((work_dir / "final-1.mp4").exists())
+
     def test_without_copy_media_the_working_copy_survives(self):
         """copy_media=False（补 .txt / 计划表的修复路径）不能删源。
 

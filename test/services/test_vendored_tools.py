@@ -36,6 +36,22 @@ REQUIRED_TOOLS = (
     "setup_upload.py",
 )
 
+#: 只在仓库根 ``tools/`` 里出现的仓库运维脚本，**故意**不 vendored。
+#:
+#: 它们服务的是这个工作区的运营，不是 app：``linear_sync.py`` 把
+#: ``plans/_system/backlog.json`` 同步到 Linear，``check_skills_contract.py``
+#: 校验 AGENTS.md 的技能契约，``subagent_prompt.py`` 生成合规的子代理提示词。
+#: app 和定时流水线从不按 ``tools_dir`` 取用它们，复制一份到 app 里只会让两份
+#: 副本各自漂移。反向检查只为“某个该 vendored 的脚本漏了”而存在，
+#: 所以这里把它显式列出来，其它任何单边文件仍然算失败。
+ROOT_ONLY_TOOLS = frozenset(
+    {
+        "check_skills_contract.py",
+        "linear_sync.py",
+        "subagent_prompt.py",
+    }
+)
+
 
 def _load_module(path: Path):
     """按文件路径加载一个工具脚本，取出它的常量。"""
@@ -96,10 +112,14 @@ class TestVendoredTools(unittest.TestCase):
         )
 
     def test_no_stray_tool_only_in_one_place(self):
-        """反向检查：任何只在单边出现的 .py 都要被看见。"""
+        """反向检查：任何只在单边出现的 .py 都要被看见。
+
+        ``ROOT_ONLY_TOOLS`` 是已知的、故意只在仓库根出现的运维脚本；
+        除此之外出现单边文件都说明有一份副本漏了。
+        """
         root_names = {p.name for p in ROOT_TOOLS.glob("*.py")} if ROOT_TOOLS.is_dir() else set()
         vendored_names = {p.name for p in VENDORED_TOOLS.glob("*.py")}
-        only_root = sorted(root_names - vendored_names)
+        only_root = sorted(root_names - vendored_names - ROOT_ONLY_TOOLS)
         only_vendored = sorted(vendored_names - root_names)
         self.assertEqual(only_root, [], f"只在仓库根 tools/ 里有: {only_root}")
         self.assertEqual(only_vendored, [], f"只在 app tools/ 里有: {only_vendored}")

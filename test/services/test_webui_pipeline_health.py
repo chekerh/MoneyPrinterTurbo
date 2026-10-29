@@ -10,9 +10,9 @@
 """
 
 import ast
+import os
 from pathlib import Path
 
-import pytest
 from streamlit.testing.v1 import AppTest
 
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -124,6 +124,40 @@ def test_last_run_success_shows_on_the_strip(monkeypatch, tmp_path, switch_view)
         assert "succeeded" in blob, f"成功的定时运行没有显示出来：{blob[:300]}"
     finally:
         fake_log.unlink(missing_ok=True)
+
+
+def test_latest_run_wins_across_flat_and_month_layouts(monkeypatch, tmp_path, switch_view):
+    """平铺旧日志与月目录新日志共存时，必须取 mtime 最新的那一条。
+
+    迁移期间两种布局会同时存在。若按路径排序，``logs/daily_*`` 会排在
+    ``logs/2026-10/daily_*`` 之后（字母 > 数字），界面就会一直显示那条旧的
+    失败记录，而当天那次成功的新日志永远轮不到。
+    """
+    channel = _seed_channel(monkeypatch, tmp_path)
+    flat = LOGS_DIR / f"daily_{channel}_20990101_000000.log"
+    month_dir = LOGS_DIR / "2099-01"
+    month = month_dir / f"daily_{channel}_20990102_000000.log"
+    assert not flat.exists() and not month.exists(), "假日志撞上了真实文件"
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        month_dir.mkdir(parents=True, exist_ok=True)
+        flat.write_text("=== attempt 1/3 ===\nattempts failed\n", encoding="utf-8")
+        month.write_text("=== attempt 1/3 ===\nSUCCESS on attempt 1\n", encoding="utf-8")
+        # 明显把平铺那份做旧：路径排序会选中它，按 mtime 排序会跳过它。
+        os.utime(flat, (1_000_000, 1_000_000))
+        app = AppTest.from_file(str(WEBUI_MAIN), default_timeout=120)
+        app.session_state["ui_language"] = "en"
+        switch_view(app, "plan")
+        assert [str(e.value) for e in app.exception] == [], app.exception
+        blob = _plan_blob(app)
+        assert "succeeded" in blob, f"取到了旧的平铺日志：{blob[:300]}"
+    finally:
+        flat.unlink(missing_ok=True)
+        month.unlink(missing_ok=True)
+        try:
+            month_dir.rmdir()
+        except OSError:
+            pass
 
 
 def test_unconfigured_channel_shows_not_connected(monkeypatch, tmp_path, switch_view):

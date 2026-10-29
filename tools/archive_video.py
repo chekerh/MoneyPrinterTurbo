@@ -474,15 +474,36 @@ def _drop_working_copy(src_video: Path) -> None:
     ``final-1.mp4`` 就是这么攒出来的（1.1 GB，全是已归档内容的逐字节副本）。
 
     只在 ``copy_media=True``、且成片已确认落盘之后调用。任何一步落盘失败都会
-    在调用之前抛出，因此走不到这里。目录本身留空壳——任务状态还要按 task_id
-    索引它。
+    在调用之前抛出，因此走不到这里。
+
+    成片不是这个目录里的唯一文件：``posting_package.save_for_video`` 会在成片
+    旁边写 ``.posting.json`` / ``.posting.txt``，发布流程写 ``.publish.json``。
+    只删 ``.mp4`` 会让目录永远非空，于是每出一条视频就多一个只剩边车的 UUID
+    目录——``outputs/`` 顶层因此攒出 20 多个打不开的人眼垃圾。这里把已确认归档
+    的那几份副本一并删掉，目录空了就顺手收掉。
+
+    只删**确实已经进档案**的边车（``archive_channel_video`` 复制失败会先抛
+    ``ArchiveError``，走不到这里）。其余任何文件都不动：目录不空就留着，
+    看得见总比静默丢掉好。
     """
+    sidecars = (
+        src_video.with_suffix(".posting.json"),
+        src_video.with_suffix(".posting.txt"),
+        src_video.with_suffix(".publish.json"),
+    )
+    for path in (src_video, *sidecars):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            # 删不掉只是留一份重复文件，绝不该让已经成功的归档变成失败。
+            print(f"warning: failed to remove working copy {path}: {exc}")
     try:
-        if src_video.is_file():
-            src_video.unlink()
-    except OSError as exc:
-        # 删不掉只是留一份重复文件，绝不该让已经成功的归档变成失败。
-        print(f"warning: failed to remove working copy {src_video}: {exc}")
+        src_video.parent.rmdir()
+    except OSError:
+        # 目录里还有别的产物，或者根本不是空目录：留着。
+        pass
 
 
 def main() -> None:
