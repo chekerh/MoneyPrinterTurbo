@@ -6,8 +6,9 @@
 
 两份副本**不是**逐字节相同的：vendored 那一份是 app 内相对路径变体（例如
 ``youtube_uploader.py`` 的 ``PROFILE_ROOT`` 不带 ``MoneyPrinterTurbo/`` 那一层，
-``plans.py`` 也改成了显式解析作品集根）。所以这里只守住真正的风险——某个脚本
-只在一边存在，或者某一边的路径基准是错的——而不是去要求两者内容一致。
+``setup_youtube.py`` 的 ``CONFIG_PATH`` 也不同）。所以这里只守住真正的风险——
+某个脚本只在一边存在，或者某一边的路径基准是错的——而不是去要求两者内容一致；
+逐字节相同的只有 :data:`IDENTICAL_TOOLS` 里那两个（见那里的说明）。
 
 后果很具体：``publish_video.py`` 一开始只加在根目录，vendored 副本缺失，于是
 ``_plan_uploader_tool()`` 拿到一个不存在的路径，WebUI 的发布按钮只会报一句
@@ -51,6 +52,16 @@ ROOT_ONLY_TOOLS = frozenset(
         "subagent_prompt.py",
     }
 )
+
+#: 这两份副本必须**逐字节相同**，不适用上面"允许路径变体"的豁免。
+#:
+#: 它们不是 app 内相对路径变体：``plans.py`` 已经改成显式解析作品集根，两个位置
+#: 运行的是同一套判断；``archive_video.py`` 的命令行与 WebUI 调的是同一个函数。
+#: 同一份数据被两个入口读，两份代码一旦分叉就会给出两种答案：仓库根那份
+#: ``first_pending_topic`` 曾经只读"磁盘上最新的月份"，而 WebUI 读跨月已录制
+#: 主题，于是同一天定时任务选 #5（9 月已录过），WebUI 选 #13——渲染两小时，
+#: 成片被归档端按重复丢弃，且没有任何报错。
+IDENTICAL_TOOLS = ("plans.py", "archive_video.py")
 
 
 def _load_module(path: Path):
@@ -123,6 +134,26 @@ class TestVendoredTools(unittest.TestCase):
         only_vendored = sorted(vendored_names - root_names)
         self.assertEqual(only_root, [], f"只在仓库根 tools/ 里有: {only_root}")
         self.assertEqual(only_vendored, [], f"只在 app tools/ 里有: {only_vendored}")
+
+    def test_shared_copy_tools_are_byte_identical(self):
+        """``plans.py`` / ``archive_video.py`` 两份副本必须逐字节相同。
+
+        这两个脚本同时被 shell 流水线与 WebUI 调用，读的是同一份 plans/ 与
+        outputs/。只要其中一边落后，同一个问题就会有两个答案：定时任务与界面
+        各自"认领"不同的待办主题，渲染与归档互相拆台。其它工具允许因路径基准
+        不同而内容不同，这两个不允许。
+        """
+        if not ROOT_TOOLS.is_dir():
+            self.skipTest("没有上一级 tools/ 目录（干净克隆）")
+        for name in IDENTICAL_TOOLS:
+            with self.subTest(tool=name):
+                root_bytes = (ROOT_TOOLS / name).read_bytes()
+                vendored_bytes = (VENDORED_TOOLS / name).read_bytes()
+                self.assertEqual(
+                    root_bytes,
+                    vendored_bytes,
+                    f"{name} 的两份副本已经分叉：同一份数据会被两个入口读出两种答案",
+                )
 
     def test_publish_video_tool_is_runnable(self):
         """真正跑一次发布调用：语法错、import 错、参数拼错都会在这里暴露。

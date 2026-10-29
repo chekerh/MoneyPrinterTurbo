@@ -338,10 +338,10 @@ def archive_channel_video(
 
     ``task_dir`` 内必须存在 ``script.json``。最终成片的位置由 ``final_video_dir``
     指定（``<outputs_root>/<task_id>/``）；为 ``None`` 时回退到
-    ``<task_dir>/final-1.mp4``，供历史任务与命令行调用方使用。归档时写入
-    ``videos/<base>.txt`` 并重新生成 ``<out_dir>/monthly-plan.md``。当
-    ``copy_media`` 为真时，把成片与可选字幕一并复制进 ``videos`` 目录；
-    命令行调用方(archive_video.sh)自行复制文件，因此保持默认不复制。
+    ``<task_dir>/final-1.mp4``，供 b2b52cc 之前的历史任务使用。归档时写入
+    ``videos/<base>.txt`` 并重新生成 ``<out_dir>/monthly-plan.md``。``copy_media``
+    为真时把成片与可选字幕复制进 ``videos`` 目录，确认落盘后删除工作副本——
+    ``archive_video.sh`` 与 WebUI 都走这条路，调用方不再自己 ``cp``。
 
     顺序很重要：**先确认成片完整落盘，再写月度计划**。旧实现先写计划和边车、
     再复制成片，于是成片缺失时计划里仍会出现一条「已录制」记录，而复制中途
@@ -465,16 +465,18 @@ def archive_channel_video(
 
 
 def _drop_working_copy(src_video: Path) -> None:
-    """归档成功后删掉成片的工作副本。
+    """归档成功后删掉 ``outputs/<task_id>/`` 里的成片工作副本。
+
+    只在 ``copy_media=True``、且成片已确认落盘之后调用。
 
     成片先落在 ``outputs/<task_id>/final-1.mp4``，再被归档进
     ``outputs/<channel>/<YYYY-MM>/videos/``。以前只复制不删除，而
     ``outputs/<task_id>/`` 在 ``PERSISTENT_SUBDIRS`` 里也不会被自动清理，
-    于是每出一条视频就永久多出一个 UUID 目录——``outputs/`` 顶层那 9 个无名的
-    ``final-1.mp4`` 就是这么攒出来的（1.1 GB，全是已归档内容的逐字节副本）。
+    于是每出一条视频就永久多出一个 UUID 目录——``outputs/`` 里那一堆无名的
+    ``final-1.mp4`` 就是这么攒出来的。
 
-    只在 ``copy_media=True``、且成片已确认落盘之后调用。任何一步落盘失败都会
-    在调用之前抛出，因此走不到这里。
+    只在**全部**落盘成功之后删：``.mp4``/``.srt``/``.txt``/``monthly-plan.md``
+    任何一个写失败都会在上面抛出，不会走到这里。
 
     成片不是这个目录里的唯一文件：``posting_package.save_for_video`` 会在成片
     旁边写 ``.posting.json`` / ``.posting.txt``，发布流程写 ``.publish.json``。
@@ -514,6 +516,22 @@ def main() -> None:
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--plans-root", required=True)
     parser.add_argument("--duration", default="")
+    parser.add_argument(
+        "--copy-media",
+        action="store_true",
+        help=(
+            "把成片与字幕复制进 videos/ 并在成功后删除工作副本。"
+            "archive_video.sh 用这个开关，不再自己 cp。"
+        ),
+    )
+    parser.add_argument(
+        "--final-video-dir",
+        default="",
+        help=(
+            "成片所在目录（outputs/<task_id>/）。省略则退回 <task-dir>/final-1.mp4，"
+            "只适用于历史任务——流水线写的是前者。"
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -524,6 +542,8 @@ def main() -> None:
             out_dir=args.out_dir,
             plans_root=args.plans_root,
             duration=args.duration,
+            copy_media=args.copy_media,
+            final_video_dir=args.final_video_dir or None,
         )
     except ArchiveError as exc:
         # 命令行调用方（archive_video.sh）依赖退出码判断成败，因此归档失败
