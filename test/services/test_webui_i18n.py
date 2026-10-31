@@ -14,6 +14,9 @@ I18N_DIR = ROOT_DIR / "webui" / "i18n"
 LLM_PROVIDER_TIPS_PREFIX = "llm_provider_tips."
 TTS_PROVIDER_TIPS_PREFIX = "tts_provider_tips."
 SECONDARY_LOCALES = ("de", "es", "fr", "id", "it", "ko", "pt", "ru", "tr", "vi")
+# 中英文是完整维护的两套文案：新增 key 必须先补齐这两套，其余语言按需翻译、
+# 缺失时由 tr() 回退英文。
+PRIMARY_LOCALES = ("en", "zh")
 PROVIDER_TIPS_PREFIXES = (
     LLM_PROVIDER_TIPS_PREFIX,
     TTS_PROVIDER_TIPS_PREFIX,
@@ -328,13 +331,45 @@ def _load_translation(locale):
 
 
 def _required_translation_keys(translations):
-    """返回二级语言必须维护的 key，Provider 长说明统一回退英文。"""
+    """返回二级语言**已自行维护**的 key。
+
+    二级 locale 采用回退策略：新功能只维护中英文，缺失的 key 由 ``tr()``
+    回退到英文（见 Main.py 里 ``tr`` 的注释）。因此这里只校验 locale 真正
+    写过的条目——缺条目不是错误，写错的翻译才是。
+    """
     return {
         key
         for key in translations
         if key not in ENGLISH_FALLBACK_KEYS
         and not key.startswith(PROVIDER_TIPS_PREFIXES)
     }
+
+
+def _nav_group_keys():
+    """``_NAV_GROUPS`` 里的分组标题、页面标题和说明。
+
+    这些字符串先作为数据登记在 ``_NAV_GROUPS`` 里，再由循环传给 ``tr()``，
+    所以 AST 只统计 ``tr("...")`` 字面量的测试看不见它们。曾经有 14 个
+    key 因此两边都没登记，左侧导航和页头直接把 ``Nav Plan`` 这类内部键
+    渲染给用户看。
+    """
+    tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
+    keys = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(
+            isinstance(target, ast.Name) and target.id == "_NAV_GROUPS"
+            for target in node.targets
+        ):
+            continue
+        # 结构：[(分组 key, [(视图, 标题 key, 图标, 说明 key), ...]), ...]
+        for group in node.value.elts:
+            keys.add(group.elts[0].value)
+            for item in group.elts[1].elts:
+                keys.add(item.elts[1].value)
+                keys.add(item.elts[3].value)
+    return keys
 
 
 def _format_placeholders(value):
@@ -376,14 +411,30 @@ class TestWebuiI18n(unittest.TestCase):
 
         self.assertEqual(language, "en")
 
-    def test_english_locale_covers_static_webui_labels(self):
+    def test_primary_locales_cover_static_webui_labels(self):
+        """中英文是唯一保证完整的两套文案，其余 locale 缺失即回退英文。"""
         tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
         visitor = _TrKeyVisitor()
         visitor.visit(tree)
+        tr_keys = visitor.keys
 
-        en_keys = set(_load_translation("en"))
+        for locale in PRIMARY_LOCALES:
+            with self.subTest(locale=locale):
+                missing = sorted(tr_keys - set(_load_translation(locale)))
+                self.assertEqual(missing, [])
 
-        self.assertEqual(sorted(visitor.keys - en_keys), [])
+    def test_primary_locales_cover_navigation_labels(self):
+        """导航标题/说明是数据驱动的 key，不会被 ``tr("...")`` 扫到。"""
+        nav_keys = _nav_group_keys()
+
+        for locale in PRIMARY_LOCALES:
+            with self.subTest(locale=locale):
+                missing = sorted(nav_keys - set(_load_translation(locale)))
+                self.assertEqual(
+                    missing,
+                    [],
+                    f"{locale}.json 缺少导航 key，界面会直接显示内部键名",
+                )
 
     def test_shengsuanyun_provider_tips_keep_registration_and_model_links(self):
         """合作入口和模型目录属于产品配置，避免后续改文案时误删追踪链接。"""
@@ -403,14 +454,16 @@ class TestWebuiI18n(unittest.TestCase):
                 )
                 self.assertEqual(_markdown_urls(rendered), expected_urls)
 
-    def test_secondary_locales_cover_english_locale(self):
-        en_translations = _load_translation("en")
-        required_en_keys = _required_translation_keys(en_translations)
+    def test_secondary_locales_define_no_unknown_keys(self):
+        """二级 locale 不认识的 key 说明英文侧已改名，属于残留而不是缺翻译。"""
+        en_keys = set(_load_translation("en"))
 
         for locale in SECONDARY_LOCALES:
             with self.subTest(locale=locale):
-                locale_keys = set(_load_translation(locale))
-                self.assertEqual(sorted(required_en_keys - locale_keys), [])
+                self.assertEqual(
+                    sorted(set(_load_translation(locale)) - en_keys),
+                    [],
+                )
 
     def test_secondary_locales_do_not_duplicate_provider_tips(self):
         # Provider 配置长说明只维护中英文，其它语言运行时回退英文。
@@ -429,17 +482,34 @@ class TestWebuiI18n(unittest.TestCase):
                 locale_keys = set(_load_translation(locale))
                 self.assertEqual(sorted(ENGLISH_FALLBACK_KEYS & locale_keys), [])
 
-    def test_secondary_locales_cover_static_webui_labels(self):
-        tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
-        visitor = _TrKeyVisitor()
-        visitor.visit(tree)
+    def test_secondary_locales_translate_what_they_claim_to(self):
+        """写进二级 locale 的条目必须真的翻过，不能直接抄英文。"""
+        en_translations = _load_translation("en")
+        # 这些值在任何语言里都保持原样：品牌名、产品名、URL、纯符号。
+        untranslatable = {
+            key
+            for key, value in en_translations.items()
+            if not re.search(r"[a-z]{3,}", value)
+            or "http" in value
+            or len(value) <= 24
+        }
 
         for locale in SECONDARY_LOCALES:
             with self.subTest(locale=locale):
-                locale_keys = set(_load_translation(locale))
-                self.assertEqual(
-                    sorted(visitor.keys - locale_keys - ENGLISH_FALLBACK_KEYS),
-                    [],
+                translations = _load_translation(locale)
+                untranslated = sorted(
+                    key
+                    for key, value in translations.items()
+                    if key in en_translations
+                    and key not in untranslatable
+                    and key not in ENGLISH_FALLBACK_KEYS
+                    and value == en_translations[key]
+                )
+                # 允许少量专有名词句子原样保留，超过阈值才说明整段没翻。
+                self.assertLessEqual(
+                    len(untranslated),
+                    len(translations) // 4,
+                    f"{locale}.json 有 {len(untranslated)} 条与英文完全相同",
                 )
 
     def test_secondary_locales_preserve_format_placeholders(self):
@@ -447,7 +517,9 @@ class TestWebuiI18n(unittest.TestCase):
 
         for locale in SECONDARY_LOCALES:
             locale_translations = _load_translation(locale)
-            for key in _required_translation_keys(en_translations):
+            for key in _required_translation_keys(locale_translations):
+                if key not in en_translations:
+                    continue
                 with self.subTest(locale=locale, key=key):
                     self.assertEqual(
                         _format_placeholders(locale_translations[key]),
@@ -459,7 +531,9 @@ class TestWebuiI18n(unittest.TestCase):
 
         for locale in SECONDARY_LOCALES:
             locale_translations = _load_translation(locale)
-            for key in _required_translation_keys(en_translations):
+            for key in _required_translation_keys(locale_translations):
+                if key not in en_translations:
+                    continue
                 with self.subTest(locale=locale, key=key):
                     self.assertEqual(
                         _markdown_urls(locale_translations[key]),

@@ -7,6 +7,80 @@ div[data-testid="stSkillsNudge"] {
     display: none !important;
 }
 
+/* Streamlit 唯一的侧栏展开按钮长在 stToolbar → stHeader 里面。上面整块隐藏
+   的结果是：窄屏（<800px 侧栏自动收起）和手动收起侧栏的宽屏都没有任何入口
+   能重新打开导航。只在展开按钮确实存在时把这层 header 放回来，并继续隐藏
+   header 里与产品无关的主菜单/部署/状态装饰，只留这一个 44px 触控按钮。 */
+div[data-testid="stAppViewContainer"]:has(
+        button[data-testid="stExpandSidebarButton"]
+    ) header[data-testid="stHeader"],
+div[data-testid="stAppViewContainer"]:has(
+        button[data-testid="stExpandSidebarButton"]
+    ) div[data-testid="stToolbar"] {
+    display: flex !important;
+}
+
+div[data-testid="stAppViewContainer"]:has(
+        button[data-testid="stExpandSidebarButton"]
+    ) header[data-testid="stHeader"] {
+    position: fixed !important;
+    inset: 0 0 auto 0 !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    padding: 0 !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    pointer-events: none !important;
+    z-index: 1000;
+}
+
+div[data-testid="stAppViewContainer"]:has(
+        button[data-testid="stExpandSidebarButton"]
+    ) div[data-testid="stToolbar"] {
+    background: transparent !important;
+    pointer-events: none !important;
+}
+
+div[data-testid="stAppViewContainer"]:has(
+        button[data-testid="stExpandSidebarButton"]
+    ) span[data-testid="stMainMenu"],
+div[data-testid="stAppViewContainer"]:has(
+        button[data-testid="stExpandSidebarButton"]
+    ) div[data-testid="stToolbarActions"],
+div[data-testid="stAppViewContainer"]:has(
+        button[data-testid="stExpandSidebarButton"]
+    ) div[data-testid="stStatusWidget"],
+div[data-testid="stAppViewContainer"]:has(
+        button[data-testid="stExpandSidebarButton"]
+    ) div[data-testid="stDecoration"] {
+    display: none !important;
+}
+
+button[data-testid="stExpandSidebarButton"] {
+    pointer-events: auto !important;
+    position: fixed !important;
+    top: 0.5rem !important;
+    left: 0.75rem !important;
+    width: 2.75rem !important;
+    height: 2.75rem !important;
+    min-width: 2.75rem !important;
+    min-height: 2.75rem !important;
+    padding: 0 !important;
+    border-radius: 10px !important;
+    background: var(--vix-surface) !important;
+    border: 1px solid var(--vix-line) !important;
+    box-shadow: var(--vix-shadow-sm) !important;
+    color: inherit !important;
+    z-index: 1001;
+}
+
+/* 为触控条让出顶部空间，菜单按钮才不会压住顶部栏的字标。 */
+div[data-testid="stAppViewContainer"]:has(
+        button[data-testid="stExpandSidebarButton"]
+    ) div[data-testid="stMainBlockContainer"] {
+    padding-top: 3.25rem !important;
+}
+
 div[data-testid="stMainBlockContainer"] {
     padding-top: 0.5rem !important;
 }
@@ -46,9 +120,13 @@ div[class*="st-key-voice_mode_control"] [role="radiogroup"] > button p {
     white-space: nowrap !important;
 }
 
-/* 顶部品牌区将项目名和弱化版本号放在同一基线。项目名称仍是页面唯一的 h1；
-   版本号本身作为项目链接，避免增加独立图标而干扰标题的视觉层级。 */
+/* 顶部品牌区将项目名和弱化版本号放在同一基线。项目名是页面唯一的 h1，
+   版本号和更新提醒是它的兄弟节点而不是子节点：标题里嵌链接会让屏幕阅读器
+   在朗读标题时插进两个链接名，也让标题文本随版本变化。 */
 .mpt-brand {
+    display: flex;
+    align-items: baseline;
+    gap: 0.65rem;
     min-width: 0;
     margin: 0;
     padding: 0;
@@ -56,8 +134,8 @@ div[class*="st-key-voice_mode_control"] [role="radiogroup"] > button p {
     line-height: 1.15;
 }
 
-/* Streamlit 会在自定义 h1 内增加一层文本容器，实际的行内布局需要作用在
-   这层容器上，才能稳定控制项目名和版本号的间距。 */
+/* Streamlit 会在自定义 markdown 外再包一层文本容器，间距由 .mpt-brand 自己
+   控制；这里只负责让标题在 flex 行里正常收缩。 */
 .mpt-brand > span:first-child {
     display: flex;
     align-items: baseline;
@@ -65,17 +143,24 @@ div[class*="st-key-voice_mode_control"] [role="radiogroup"] > button p {
     min-width: 0;
 }
 
+/* 字标是 logo lockup，不是页面标题：44px 时它是每一屏上最大的文字，用户
+   每天九次先看到的是产品名，而不是"我在哪一屏"。压到 1.125rem 并把
+   .mpt-top-context__title 提到 2rem，页面名才成为第一层级。
+   !important 是因为 Streamlit 自带的 `.st-emotion-cache-* h1`（0,1,1）
+   选择器权重高于单个类名，否则字号和 white-space 都会被它改回去。 */
 .mpt-brand__name {
     min-width: 0;
-    font-size: 2.75rem;
-    font-weight: 700;
-    letter-spacing: 0;
-    white-space: nowrap;
+    margin: 0 !important;
+    padding: 0 !important;
+    font-size: 1.125rem !important;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    white-space: nowrap !important;
 }
 
 .mpt-brand__version {
     flex: 0 0 auto;
-    font-size: 1rem;
+    font-size: 0.8125rem !important;
     font-weight: 600;
     color: inherit !important;
     opacity: 0.72;
@@ -99,9 +184,11 @@ div[class*="st-key-voice_mode_control"] [role="radiogroup"] > button p {
    让它保持可发现性，同时不抢占项目标题和主要操作入口的视觉层级。 */
 .mpt-brand__update {
     flex: 0 0 auto;
-    font-size: 0.875rem;
+    font-size: 0.75rem !important;
     font-weight: 600;
-    color: #d94848 !important;
+    /* #d94848 measured 4.22:1 on the white top bar; #c62f2f is 5.44:1 and
+       keeps the "something new" red without the AA failure. */
+    color: #c62f2f !important;
     text-decoration: none !important;
     white-space: nowrap;
 }
@@ -122,9 +209,10 @@ div[class*="st-key-voice_mode_control"] [role="radiogroup"] > button p {
     }
 }
 
-/* Streamlit 会自动给 h1 追加一个标题锚点。品牌区已有版本号项目链接，额外的
+/* Streamlit 会自动给标题追加一个锚点。品牌区已有版本号项目链接，额外的
    标题锚点没有实际价值，因此只在这个标题内隐藏，避免窄屏出现多余图标。 */
-.mpt-brand > [data-testid="stHeaderActionElements"] {
+.mpt-brand > [data-testid="stHeaderActionElements"],
+.mpt-brand h1 [data-testid="stHeaderActionElements"] {
     display: none !important;
 }
 
@@ -136,21 +224,48 @@ div[class*="st-key-voice_mode_control"] [role="radiogroup"] > button p {
     width: fit-content !important;
 }
 
+/* 顶部栏的两列是 "品牌 | 操作"。用媒体查询猜布局会漏：900px 宽时侧栏还
+   展开着，内容列只有 440px，当时 44px 的字标（293px）越过了 252px 的品牌
+   列，压在 679px 起点的 Task Manager 按钮下面；1440px 时操作列 356px 又装
+   不下四个按钮（452px），被挤成两行，顶栏 209px。
+   所以按顶部栏**自身宽度**判断，而不是视口宽度：
+   - <800px（多数是侧栏收起）：两个区域整体换行，操作区拿到整行；
+   - >=800px：操作列改为按内容收窄，品牌列拿走剩余宽度，四个按钮不换行。 */
+div[class*="st-key-top_bar"] {
+    container-type: inline-size;
+}
+
+@container (max-width: 1099.98px) {
+    div[class*="st-key-top_bar"]
+        > div[data-testid="stLayoutWrapper"]
+        > div[data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap !important;
+    }
+
+    div[class*="st-key-top_bar"]
+        > div[data-testid="stLayoutWrapper"]
+        > div[data-testid="stHorizontalBlock"]
+        > div[data-testid="stColumn"] {
+        flex: 1 1 100% !important;
+        width: 100% !important;
+        min-width: 100% !important;
+    }
+}
+
 @media (max-width: 700px) {
+    /* 手机上三项放不进一行：允许版本号/更新提醒掉到第二行，字标本身保持单行。 */
     .mpt-brand > span:first-child {
+        flex-wrap: wrap;
+        row-gap: 0.15rem;
         gap: 0.45rem;
     }
 
-    .mpt-brand__name {
-        font-size: 1.875rem;
-    }
-
     .mpt-brand__version {
-        font-size: 0.875rem;
+        font-size: 0.75rem !important;
     }
 
     .mpt-brand__update {
-        font-size: 0.75rem;
+        font-size: 0.6875rem !important;
     }
 
 }
@@ -158,18 +273,6 @@ div[class*="st-key-voice_mode_control"] [role="radiogroup"] > button p {
 @media (max-width: 480px) {
     .mpt-brand > span:first-child {
         gap: 0.35rem;
-    }
-
-    .mpt-brand__name {
-        font-size: 1.5rem;
-    }
-
-    .mpt-brand__version {
-        font-size: 0.75rem;
-    }
-
-    .mpt-brand__update {
-        font-size: 0.6875rem;
     }
 
 }
@@ -390,14 +493,6 @@ div[class*="st-key-task_row_"]
 
 /* 中等宽度下将四个设置面板调整为 2×2，避免每列过窄导致标签和按钮频繁换行。 */
 @media (min-width: 701px) and (max-width: 1100px) {
-    .mpt-brand__name {
-        font-size: 2.25rem;
-    }
-
-    .mpt-brand__version {
-        font-size: 0.875rem;
-    }
-
     div[class*="st-key-main_settings_grid"]
         > div[data-testid="stLayoutWrapper"]
         > div[data-testid="stHorizontalBlock"] {
@@ -622,7 +717,7 @@ div[data-testid="stVideo"] {
     border: 1px dashed color-mix(in srgb, currentColor 18%, transparent);
     border-radius: 8px;
     color: color-mix(in srgb, currentColor 72%, transparent);
-    font-size: 0.95rem;
+    font-size: 0.95rem !important;
     font-weight: 500;
     text-align: center;
 }
@@ -694,7 +789,7 @@ div[data-testid="stVideo"] {
     align-items: center;
     gap: 0.6rem;
     margin: 0.5rem 0 0.75rem;
-    font-size: 0.9rem;
+    font-size: 0.9rem !important;
     font-weight: 500;
 }
 
@@ -914,7 +1009,7 @@ div[class*="st-key-nav_item_"] button {
 }
 
 .mpt-bench-desc {
-    font-size: 0.78rem;
+    font-size: 0.78rem !important;
     line-height: 1.45;
     color: color-mix(in srgb, currentColor 68%, transparent);
     margin: 0 0 0.5rem;
@@ -1087,7 +1182,10 @@ div[class*="st-key-bench_card_"] p[data-testid="stCaptionContainer"] {
     --vix-surface: #ffffff;
     --vix-field: #ffffff;
     --vix-ink: #101013;
-    --vix-muted: #6d727b;
+    /* 3.98:1 → 4.89:1 on --vix-bg-0. The old #6d727b read fine on the white
+       cards but failed WCAG AA for the hero copy and nav hints that sit
+       directly on the dotted canvas. */
+    --vix-muted: #5f646d;
     --vix-line: rgba(16, 16, 19, 0.09);
     --vix-shadow-sm: 0 1px 2px rgba(16, 16, 19, 0.06), 0 4px 14px rgba(16, 16, 19, 0.06);
     --vix-shadow-md: 0 2px 6px rgba(16, 16, 19, 0.07), 0 18px 44px rgba(16, 16, 19, 0.1);
@@ -1157,10 +1255,12 @@ section[data-testid="stSidebar"] strong {
     color: var(--vix-ink) !important;
 }
 
-/* Nav groups: tiny uppercase labels like PLAN / CREATE / POLISH. */
+/* Nav groups: small caps labels. 0.62rem (9.9px) is below the size where
+   uppercase tracking stays legible; 12px keeps the label role without
+   forcing the reader to decode it. */
 section[data-testid="stSidebar"] .mpt-nav-group {
-    font-size: 0.62rem !important;
-    letter-spacing: 0.14em !important;
+    font-size: 0.75rem !important;
+    letter-spacing: 0.1em !important;
     color: var(--vix-muted) !important;
 }
 
@@ -1224,18 +1324,27 @@ div[class*="st-key-top_bar"] {
 }
 
 .mpt-top-context__title {
-    font-weight: 750;
-    font-size: 0.95rem;
-    letter-spacing: -0.01em;
+    font-weight: 800;
+    /* Streamlit 自带的 h2 规则（.stMarkdown h2）选择器权重高于单个类名，
+       这里必须 !important，否则页面标题会被渲染成 36px 的正文级大标题。
+       clamp 的下限保证 390px 手机上仍是全页最大的一行，上限让 1440px
+       桌面不必靠 36px 撑场面。 */
+    font-size: clamp(1.5rem, 1.15rem + 1.35vw, 2rem) !important;
+    line-height: 1.15 !important;
+    letter-spacing: -0.022em;
     color: var(--vix-ink);
-    margin: 0;
+    margin: 0 !important;
+    padding: 0 !important;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
 .mpt-top-context__sub {
-    font-size: 0.75rem;
+    /* 0.75rem 没加 !important 时，Streamlit 的 `.st-emotion-cache-* p`
+       （0,1,1）会把 font-size 改回 inherit=16px：说明行和标题挤成同样大小，
+       顶部栏读起来像两行标题。 */
+    font-size: 0.75rem !important;
     color: var(--vix-muted);
     margin: 0;
     white-space: nowrap;
@@ -1243,7 +1352,11 @@ div[class*="st-key-top_bar"] {
     text-overflow: ellipsis;
 }
 
-/* ── Hero (Vixal page headers) ──────────────────────────────────────── */
+/* ── Hero (Vixal page headers) ────────────────────────────────────────
+   这一块此前从未生效过：`.st-emotion-cache-* p`（0,1,1）覆盖了单个类名的
+   font-size，于是 badge / title / sub 全都被渲染成 16px 正文。加上
+   !important 后按“页面标题 > 页头口号 > 正文”重新排序，口号不再跟
+   .mpt-top-context__title 抢第一层级。 */
 .mpt-hero {
     text-align: center;
     max-width: 760px;
@@ -1255,9 +1368,10 @@ div[class*="st-key-top_bar"] {
     display: inline-flex;
     align-items: center;
     gap: 0.35rem;
-    font-size: 0.64rem;
+    font-size: 0.68rem !important;
     font-weight: 750;
     letter-spacing: 0.16em;
+    line-height: 1.4 !important;
     text-transform: uppercase;
     color: var(--vix-muted);
     /* color-mix instead of a fixed white: the pill stays translucent
@@ -1271,18 +1385,18 @@ div[class*="st-key-top_bar"] {
 }
 
 .mpt-hero-title {
-    font-size: clamp(1.7rem, 4.2vw, 2.9rem);
+    font-size: clamp(1.2rem, 1.05rem + 0.85vw, 1.5rem) !important;
     font-weight: 800;
-    letter-spacing: -0.025em;
-    line-height: 1.06;
+    letter-spacing: -0.02em;
+    line-height: 1.2 !important;
     color: var(--vix-ink);
-    margin: 0 0 0.55rem;
+    margin: 0 0 0.45rem;
     text-wrap: balance;
 }
 
 .mpt-hero-sub {
-    font-size: 0.92rem;
-    line-height: 1.55;
+    font-size: 0.875rem !important;
+    line-height: 1.55 !important;
     color: var(--vix-muted);
     margin: 0;
     text-wrap: balance;
@@ -1586,7 +1700,7 @@ div[class*="st-key-thumbnail_panel_"] div[data-testid="stCaptionContainer"] p {
 .mpt-steps {
     margin: 0.2rem 0 0.7rem 1.1rem;
     padding: 0;
-    font-size: 0.85rem;
+    font-size: 0.85rem !important;
     line-height: 1.65;
     color: color-mix(in srgb, currentColor 82%, transparent);
 }
@@ -1614,6 +1728,132 @@ div[class*="st-key-thumbnail_panel_"] div[data-testid="stCaptionContainer"] p {
         > div[data-testid="stColumn"] {
         width: 100% !important;
         min-width: 0 !important;
+    }
+}
+
+/* ── Section headings: 28px is Streamlit's body-level section size, but it is
+   larger than the top bar's screen title (2rem at 1440, 1.5rem on phones). On
+   screens whose only identity is the top bar — Settings — that inverts the
+   hierarchy: the section heading outranks the page title. Bring it under the
+   screen title and keep the heading level (h3) intact. */
+div[data-testid="stHeading"] h3 {
+    font-size: 1.15rem !important;
+    line-height: 1.3 !important;
+    letter-spacing: -0.01em !important;
+    margin: 1.1rem 0 0.45rem !important;
+}
+
+/* ── Callout titles: provider setup notes are ``st.info`` blocks whose first
+   line is a markdown heading. They sit directly under the page-title h2, so
+   the heading has to be h3 to keep the document outline free of skips — but a
+   full 28px h3 inside a 10px-padded callout reads as a section break. Keep the
+   level, shrink the paint. */
+div[data-testid="stAlertContainer"] h3 {
+    margin: 0 0 0.4rem !important;
+    padding: 0 !important;
+    font-size: 1.02rem !important;
+    line-height: 1.35 !important;
+    font-weight: 700 !important;
+    letter-spacing: -0.005em !important;
+}
+
+/* ── Alert text: Streamlit's own error/warning hues on their own 10% tint
+   measure 3.80:1 and 3.97:1 on the light canvas. Re-point only the text
+   colour so the tint, icon and layout stay Streamlit's; dark mode keeps
+   Streamlit's light-on-dark values. */
+@media (prefers-color-scheme: light) {
+    div[data-testid="stAlertContainer"] div[data-testid="stAlertContentError"] {
+        color: #a51b1e !important;
+    }
+
+    div[data-testid="stAlertContainer"] div[data-testid="stAlertContentWarning"] {
+        color: #7a5c00 !important;
+    }
+
+    /* The tint is 10% of the hue over the card, so the same text colour
+       has to hold up against both white cards and the dotted canvas. */
+    div[data-testid="stAlertContainer"] div[data-testid="stAlertContentError"] p,
+    div[data-testid="stAlertContainer"] div[data-testid="stAlertContentError"] a,
+    div[data-testid="stAlertContainer"] div[data-testid="stAlertContentWarning"] p,
+    div[data-testid="stAlertContainer"] div[data-testid="stAlertContentWarning"] a {
+        color: inherit !important;
+    }
+}
+
+/* ── Captions: st.caption ships opacity .6. Composited over the white
+   surface that puts 14px text at ~3.76:1 — under AA, and the screenshot
+   checker flags it on every screen that has a caption. Drop the opacity
+   and use the muted token instead: the text stays visually quiet but
+   measures 5.95:1 (light) / 7.03:1 (dark). */
+[data-testid="stCaptionContainer"] {
+    opacity: 1 !important;
+}
+
+[data-testid="stCaptionContainer"] p {
+    color: var(--vix-muted) !important;
+    opacity: 1 !important;
+}
+
+/* ── Hit targets ──────────────────────────────────────────────────────
+   The version and update links are 19px and 17px tall: they pass the
+   spacing exception at desktop but are unhittable with a thumb. Grow the
+   hit box without moving the baseline by paying the padding back as a
+   negative margin. */
+.mpt-brand__version,
+.mpt-brand__update {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.5rem;
+    padding-inline: 0.2rem;
+    margin-inline: -0.2rem;
+}
+
+@media (pointer: coarse) {
+    .mpt-brand__version,
+    .mpt-brand__update {
+        min-height: 2.75rem;
+        padding-inline: 0.45rem;
+        margin-inline: -0.45rem;
+    }
+
+    /* Touch: 40px Streamlit buttons and nav rows go to the 44px floor.
+       带 help 的按钮在 <button> 外多包了一层 stTooltipHoverTarget，所以这里
+       用后代选择器而不是 `> button`，否则重播引导这类按钮仍是 40px。 */
+    div[class*="st-key-top_bar"] div[data-testid="stButton"] button,
+    div[class*="st-key-nav_item_"] button,
+    div[class*="st-key-nav_new_video"] button,
+    div[class*="st-key-top_language_code_selector"] button {
+        min-height: 2.75rem !important;
+    }
+
+    /* 侧栏收起按钮在触屏上仍是 28px：它和展开按钮是同一个入口的两端。 */
+    div[data-testid="stSidebarCollapseButton"] button {
+        width: 2.75rem !important;
+        height: 2.75rem !important;
+    }
+}
+
+/* 重播引导的整句标签宽 192px，是操作区换行的主要原因：顶部栏内容宽不足
+   700px 时四个操作装不进一行。保留按钮和无障碍名称（文本裁剪而非
+   display:none），只收窄到图标宽度，四个操作就能回到同一行。
+   这里同样按顶部栏自身宽度判断，900px 视口下内容列只有 440px 也能覆盖。 */
+@container (max-width: 699.98px) {
+    div[class*="st-key-replay_onboarding_tour_button"] button p {
+        position: absolute !important;
+        width: 1px !important;
+        height: 1px !important;
+        padding: 0 !important;
+        margin: -1px !important;
+        overflow: hidden !important;
+        clip: rect(0, 0, 0, 0) !important;
+        clip-path: inset(50%) !important;
+        white-space: nowrap !important;
+    }
+
+    div[class*="st-key-replay_onboarding_tour_button"] button {
+        width: 2.75rem !important;
+        min-width: 2.75rem !important;
+        padding-inline: 0 !important;
     }
 }
 

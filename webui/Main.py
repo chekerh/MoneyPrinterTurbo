@@ -2352,8 +2352,8 @@ def _render_brand(available_update: str | None = None):
         )
     st.markdown(
         f"""
-        <h1 class="mpt-brand">
-            <span class="mpt-brand__name">MoneyPrinterTurbo</span>
+        <div class="mpt-brand">
+            <h1 class="mpt-brand__name">MoneyPrinterTurbo</h1>
             <a class="mpt-brand__version"
                href="https://github.com/harry0703/MoneyPrinterTurbo"
                target="_blank"
@@ -2361,7 +2361,7 @@ def _render_brand(available_update: str | None = None):
                aria-label="Open MoneyPrinterTurbo on GitHub"
                title="Open project on GitHub">v{html.escape(str(config.project_version))}</a>
             {update_link}
-        </h1>
+        </div>
         """,
         unsafe_allow_html=True,
     )
@@ -2393,7 +2393,7 @@ def _render_top_bar_context():
     title_key, hint_key = _nav_title_and_hint(view)
     st.markdown(
         f'<div class="mpt-top-context">'
-        f'<p class="mpt-top-context__title">{html.escape(tr(title_key))}</p>'
+        f'<h2 class="mpt-top-context__title">{html.escape(tr(title_key))}</h2>'
         f'<p class="mpt-top-context__sub">{html.escape(tr(hint_key))}</p>'
         f"</div>",
         unsafe_allow_html=True,
@@ -9078,10 +9078,21 @@ def _page_copyright():
             if task.get("video_file")
         ]
         if not candidates:
+            # 空状态只说"去生成一条"等于把用户留在原地：这一屏没有任何入口能到
+            # 生成页。给一个直接按钮，走和侧栏「新建视频」同一条导航通道。
             st.markdown(
                 f"<p class='mpt-empty-state'>{html.escape(tr('Copyright No Video'))}</p>",
                 unsafe_allow_html=True,
             )
+            if st.button(
+                tr("New Video"),
+                key="copyright_empty_generate",
+                type="primary",
+                icon=":material/movie_edit:",
+            ):
+                st.session_state[_NAV_REQUEST_KEY] = "generate"
+                st.session_state["bench_focus"] = "focus_generate"
+                st.rerun()
             return
 
         options = [task["task_id"] for task in candidates]
@@ -9850,13 +9861,15 @@ def _bench_tool_state(tool) -> tuple[str, str]:
 
 def _render_tools_bench():
     """工具台：一屏看全所有能力，以及每一项此刻能不能用。"""
+    # 页头与登录/版权/频道/生成四屏共用同一套 hero 语言（eyebrow + 大标题 + 说明）。
+    # 这里原本用 `## 标题` 渲染，导致同一个页面上出现两个 h2：顶部栏的屏名和大标题，
+    # 两者字号还差一倍。标题改为普通段落，屏幕标题继续由顶部栏提供唯一 h2。
     st.markdown(
-        f'<p class="mpt-bench-eyebrow">{html.escape(tr("Bench Eyebrow"))}</p>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(f"## {html.escape(tr('Bench Title'))}")
-    st.markdown(
-        f'<p class="mpt-bench-subtitle">{html.escape(tr("Bench Subtitle"))}</p>',
+        f'<div class="mpt-hero">'
+        f'<p class="mpt-hero-badge">{html.escape(tr("Bench Eyebrow"))}</p>'
+        f'<p class="mpt-hero-title">{html.escape(tr("Bench Title"))}</p>'
+        f'<p class="mpt-hero-sub">{html.escape(tr("Bench Subtitle"))}</p>'
+        f"</div>",
         unsafe_allow_html=True,
     )
 
