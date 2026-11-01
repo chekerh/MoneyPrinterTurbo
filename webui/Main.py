@@ -4896,7 +4896,9 @@ def _render_script_settings(panel, params):
     """渲染文案设置并更新生成参数。"""
     with panel:
         with st.container(border=True):
-            st.write(tr("Video Script Settings"))
+            # 分组标题是真标题（h3），页面名是 h2：读屏用户因此能在四组参数之间
+            # 按标题跳转，而不必逐个 Tab。只给标题语义，样式仍由容器内的 h3 继承。
+            st.markdown(f"### {tr('Video Script Settings')}")
             params.video_subject = st.text_area(
                 tr("Video Subject"),
                 placeholder=tr("Video Subject Placeholder"),
@@ -5091,7 +5093,7 @@ def _render_video_settings(panel, params):
     uploaded_files = []
     with panel:
         with st.container(border=True):
-            st.write(tr("Video Settings"))
+            st.markdown(f"### {tr('Video Settings')}")
             video_concat_modes = [
                 (tr("Sequential"), "sequential"),
                 (tr("Random"), "random"),
@@ -6284,7 +6286,7 @@ def _render_audio_settings(panel, params):
     """渲染音频设置并返回上传音频与当前配音模式。"""
     with panel:
         with st.container(border=True):
-            st.write(tr("Audio Settings"))
+            st.markdown(f"### {tr('Audio Settings')}")
 
             # 配音方式是音频设置的一级状态，负责明确区分自动配音、用户上传和无配音。
             # 旧配置没有 voice_mode 时，根据原 tts_server 的无配音哨兵保持兼容。
@@ -6799,7 +6801,7 @@ def _render_subtitle_settings(panel, params):
     """渲染字幕设置并更新生成参数。"""
     with panel:
         with st.container(border=True):
-            st.write(tr("Subtitle Settings"))
+            st.markdown(f"### {tr('Subtitle Settings')}")
             st.session_state.setdefault(
                 "subtitle_enabled_checkbox",
                 _saved_ui_bool(
@@ -9065,7 +9067,6 @@ def _page_copyright():
     with st.container(key="page_copyright"):
         st.markdown(
             f'<div class="mpt-hero">'
-            f'<p class="mpt-hero-badge">{html.escape(tr("Copyright Hero Badge"))}</p>'
             f'<p class="mpt-hero-title">{html.escape(tr("Copyright Hero Title"))}</p>'
             f'<p class="mpt-hero-sub">{html.escape(tr("Copyright Hero Sub"))}</p>'
             f"</div>",
@@ -9154,7 +9155,6 @@ def _page_channels():
     with st.container(key="page_channels"):
         st.markdown(
             f'<div class="mpt-hero">'
-            f'<p class="mpt-hero-badge">{html.escape(tr("Channels Hero Badge"))}</p>'
             f'<p class="mpt-hero-title">{html.escape(tr("Channels Hero Title"))}</p>'
             f'<p class="mpt-hero-sub">{html.escape(tr("Channels Hero Sub"))}</p>'
             f"</div>",
@@ -10041,11 +10041,12 @@ def _page_generate():
     """
     with st.container(key="page_generate"):
         # 参考设计的每个工具页顶部都是一组居中 hero：小徽章 + 大标题 + 一句副标题。
+        # 参考设计的每个工具页顶部都是一组居中 hero：大标题 + 一句副标题。
         # 生成页的四个参数面板就是本应用的"工具区"，hero 让它读起来像一个工具，
-        # 而不是一张配置表。
+        # 而不是一张配置表。徽章在生成/版权/赛道三页已去掉——它重复了页面标题，
+        # 而标题现在是页面上最大的一行；账号页和工具台保留。
         st.markdown(
             f'<div class="mpt-hero">'
-            f'<p class="mpt-hero-badge">{html.escape(tr("Generate Hero Badge"))}</p>'
             f'<p class="mpt-hero-title">{html.escape(tr("Generate Hero Title"))}</p>'
             f'<p class="mpt-hero-sub">{html.escape(tr("Generate Hero Sub"))}</p>'
             f"</div>",

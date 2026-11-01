@@ -1771,6 +1771,21 @@ div[class*="st-key-thumbnail_panel_"] div[data-testid="stCaptionContainer"] p {
     }
 }
 
+/* ── Generate group labels: these were bold paragraphs until they became real
+   headings for the outline. An unstyled markdown h3 paints at 28px — almost
+   the page title's 32px — so four of them would out-shout the screen name they
+   sit under and grow the settings grid. Keep the level (so readers can jump
+   between groups), keep the old painted size: 16px / 600, same as the strong
+   text they replaced. */
+div[class*="st-key-main_settings_grid"] h3 {
+    font-size: 1rem !important;
+    font-weight: 600 !important;
+    line-height: 1.35 !important;
+    letter-spacing: 0 !important;
+    margin: 0 0 0.5rem !important;
+    padding: 0 !important;
+}
+
 /* ── Section headings: 28px is Streamlit's body-level section size, but it is
    larger than the top bar's screen title (2rem at 1440, 1.5rem on phones). On
    screens whose only identity is the top bar — Settings — that inverts the
