@@ -1603,12 +1603,52 @@ div[data-testid="stFileUploader"] section {
     border-radius: var(--vix-radius-md) !important;
 }
 
+/* Streamlit prints the accept list on one nowrap line. The Generate grid's
+   audio column is 177px wide, so "30MB per file • MP3, M4A, AAC, WAV, FLAC,
+   OGG, OPUS, WMA" measured 345px inside a 177px box: cut mid-list, with no
+   ellipsis, so the user could not see which formats are accepted. The formats
+   are the information — let them wrap instead. */
+div[data-testid="stFileUploaderDropzoneInstructions"] span {
+    white-space: normal !important;
+}
+
 /* Settings panels sit on white cards so the 4-column grid reads as tiles. */
 div[class*="st-key-main_settings_grid"] div[data-testid="stVerticalBlockBorderWrapper"] {
     background: var(--vix-surface) !important;
     border: 1px solid var(--vix-line) !important;
     border-radius: var(--vix-radius-lg) !important;
     box-shadow: var(--vix-shadow-sm) !important;
+}
+
+/* ── Generate: keep the only action reachable ─────────────────────────────────
+   The Generate page is ~1,570px of content inside a 900px scroll port. Four
+   settings columns (the tallest, Audio, drives the grid to 1,020px) plus two
+   expanders put "Generate Video" 613px below the fold, so the flow is: fill in
+   100 controls, then hunt for the button that does anything.
+
+   The action now sticks to the bottom edge of the scroll port. It stays in
+   normal flow as the page's last element, so it does not cover anything once
+   the page is scrolled to the end, and on a viewport tall enough to show the
+   whole form it simply sits where it always did. The opaque surface is
+   required: without it the controls scroll underneath and the button label
+   sits on top of whatever field happens to be behind it. */
+div[class*="st-key-generate_video_button"] {
+    position: sticky !important;
+    bottom: 0 !important;
+    z-index: 30;
+    background: var(--vix-surface) !important;
+    border-top: 1px solid var(--vix-line) !important;
+    padding: 0.6rem 0 0.7rem !important;
+    margin-top: 0.35rem !important;
+    box-shadow: 0 -8px 18px -14px rgba(16, 16, 19, 0.45);
+}
+
+/* While the bar is pinned it covers the bottom ~60px of the scroll port, so a
+   control that Tab brings into view would land underneath it. Scroll padding is
+   declared on the scroll container, not the bar, so it is scoped to the screen
+   that actually has a pinned bar. */
+section[data-testid="stMain"]:has(div[class*="st-key-generate_video_button"]) {
+    scroll-padding-bottom: 4.25rem;
 }
 
 /* Segmented pills (tabs / aspect / voice mode) like the reference chips. */
